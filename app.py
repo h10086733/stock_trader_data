@@ -249,7 +249,6 @@ HTML = """<!DOCTYPE html>
 <div class="header">
   <div>
     <h1>行业宽度指标</h1>
-    <p>净值 = 3日均值（MA3）</p>
   </div>
   <div class="header-right">
     <select class="days-select" id="daysSelect" onchange="loadData()">
