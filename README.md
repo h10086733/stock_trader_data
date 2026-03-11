@@ -48,7 +48,7 @@ PB处于历史低位（历史25分位 × 1.2 以内）
 stock_trader_data/
 ├── fetch.py               # 全市场股票列表 + 日K线价格入库
 ├── findata.py             # PB / ROE 历史财务数据入库
-├── index.py               # 指数成分股管理（中证官网XLS导入）
+├── index.py               # 指数成分股管理（中证 / 国证 渠道导入）
 ├── index_stats.py         # 行业宽度指标计算（20日新高/新低净值）
 ├── sector_strategy.py     # 行业股票池管理 + 低PB信号扫描
 ├── backtest.py            # 历史回测
@@ -183,6 +183,15 @@ python app.py
 35 16 * * 1-5  cd ~/project/stock_trader_data && python index_stats.py --calc-today >> cron.log 2>&1
 ```
 
+### 添加指数成分股
+
+```bash
+python index.py --add 932365 中证现金流
+python index.py --channel cnindex --add 980092 国证行业指数
+python index_stats.py --backfill 932365
+```
+
+
 ---
 
 ## 数据来源
@@ -193,7 +202,7 @@ python app.py
 | 日K线价格  | 东方财富              | push2his API（前复权）|
 | PB历史     | 东方财富数据中心       | RPT_CUSTOM_DMSK_TREND |
 | ROE历史    | 东方财富数据中心       | RPT_F10_FINANCE_DUPONT |
-| 指数成分股 | 中证指数官网           | XLS文件下载 |
+| 指数成分股 | 中证指数官网 / 国证指数官网 | XLS文件下载 |
 
 ---
 
