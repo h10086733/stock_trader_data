@@ -217,7 +217,7 @@ HTML = """<!DOCTYPE html>
     z-index: 100;
     box-shadow: 0 8px 24px rgba(0,0,0,.5);
     pointer-events: none;
-    min-width: 170px;
+    min-width: 190px;
   }
   .tooltip.show { display:block; }
   .tooltip-title { font-size:11px; color:var(--text-dim); margin-bottom:8px; border-bottom:1px solid var(--border); padding-bottom:6px; }
@@ -242,20 +242,6 @@ HTML = """<!DOCTYPE html>
     animation: spin .8s linear infinite;
   }
   @keyframes spin { to { transform:rotate(360deg); } }
-
-  /* 图例 */
-  .legend {
-    display: flex;
-    gap: 20px;
-    margin-top: 16px;
-    padding-top: 14px;
-    border-top: 1px solid var(--border);
-    font-size: 11px;
-    color: var(--text-dim);
-    flex-wrap: wrap;
-  }
-  .legend-item { display:flex; align-items:center; gap:6px; }
-  .legend-dot  { width:8px; height:8px; border-radius:2px; }
 </style>
 </head>
 <body>
@@ -263,6 +249,7 @@ HTML = """<!DOCTYPE html>
 <div class="header">
   <div>
     <h1>行业宽度指标</h1>
+    <p>净值 = 3日均值（MA3）</p>
   </div>
   <div class="header-right">
     <select class="days-select" id="daysSelect" onchange="loadData()">
@@ -292,6 +279,31 @@ HTML = """<!DOCTYPE html>
 
 <div class="table-wrap" id="tableWrap">
   <div class="loading"><div class="spinner"></div>加载中…</div>
+</div>
+
+<!-- Tooltip -->
+<div class="tooltip" id="tooltip">
+  <div class="tooltip-title" id="tt-title"></div>
+  <div class="tooltip-row">
+    <span class="tooltip-label">3日均值</span>
+    <span class="tooltip-val" id="tt-ma3"></span>
+  </div>
+  <div class="tooltip-row">
+    <span class="tooltip-label">当日净值</span>
+    <span class="tooltip-val" id="tt-net"></span>
+  </div>
+  <div class="tooltip-row">
+    <span class="tooltip-label">创新高</span>
+    <span class="tooltip-val" id="tt-high"></span>
+  </div>
+  <div class="tooltip-row">
+    <span class="tooltip-label">创新低</span>
+    <span class="tooltip-val" id="tt-low"></span>
+  </div>
+  <div class="tooltip-row">
+    <span class="tooltip-label">有效/总</span>
+    <span class="tooltip-val" id="tt-valid"></span>
+  </div>
 </div>
 
 <script>
@@ -327,7 +339,7 @@ function buildTable(data) {
   indices.forEach(idx => {
     html += `<tr><td class="name-cell">${idx.name}<span class="idx-code">${idx.code}</span></td>`;
     dates.forEach(d => {
-      const v   = idx.values[d];
+      const v   = idx.ma3[d];      // 显示3日均值
       const det = idx.details ? idx.details[d] : null;
       if (v === undefined || v === null) {
         html += '<td class="val-cell"><span class="empty-cell">—</span></td>';
@@ -356,6 +368,7 @@ function showTip(e, name, date, enc) {
   if (!enc) return;
   const det = JSON.parse(decodeURIComponent(enc));
   document.getElementById('tt-title').textContent  = name + ' · ' + date;
+  document.getElementById('tt-ma3').textContent    = det.ma3 != null ? (det.ma3 * 100).toFixed(4) + '%' : '—';
   document.getElementById('tt-net').textContent    = (det.net_value * 100).toFixed(4) + '%';
   document.getElementById('tt-high').textContent   = (det.high_count || 0) + ' 只';
   document.getElementById('tt-low').textContent    = (det.low_count  || 0) + ' 只';
@@ -367,8 +380,8 @@ function showTip(e, name, date, enc) {
 function hideTip()  { document.getElementById('tooltip').classList.remove('show'); }
 function moveTip(e) {
   const tt = document.getElementById('tooltip');
-  tt.style.left = Math.min(e.clientX+16, window.innerWidth-190)  + 'px';
-  tt.style.top  = Math.min(e.clientY-10, window.innerHeight-160) + 'px';
+  tt.style.left = Math.min(e.clientX+16, window.innerWidth-210)  + 'px';
+  tt.style.top  = Math.min(e.clientY-10, window.innerHeight-180) + 'px';
 }
 document.addEventListener('mousemove', e => {
   if (document.getElementById('tooltip').classList.contains('show')) moveTip(e);
@@ -419,7 +432,7 @@ def api_stats():
         LIMIT ?
     """, (days,))
     dates     = [r["trade_date"] for r in cur.fetchall()]
-    dates_asc = list(reversed(dates))  # 升序，左→右显示
+    dates_asc = list(reversed(dates))
 
     # 取所有指数
     cur.execute("SELECT code, name FROM indices ORDER BY code")
@@ -428,29 +441,69 @@ def api_stats():
     result = []
     for idx in indices:
         code = idx["code"]
+
         if not dates_asc:
-            result.append({"code": code, "name": idx["name"], "values": {}, "details": {}})
+            result.append({"code": code, "name": idx["name"],
+                           "ma3": {}, "details": {}})
             continue
 
+        # 多取2天历史数据用于计算MA3（最早显示日期往前2天）
         cur.execute("""
             SELECT trade_date, net_value, high_count, low_count, valid_count, total_count
             FROM index_daily_stats
             WHERE index_code = ?
-              AND trade_date IN ({})
-        """.format(",".join("?" * len(dates_asc))), [code] + dates_asc)
+              AND trade_date <= ?
+              AND trade_date >= (
+                  SELECT trade_date FROM index_daily_stats
+                  WHERE index_code = ?
+                    AND trade_date <= ?
+                  ORDER BY trade_date ASC
+                  LIMIT 1 OFFSET 0
+              )
+            ORDER BY trade_date ASC
+        """, (code, dates_asc[-1], code, dates_asc[0]))
 
-        values, details = {}, {}
-        for row in cur.fetchall():
-            td = row["trade_date"]
-            values[td]  = row["net_value"]
-            details[td] = {
-                "net_value":   row["net_value"],
-                "high_count":  row["high_count"],
-                "low_count":   row["low_count"],
-                "valid_count": row["valid_count"],
-                "total_count": row["total_count"],
-            }
-        result.append({"code": code, "name": idx["name"], "values": values, "details": details})
+        # 用 Python 算滑动均值，不依赖窗口函数
+        all_rows = cur.fetchall()
+
+        # 先建完整的 net_value 时间序列
+        nv_series = {r["trade_date"]: r["net_value"] for r in all_rows}
+        detail_map = {r["trade_date"]: r for r in all_rows}
+
+        # 取所有日期排序（包括比显示窗口更早的）
+        all_dates_sorted = sorted(nv_series.keys())
+
+        # 计算每个日期的 MA3
+        ma3_map = {}
+        for i, td in enumerate(all_dates_sorted):
+            window = [nv_series[all_dates_sorted[j]]
+                      for j in range(max(0, i-2), i+1)
+                      if nv_series.get(all_dates_sorted[j]) is not None]
+            ma3_map[td] = round(sum(window) / len(window), 6) if window else None
+
+        # 只输出用户要看的日期
+        ma3    = {}
+        details= {}
+        for td in dates_asc:
+            if td in ma3_map:
+                ma3[td] = ma3_map[td]
+            if td in detail_map:
+                r = detail_map[td]
+                details[td] = {
+                    "net_value":   r["net_value"],
+                    "ma3":         ma3_map.get(td),
+                    "high_count":  r["high_count"],
+                    "low_count":   r["low_count"],
+                    "valid_count": r["valid_count"],
+                    "total_count": r["total_count"],
+                }
+
+        result.append({
+            "code":    code,
+            "name":    idx["name"],
+            "ma3":     ma3,
+            "details": details,
+        })
 
     conn.close()
     return jsonify({"dates": dates_asc, "indices": result})
