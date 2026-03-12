@@ -258,9 +258,18 @@ def insert_daily_prices(conn, code, rows):
     if not rows:
         return 0
     conn.executemany("""
-        INSERT OR IGNORE INTO daily_prices
+        INSERT INTO daily_prices
             (code, trade_date, open, close, high, low, volume, amount, pct_change, turnover)
         VALUES (?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(code, trade_date) DO UPDATE SET
+            open       = excluded.open,
+            close      = excluded.close,
+            high       = excluded.high,
+            low        = excluded.low,
+            volume     = excluded.volume,
+            amount     = excluded.amount,
+            pct_change = excluded.pct_change,
+            turnover   = excluded.turnover
     """, [(code, r["trade_date"], r["open"], r["close"], r["high"],
            r["low"], r["volume"], r["amount"], r["pct_change"], r["turnover"])
           for r in rows])
@@ -299,13 +308,16 @@ def sync_one(conn, code, market, mode="init"):
         cur.execute("SELECT history_end FROM stocks WHERE code=?", (code,))
         row  = cur.fetchone()
         last = row[0] if row and row[0] else None
+        today_dash = datetime.today().strftime("%Y-%m-%d")
+        today = datetime.today().strftime("%Y%m%d")
         if last:
-            next_day = (datetime.strptime(last, "%Y-%m-%d")
-                        + timedelta(days=1)).strftime("%Y%m%d")
-            today = datetime.today().strftime("%Y%m%d")
-            if next_day > today:
-                return   # 已是最新，跳过
-            start_date = next_day
+            if last >= today_dash:
+                # 当天盘中已写入过日K时，继续刷新今天这根K线，直到收盘定稿。
+                start_date = today
+            else:
+                next_day = (datetime.strptime(last, "%Y-%m-%d")
+                            + timedelta(days=1)).strftime("%Y%m%d")
+                start_date = next_day
         else:
             start_date = HISTORY_START
 

@@ -19,7 +19,7 @@
 定时任务：
   30 9,10,11 * * 1-5  cd /path && python fetch.py --sync && python index_stats.py --calc-intraday >> cron.log 2>&1
   00 13,14,15 * * 1-5 cd /path && python fetch.py --sync && python index_stats.py --calc-intraday >> cron.log 2>&1
-  35 16 * * 1-5       cd /path && python index_stats.py --calc-today >> cron.log 2>&1
+  35 16 * * 1-5       cd /path && python fetch.py --sync && python index_stats.py --calc-today >> cron.log 2>&1
 """
 
 import sqlite3

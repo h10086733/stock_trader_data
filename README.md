@@ -184,7 +184,7 @@ python app.py
 # crontab -e
 30 11 * * 1-5  cd ~/project/stock_trader_data && python3 fetch.py --sync && python3 index_stats.py --calc-intraday >> cron.log 2>&1
 00 15 * * 1-5 cd ~/project/stock_trader_data && python3 fetch.py --sync && python3 index_stats.py --calc-intraday >> cron.log 2>&1
-35 16 * * 1-5  cd ~/project/stock_trader_data && python3 index_stats.py --calc-today >> cron.log 2>&1
+35 16 * * 1-5  cd ~/project/stock_trader_data && python3 fetch.py --sync && python3 index_stats.py --calc-today >> cron.log 2>&1
 ```
 
 ### 添加指数成分股
