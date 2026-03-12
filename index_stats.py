@@ -86,6 +86,22 @@ def init_db(conn):
 # ─────────────────────────────────────────────────────────────────
 # 核心计算：用纯 SQL 完成，速度快
 # ─────────────────────────────────────────────────────────────────
+def to_float_or_none(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    if not text or text in ("-", "--", "None", "null", "NULL"):
+        return None
+
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def calc_index_one_day(conn, index_code, trade_date):
     """
     计算指定指数在指定交易日的宽度指标。
@@ -228,6 +244,10 @@ def calc_index_intraday(conn, index_code, trade_date):
 
     rows = cur.fetchall()
     for code, latest_price, high_hist, low_hist, days_count in rows:
+        latest_price = to_float_or_none(latest_price)
+        high_hist = to_float_or_none(high_hist)
+        low_hist = to_float_or_none(low_hist)
+
         if latest_price is None or high_hist is None or low_hist is None:
             continue
         if days_count < WINDOW - 1:
