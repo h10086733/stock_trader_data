@@ -270,7 +270,7 @@ function buildTable(data) {
 
   if (!displayDates.length || !indices.length) {
     document.getElementById('tableWrap').innerHTML =
-      '<div class="loading">暂无数据，请先运行 index_stats_pipeline.py</div>';
+      '<div class="loading">暂无数据，请先运行 index_stats.py</div>';
     return;
   }
 

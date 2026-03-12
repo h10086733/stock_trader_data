@@ -164,7 +164,10 @@ python backtest.py --trades --strength 3
 # 先回填历史净值（首次运行）
 python index_stats.py --backfill-all
 
-# 每日计算
+# 盘中每小时刷新一次最新交易日
+python index_stats.py --calc-intraday
+
+# 收盘后做最终日线计算
 python index_stats.py --calc-today
 
 # 启动 Web 页面（访问 http://localhost:5000）
@@ -175,12 +178,13 @@ python app.py
 
 ## 定时任务
 
-每个交易日收盘后（16:30起）自动执行：
+每个交易日盘中和收盘后自动执行：
 
 ```bash
 # crontab -e
-10 15 * * 1-5  cd ~/project/stock_trader_data && python fetch.py --sync >> cron.log 2>&1
-35 16 * * 1-5  cd ~/project/stock_trader_data && python index_stats.py --calc-today >> cron.log 2>&1
+30 11 * * 1-5  cd ~/project/stock_trader_data && python3 fetch.py --sync && python3 index_stats.py --calc-intraday >> cron.log 2>&1
+00 15 * * 1-5 cd ~/project/stock_trader_data && python3 fetch.py --sync && python3 index_stats.py --calc-intraday >> cron.log 2>&1
+35 16 * * 1-5  cd ~/project/stock_trader_data && python3 index_stats.py --calc-today >> cron.log 2>&1
 ```
 
 ### 添加指数成分股

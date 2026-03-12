@@ -1,5 +1,5 @@
 """
-行业宽度指标计算 — index_stats_pipeline.py
+行业宽度指标计算 — index_stats.py
 ==========================================
 指标逻辑：
   每只成分股当日得分：
@@ -9,14 +9,17 @@
   行业净值 = Σ得分 / 成分股有效数量    范围：-1 ~ +1
 
 使用方式：
-  python index_stats_pipeline.py --calc-today        # 计算今日所有行业指标（每日收盘后）
-  python index_stats_pipeline.py --backfill 000300   # 回填指定指数历史净值
-  python index_stats_pipeline.py --backfill-all      # 回填所有指数历史净值
-  python index_stats_pipeline.py --show 000300       # 查看指数最近净值
-  python index_stats_pipeline.py --show-all          # 查看所有指数最新净值
+  python index_stats.py --calc-today           # 计算今日所有行业指标（每日收盘后）
+  python index_stats.py --calc-intraday        # 计算盘中快照（开盘时段每小时一次）
+  python index_stats.py --backfill 000300      # 回填指定指数历史净值
+  python index_stats.py --backfill-all         # 回填所有指数历史净值
+  python index_stats.py --show 000300          # 查看指数最近净值
+  python index_stats.py --show-all             # 查看所有指数最新净值
 
-定时任务（在 stock_db_pipeline --sync 完成后执行）：
-  35 16 * * 1-5  cd /path && python index_stats_pipeline.py --calc-today >> cron.log 2>&1
+定时任务：
+  30 9,10,11 * * 1-5  cd /path && python fetch.py --sync && python index_stats.py --calc-intraday >> cron.log 2>&1
+  00 13,14,15 * * 1-5 cd /path && python fetch.py --sync && python index_stats.py --calc-intraday >> cron.log 2>&1
+  35 16 * * 1-5       cd /path && python index_stats.py --calc-today >> cron.log 2>&1
 """
 
 import sqlite3
@@ -57,8 +60,27 @@ def init_db(conn):
         CREATE INDEX IF NOT EXISTS idx_ids_date
         ON index_daily_stats(trade_date)
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS index_intraday_stats (
+            index_code     TEXT NOT NULL,
+            trade_date     DATE NOT NULL,
+            snapshot_slot  TEXT NOT NULL,  -- 09:30 / 10:30 / 11:30 / 13:00 / 14:00 / 15:00
+            snapshot_at    DATETIME NOT NULL,
+            score_sum      REAL,
+            high_count     INTEGER,
+            low_count      INTEGER,
+            valid_count    INTEGER,
+            total_count    INTEGER,
+            net_value      REAL,
+            PRIMARY KEY (index_code, trade_date, snapshot_slot)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_iis_date_slot
+        ON index_intraday_stats(trade_date, snapshot_slot)
+    """)
     conn.commit()
-    log.info("index_daily_stats 表就绪")
+    log.info("index_daily_stats / index_intraday_stats 表就绪")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -150,6 +172,92 @@ def calc_index_one_day(conn, index_code, trade_date):
     }
 
 
+def calc_index_intraday(conn, index_code, trade_date):
+    """
+    用 stocks.price_latest 计算盘中宽度快照：
+      当前价 vs 最近 19 个已收盘交易日高低点
+    """
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT stock_code FROM index_constituents
+        WHERE index_code = ?
+    """, (index_code,))
+    stocks = [r[0] for r in cur.fetchall()]
+    if not stocks:
+        return None
+
+    cur.execute("""
+        SELECT MAX(trade_date) FROM daily_prices
+        WHERE trade_date <= ?
+    """, (trade_date,))
+    base_trade_date = cur.fetchone()[0]
+    if not base_trade_date:
+        return None
+
+    total_count = len(stocks)
+    score_sum   = 0
+    high_count  = 0
+    low_count   = 0
+    valid_count = 0
+
+    placeholders = ",".join("?" * total_count)
+    cur.execute(f"""
+        SELECT
+            s.code,
+            s.price_latest                      AS latest_price,
+            MAX(h.close)                        AS high_hist,
+            MIN(h.close)                        AS low_hist,
+            COUNT(h.trade_date)                 AS days_count
+        FROM stocks s
+        JOIN daily_prices h
+            ON h.code = s.code
+           AND h.trade_date <= ?
+           AND h.trade_date >= (
+               SELECT d2.trade_date
+               FROM daily_prices d2
+               WHERE d2.code = s.code
+                 AND d2.trade_date <= ?
+               ORDER BY d2.trade_date DESC
+               LIMIT 1 OFFSET {WINDOW - 2}
+           )
+        WHERE s.code IN ({placeholders})
+          AND s.price_latest IS NOT NULL
+        GROUP BY s.code
+    """, [base_trade_date, base_trade_date] + stocks)
+
+    rows = cur.fetchall()
+    for code, latest_price, high_hist, low_hist, days_count in rows:
+        if latest_price is None or high_hist is None or low_hist is None:
+            continue
+        if days_count < WINDOW - 1:
+            continue
+
+        valid_count += 1
+        if latest_price >= high_hist:
+            score_sum  += 1
+            high_count += 1
+        elif latest_price <= low_hist:
+            score_sum  -= 1
+            low_count  += 1
+
+    if valid_count == 0:
+        return None
+
+    net_value = round(score_sum / valid_count, 6)
+
+    return {
+        "index_code":  index_code,
+        "trade_date":  trade_date,
+        "score_sum":   score_sum,
+        "high_count":  high_count,
+        "low_count":   low_count,
+        "valid_count": valid_count,
+        "total_count": total_count,
+        "net_value":   net_value,
+    }
+
+
 def save_stat(conn, stat):
     conn.execute("""
         INSERT OR REPLACE INTO index_daily_stats
@@ -158,6 +266,22 @@ def save_stat(conn, stat):
         VALUES (:index_code, :trade_date, :score_sum, :high_count, :low_count,
                 :valid_count, :total_count, :net_value)
     """, stat)
+    conn.commit()
+
+
+def save_intraday_stat(conn, stat, snapshot_slot, snapshot_at=None):
+    snapshot_at = snapshot_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("""
+        INSERT OR REPLACE INTO index_intraday_stats
+            (index_code, trade_date, snapshot_slot, snapshot_at,
+             score_sum, high_count, low_count, valid_count, total_count, net_value)
+        VALUES (:index_code, :trade_date, :snapshot_slot, :snapshot_at,
+                :score_sum, :high_count, :low_count, :valid_count, :total_count, :net_value)
+    """, {
+        **stat,
+        "snapshot_slot": snapshot_slot,
+        "snapshot_at": snapshot_at,
+    })
     conn.commit()
 
 
@@ -183,6 +307,34 @@ def get_trade_dates(conn, start_date=None, end_date=None):
     return [r[0] for r in cur.fetchall()]
 
 
+def detect_intraday_slot(now=None):
+    now = now or datetime.now()
+    hhmm = now.strftime("%H:%M")
+    if hhmm < "09:30":
+        return None
+    if hhmm < "10:30":
+        return "09:30"
+    if hhmm < "11:30":
+        return "10:30"
+    if hhmm < "13:00":
+        return "11:30"
+    if hhmm < "14:00":
+        return "13:00"
+    if hhmm < "15:00":
+        return "14:00"
+    return "15:00"
+
+
+def has_fresh_realtime_prices(conn, trade_date):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) FROM stocks
+        WHERE price_latest IS NOT NULL
+          AND date(updated_at) = ?
+    """, (trade_date,))
+    return cur.fetchone()[0] > 0
+
+
 # ─────────────────────────────────────────────────────────────────
 # 命令：计算今日
 # ─────────────────────────────────────────────────────────────────
@@ -194,7 +346,7 @@ def cmd_calc_today(conn):
     cur.execute("SELECT code, name FROM indices ORDER BY code")
     indices = cur.fetchall()
     if not indices:
-        log.warning("没有维护的指数，请先运行 index_pipeline.py --init-all")
+        log.warning("没有维护的指数，请先运行 index.py --init-all")
         return
 
     results = []
@@ -211,6 +363,49 @@ def cmd_calc_today(conn):
             log.warning(f"  [{index_code}] {index_name} 今日无数据（可能未收盘或数据未同步）")
 
     log.info(f"今日计算完成，共 {len(results)} 个指数")
+
+
+def cmd_calc_intraday(conn):
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    if now.weekday() >= 5:
+        log.warning(f"{today} 是周末，不生成盘中快照")
+        return
+
+    slot = detect_intraday_slot(now)
+    if not slot:
+        log.warning(f"当前时间 {now.strftime('%H:%M')} 早于开盘，不生成盘中快照")
+        return
+
+    if not has_fresh_realtime_prices(conn, today):
+        log.warning("stocks.price_latest 还没有今天的刷新记录，请先执行 fetch.py --sync")
+        return
+
+    log.info(f"计算盘中快照（{today} {slot}）行业宽度指标")
+
+    cur = conn.cursor()
+    cur.execute("SELECT code, name FROM indices ORDER BY code")
+    indices = cur.fetchall()
+    if not indices:
+        log.warning("没有维护的指数，请先运行 index.py --init-all")
+        return
+
+    snapshot_at = now.strftime("%Y-%m-%d %H:%M:%S")
+    results = []
+    for index_code, index_name in indices:
+        stat = calc_index_intraday(conn, index_code, today)
+        if stat:
+            save_intraday_stat(conn, stat, slot, snapshot_at)
+            save_stat(conn, stat)
+            results.append((index_code, index_name, stat))
+            log.info(f"  [{index_code}] {index_name:<10}  "
+                     f"槽位:{slot}  净值:{stat['net_value']:+.4f}  "
+                     f"新高:{stat['high_count']}  新低:{stat['low_count']}  "
+                     f"有效:{stat['valid_count']}/{stat['total_count']}")
+        else:
+            log.warning(f"  [{index_code}] {index_name} 盘中数据不足，跳过")
+
+    log.info(f"盘中快照完成，共 {len(results)} 个指数")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -323,7 +518,7 @@ def cmd_backfill_recent(conn, days=20, force=False):
     cur.execute("SELECT code, name FROM indices ORDER BY code")
     indices = cur.fetchall()
     if not indices:
-        log.warning("没有维护的指数，请先运行 index_pipeline.py --init-all")
+        log.warning("没有维护的指数，请先运行 index.py --init-all")
         return
 
     total_calc = total_skip_exist = total_skip_nodata = 0
@@ -451,6 +646,7 @@ def _bar(net_value):
 def main():
     parser = argparse.ArgumentParser(description="行业宽度指标计算")
     parser.add_argument("--calc-today",   action="store_true",   help="计算今日所有行业指标")
+    parser.add_argument("--calc-intraday", action="store_true",  help="计算盘中快照，并刷新今日最新值")
     parser.add_argument("--backfill",     metavar="CODE",        help="回填指定指数历史净值")
     parser.add_argument("--backfill-all", action="store_true",   help="回填所有指数历史净值")
     parser.add_argument("--recent-days",  type=int, metavar="N",   help="补算所有指数最近N个交易日净值，如: --recent-days 20")
@@ -469,6 +665,8 @@ def main():
 
     if args.calc_today:
         cmd_calc_today(conn)
+    elif args.calc_intraday:
+        cmd_calc_intraday(conn)
     elif args.backfill:
         cmd_backfill(conn, args.backfill, force=args.force)
     elif args.backfill_all:
