@@ -159,7 +159,6 @@ HTML = """<!DOCTYPE html>
   td.val-cell {
     padding: 8px 6px;
     text-align: center;
-    cursor: pointer;
   }
   .val-inner {
     display: inline-flex;
@@ -169,9 +168,7 @@ HTML = """<!DOCTYPE html>
     padding: 8px 14px;
     border-radius: 6px;
     min-width: 76px;
-    transition: transform .15s;
   }
-  td.val-cell:hover .val-inner { transform: scale(1.06); }
 
   .val-inner.positive { background: var(--red-dim); }
   .val-inner.negative { background: var(--green-dim); }
@@ -204,26 +201,6 @@ HTML = """<!DOCTYPE html>
   .negative .val-bar-fill { background:var(--green); right:50%; }
 
   .empty-cell { font-size:12px; color:var(--text-dim); }
-
-  /* Tooltip */
-  .tooltip {
-    display: none;
-    position: fixed;
-    background: #1e2333;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 14px;
-    font-size: 12px;
-    z-index: 100;
-    box-shadow: 0 8px 24px rgba(0,0,0,.5);
-    pointer-events: none;
-    min-width: 190px;
-  }
-  .tooltip.show { display:block; }
-  .tooltip-title { font-size:11px; color:var(--text-dim); margin-bottom:8px; border-bottom:1px solid var(--border); padding-bottom:6px; }
-  .tooltip-row   { display:flex; justify-content:space-between; gap:20px; margin-bottom:4px; }
-  .tooltip-label { color:var(--text-dim); }
-  .tooltip-val   { font-family:'DM Mono',monospace; color:var(--text); }
 
   /* Loading */
   .loading {
@@ -280,31 +257,6 @@ HTML = """<!DOCTYPE html>
   <div class="loading"><div class="spinner"></div>加载中…</div>
 </div>
 
-<!-- Tooltip -->
-<div class="tooltip" id="tooltip">
-  <div class="tooltip-title" id="tt-title"></div>
-  <div class="tooltip-row">
-    <span class="tooltip-label">3日均值</span>
-    <span class="tooltip-val" id="tt-ma3"></span>
-  </div>
-  <div class="tooltip-row">
-    <span class="tooltip-label">当日净值</span>
-    <span class="tooltip-val" id="tt-net"></span>
-  </div>
-  <div class="tooltip-row">
-    <span class="tooltip-label">创新高</span>
-    <span class="tooltip-val" id="tt-high"></span>
-  </div>
-  <div class="tooltip-row">
-    <span class="tooltip-label">创新低</span>
-    <span class="tooltip-val" id="tt-low"></span>
-  </div>
-  <div class="tooltip-row">
-    <span class="tooltip-label">有效/总</span>
-    <span class="tooltip-val" id="tt-valid"></span>
-  </div>
-</div>
-
 <script>
 function fmtDateHeader(s) {
   const d = new Date(s);
@@ -314,19 +266,20 @@ function fmtDateHeader(s) {
 
 function buildTable(data) {
   const { dates, indices } = data;
+  const displayDates = [...dates].reverse();
 
-  if (!dates.length || !indices.length) {
+  if (!displayDates.length || !indices.length) {
     document.getElementById('tableWrap').innerHTML =
       '<div class="loading">暂无数据，请先运行 index_stats_pipeline.py</div>';
     return;
   }
 
-  document.getElementById('statDate').textContent  = dates[dates.length-1];
+  document.getElementById('statDate').textContent  = displayDates[0];
   document.getElementById('statCount').textContent = indices.length + ' 个';
   document.getElementById('statTime').textContent  = new Date().toLocaleTimeString('zh-CN');
 
   let html = '<table><thead><tr><th>行业指数</th>';
-  dates.forEach(d => {
+  displayDates.forEach(d => {
     const {month, day} = fmtDateHeader(d);
     html += `<th><div class="date-header">
       <span class="date-month">${month}</span>
@@ -337,9 +290,8 @@ function buildTable(data) {
 
   indices.forEach(idx => {
     html += `<tr><td class="name-cell">${idx.name}<span class="idx-code">${idx.code}</span></td>`;
-    dates.forEach(d => {
-      const v   = idx.ma3[d];      // 显示3日均值
-      const det = idx.details ? idx.details[d] : null;
+    displayDates.forEach(d => {
+      const v = idx.ma3[d];
       if (v === undefined || v === null) {
         html += '<td class="val-cell"><span class="empty-cell">—</span></td>';
         return;
@@ -347,10 +299,7 @@ function buildTable(data) {
       const pct = (v * 100).toFixed(2);
       const cls = v >  0.001 ? 'positive' : v < -0.001 ? 'negative' : 'zero';
       const barW = Math.min(Math.abs(v) * 100, 50);
-      const enc  = det ? encodeURIComponent(JSON.stringify(det)) : '';
-      html += `<td class="val-cell"
-        onmouseenter="showTip(event,'${idx.name}','${d}','${enc}')"
-        onmouseleave="hideTip()">
+      html += `<td class="val-cell">
         <div class="val-inner ${cls}">
           <span class="val-number">${pct}</span>
           <div class="val-bar"><div class="val-bar-fill" style="width:${barW}%"></div></div>
@@ -362,29 +311,6 @@ function buildTable(data) {
   html += '</tbody></table>';
   document.getElementById('tableWrap').innerHTML = html;
 }
-
-function showTip(e, name, date, enc) {
-  if (!enc) return;
-  const det = JSON.parse(decodeURIComponent(enc));
-  document.getElementById('tt-title').textContent  = name + ' · ' + date;
-  document.getElementById('tt-ma3').textContent    = det.ma3 != null ? (det.ma3 * 100).toFixed(4) + '%' : '—';
-  document.getElementById('tt-net').textContent    = (det.net_value * 100).toFixed(4) + '%';
-  document.getElementById('tt-high').textContent   = (det.high_count || 0) + ' 只';
-  document.getElementById('tt-low').textContent    = (det.low_count  || 0) + ' 只';
-  document.getElementById('tt-valid').textContent  = (det.valid_count||0) + ' / ' + (det.total_count||0);
-  const tt = document.getElementById('tooltip');
-  tt.classList.add('show');
-  moveTip(e);
-}
-function hideTip()  { document.getElementById('tooltip').classList.remove('show'); }
-function moveTip(e) {
-  const tt = document.getElementById('tooltip');
-  tt.style.left = Math.min(e.clientX+16, window.innerWidth-210)  + 'px';
-  tt.style.top  = Math.min(e.clientY-10, window.innerHeight-180) + 'px';
-}
-document.addEventListener('mousemove', e => {
-  if (document.getElementById('tooltip').classList.contains('show')) moveTip(e);
-});
 
 async function loadData() {
   const days = document.getElementById('daysSelect').value;
