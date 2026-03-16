@@ -36,6 +36,7 @@ HISTORY_START    = "20100101"
 STOCK_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 KLINE_URL      = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 SINA_PRICE_URL = "https://hq.sinajs.cn/list="  # 新浪实时行情接口
+SINA_REFERER   = "https://finance.sina.com.cn/"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -54,6 +55,13 @@ def get_headers():
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
     }
+
+
+def get_sina_headers():
+    headers = get_headers()
+    headers["Referer"] = SINA_REFERER
+    headers["Accept"] = "application/javascript, text/plain, */*"
+    return headers
 
 # ─────────────────────────────────────────────────────────────────
 # 日志
@@ -113,6 +121,47 @@ def safe_get(url, params, timeout=15):
     raise RuntimeError(f"请求失败，已重试 {MAX_RETRIES} 次: {url}")
 
 
+def safe_get_sina(symbols, timeout=10):
+    """带重试的新浪行情请求"""
+    url = f"{SINA_PRICE_URL}{symbols}"
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = SESSION.get(url, headers=get_sina_headers(), timeout=timeout)
+            if resp.status_code == 429:
+                log.warning(f"  新浪限流(429)，等待 {RETRY_INTERVAL}s  attempt={attempt+1}")
+                time.sleep(RETRY_INTERVAL)
+                continue
+            resp.raise_for_status()
+            if not resp.text or 'var hq_str_' not in resp.text:
+                log.warning(f"  新浪空响应，等待重试  attempt={attempt+1}")
+                time.sleep(RETRY_INTERVAL)
+                continue
+            return resp
+        except requests.exceptions.Timeout:
+            log.warning(f"  新浪超时，重试  attempt={attempt+1}")
+            time.sleep(RETRY_INTERVAL)
+        except requests.exceptions.ConnectionError as e:
+            log.warning(f"  新浪连接错误: {e}，重试  attempt={attempt+1}")
+            time.sleep(RETRY_INTERVAL)
+        except requests.exceptions.RequestException as e:
+            log.warning(f"  新浪请求异常: {e}，重试  attempt={attempt+1}")
+            time.sleep(RETRY_INTERVAL)
+    raise RuntimeError(f"新浪请求失败，已重试 {MAX_RETRIES} 次: {url}")
+
+
+def parse_sina_quote_line(line):
+    """解析单行新浪行情，返回 (code, fields)"""
+    if "=" not in line or '"' not in line:
+        return None
+    prefix, payload = line.split("=", 1)
+    symbol = prefix.rsplit("_", 1)[-1]
+    if len(symbol) <= 2:
+        return None
+    code = symbol[2:]
+    fields = payload.strip().strip('";').split(",")
+    return code, fields
+
+
 # ─────────────────────────────────────────────────────────────────
 # 交易日判断
 # ─────────────────────────────────────────────────────────────────
@@ -125,10 +174,11 @@ def is_trading_day():
 
     try:
         # 用上证指数判断是否有交易
-        url = f"{SINA_PRICE_URL}sh000001"
-        headers = {"Referer": "https://finance.sina.com.cn"}
-        resp = requests.get(url, headers=headers, timeout=5)
-        data = resp.text.split('"')[1].split(',')
+        resp = safe_get_sina("sh000001", timeout=5)
+        parsed = parse_sina_quote_line(resp.text.strip())
+        if not parsed:
+            return True
+        _, data = parsed
         # 如果当前价格为0或日期不是今天，说明不是交易日
         if len(data) > 30 and data[3] and float(data[3]) > 0:
             trade_date = data[30]  # 格式: 2026-03-16
@@ -146,17 +196,15 @@ def get_price_sina_batch(codes):
         ("sh" if c.startswith(("6", "5")) else "sz") + c
         for c in codes
     )
-    url = f"{SINA_PRICE_URL}{symbols}"
-    headers = {"Referer": "https://finance.sina.com.cn"}
 
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = safe_get_sina(symbols, timeout=10)
         result = {}
         for line in resp.text.strip().split("\n"):
-            if '="' not in line:
+            parsed = parse_sina_quote_line(line)
+            if not parsed:
                 continue
-            code = line.split('"')[0].split("_")[-1][2:]  # 去掉sh/sz前缀
-            data = line.split('"')[1].split(',')
+            code, data = parsed
             if len(data) > 30 and data[3]:
                 try:
                     result[code] = {
