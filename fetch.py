@@ -176,15 +176,6 @@ def is_today_quote(row, today_dash):
     return bool(row and row.get("trade_date") == today_dash)
 
 
-def should_skip_kline_fallback(row, today_dash):
-    """新浪返回旧日期且价格为0时，通常已停牌或当日无成交，无需再打东财回退。"""
-    if not row:
-        return False
-    trade_date = row.get("trade_date")
-    close = row.get("close")
-    return bool(trade_date and trade_date < today_dash and (close is None or close == 0))
-
-
 # ─────────────────────────────────────────────────────────────────
 # 交易日判断
 # ─────────────────────────────────────────────────────────────────
@@ -508,10 +499,8 @@ def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0, use_sina_today=Fa
     if mode == "daily" and use_sina_today:
         log.info("使用新浪接口批量获取今日价格...")
         batch_size = 100
-        market_by_code = dict(stock_rows)
         all_codes = [code for code, _ in stock_rows]
         today_dash = datetime.today().strftime("%Y-%m-%d")
-        today = datetime.today().strftime("%Y%m%d")
 
         for batch_start in range(0, len(all_codes), batch_size):
             batch_codes = all_codes[batch_start:batch_start + batch_size]
@@ -530,24 +519,8 @@ def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0, use_sina_today=Fa
                         fail_codes.append(code)
                         log.warning(f"  ❌ {code} 失败: {e}")
                 else:
-                    if should_skip_kline_fallback(row, today_dash):
-                        fail += 1
-                        fail_codes.append(code)
-                        continue
-                    try:
-                        fallback_rows = fetch_kline(code, market_by_code[code], today)
-                        if fallback_rows and fallback_rows[-1]["trade_date"] == today_dash:
-                            rows = [fallback_rows[-1]]
-                            insert_daily_prices(conn, code, rows)
-                            update_stock_price_range(conn, code, rows)
-                            ok += 1
-                        else:
-                            fail += 1
-                            fail_codes.append(code)
-                    except Exception as e:
-                        fail += 1
-                        fail_codes.append(code)
-                        log.warning(f"  ❌ {code} fallback失败: {e}")
+                    fail += 1
+                    fail_codes.append(code)
 
             if (batch_start + batch_size) % 500 == 0 or (batch_start + batch_size) >= total:
                 elapsed = (time.time() - t0) / 60
