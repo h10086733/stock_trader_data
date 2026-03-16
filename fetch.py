@@ -17,6 +17,7 @@ import time
 import argparse
 import logging
 import sys
+import random
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -26,20 +27,33 @@ from urllib3.util.retry import Retry
 # ─────────────────────────────────────────────────────────────────
 DB_PATH          = "stock_data.db"
 LOG_FILE         = "pipeline.log"
-REQUEST_INTERVAL = 0.35   # 正常请求间隔（秒）
-RETRY_INTERVAL   = 5.0    # 限流后等待时间（秒）
-MAX_RETRIES      = 3      # 单次请求最大重试次数
+REQUEST_INTERVAL = 1.0    # 正常请求间隔（秒）- 增加到1秒避免限流
+RETRY_INTERVAL   = 10.0   # 限流后等待时间（秒）- 增加到10秒
+MAX_RETRIES      = 5      # 单次请求最大重试次数 - 增加到5次
 FAIL_ALERT_RATIO = 0.05   # 失败率超过5%时告警
 HISTORY_START    = "20100101"
 
 STOCK_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 KLINE_URL      = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+SINA_PRICE_URL = "https://hq.sinajs.cn/list="  # 新浪实时行情接口
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://www.eastmoney.com/",
-}
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+]
+
+def get_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Referer": "https://www.eastmoney.com/",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    }
 
 # ─────────────────────────────────────────────────────────────────
 # 日志
@@ -62,14 +76,13 @@ def make_session():
     session = requests.Session()
     retry = Retry(
         total=MAX_RETRIES,
-        backoff_factor=1,                         # 重试等待：1s, 2s, 4s
+        backoff_factor=2,                         # 重试等待：2s, 4s, 8s
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
     )
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     session.mount("http://",  adapter)
     session.mount("https://", adapter)
-    session.headers.update(HEADERS)
     return session
 
 SESSION = make_session()
@@ -79,7 +92,9 @@ def safe_get(url, params, timeout=15):
     """带限流检测的 GET，遇到429或空响应自动等待重试"""
     for attempt in range(MAX_RETRIES):
         try:
-            resp = SESSION.get(url, params=params, timeout=timeout)
+            # 每次请求使用随机User-Agent
+            headers = get_headers()
+            resp = SESSION.get(url, params=params, headers=headers, timeout=timeout)
             if resp.status_code == 429:
                 log.warning(f"  限流(429)，等待 {RETRY_INTERVAL}s  attempt={attempt+1}")
                 time.sleep(RETRY_INTERVAL)
@@ -96,6 +111,69 @@ def safe_get(url, params, timeout=15):
             log.warning(f"  连接错误: {e}，重试  attempt={attempt+1}")
             time.sleep(RETRY_INTERVAL)
     raise RuntimeError(f"请求失败，已重试 {MAX_RETRIES} 次: {url}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# 交易日判断
+# ─────────────────────────────────────────────────────────────────
+def is_trading_day():
+    """判断今天是否为交易日（通过新浪接口检测）"""
+    today = datetime.today()
+    # 周末直接返回False
+    if today.weekday() >= 5:  # 5=周六, 6=周日
+        return False
+
+    try:
+        # 用上证指数判断是否有交易
+        url = f"{SINA_PRICE_URL}sh000001"
+        headers = {"Referer": "https://finance.sina.com.cn"}
+        resp = requests.get(url, headers=headers, timeout=5)
+        data = resp.text.split('"')[1].split(',')
+        # 如果当前价格为0或日期不是今天，说明不是交易日
+        if len(data) > 30 and data[3] and float(data[3]) > 0:
+            trade_date = data[30]  # 格式: 2026-03-16
+            return trade_date == today.strftime("%Y-%m-%d")
+    except Exception as e:
+        log.warning(f"交易日判断失败: {e}，默认认为是交易日")
+        return True  # 出错时默认认为是交易日，避免漏数据
+
+    return False
+
+
+def get_price_sina_batch(codes):
+    """批量获取多只股票当日实时价格（新浪接口）"""
+    symbols = ",".join(
+        ("sh" if c.startswith(("6", "5")) else "sz") + c
+        for c in codes
+    )
+    url = f"{SINA_PRICE_URL}{symbols}"
+    headers = {"Referer": "https://finance.sina.com.cn"}
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        result = {}
+        for line in resp.text.strip().split("\n"):
+            if '="' not in line:
+                continue
+            code = line.split('"')[0].split("_")[-1][2:]  # 去掉sh/sz前缀
+            data = line.split('"')[1].split(',')
+            if len(data) > 30 and data[3]:
+                try:
+                    result[code] = {
+                        "trade_date": data[30],      # 交易日期
+                        "open":       float(data[1]),
+                        "close":      float(data[3]), # 当前价
+                        "high":       float(data[4]),
+                        "low":        float(data[5]),
+                        "volume":     float(data[8]),
+                        "amount":     float(data[9]),
+                    }
+                except (ValueError, IndexError):
+                    continue
+        return result
+    except Exception as e:
+        log.warning(f"新浪接口批量获取失败: {e}")
+        return {}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -197,7 +275,7 @@ def fetch_stock_list():
             if fetched >= total or not diff:
                 break
             page += 1
-            time.sleep(REQUEST_INTERVAL)
+            time.sleep(REQUEST_INTERVAL + random.uniform(0, 0.5))  # 添加随机延迟
 
     log.info(f"股票列表完成，共 {len(all_stocks)} 只")
     return all_stocks
@@ -298,11 +376,14 @@ def update_stock_price_range(conn, code, rows):
 # ─────────────────────────────────────────────────────────────────
 # 单只股票同步
 # ─────────────────────────────────────────────────────────────────
-def sync_one(conn, code, market, mode="init"):
+def sync_one(conn, code, market, mode="init", use_sina_today=False):
     cur = conn.cursor()
 
     if mode == "init":
         start_date = HISTORY_START
+        rows = fetch_kline(code, market, start_date)
+        insert_daily_prices(conn, code, rows)
+        update_stock_price_range(conn, code, rows)
     else:
         # daily：从上次最新日期的次日开始
         cur.execute("SELECT history_end FROM stocks WHERE code=?", (code,))
@@ -310,6 +391,17 @@ def sync_one(conn, code, market, mode="init"):
         last = row[0] if row and row[0] else None
         today_dash = datetime.today().strftime("%Y-%m-%d")
         today = datetime.today().strftime("%Y%m%d")
+
+        # 如果今天是交易日且使用新浪接口
+        if use_sina_today and last and last >= today_dash:
+            # 已经有今天的数据，用新浪接口更新今天的价格
+            sina_data = get_price_sina_batch([code])
+            if code in sina_data:
+                rows = [sina_data[code]]
+                insert_daily_prices(conn, code, rows)
+                update_stock_price_range(conn, code, rows)
+            return
+
         if last:
             if last >= today_dash:
                 # 当天盘中已写入过日K时，继续刷新今天这根K线，直到收盘定稿。
@@ -321,37 +413,73 @@ def sync_one(conn, code, market, mode="init"):
         else:
             start_date = HISTORY_START
 
-    rows = fetch_kline(code, market, start_date)
-    insert_daily_prices(conn, code, rows)
-    update_stock_price_range(conn, code, rows)
-    time.sleep(REQUEST_INTERVAL)
+        rows = fetch_kline(code, market, start_date)
+        insert_daily_prices(conn, code, rows)
+        update_stock_price_range(conn, code, rows)
+
+    time.sleep(REQUEST_INTERVAL + random.uniform(0, 0.5))  # 添加随机延迟
 
 
 # ─────────────────────────────────────────────────────────────────
 # 批量执行框架
 # ─────────────────────────────────────────────────────────────────
-def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0):
+def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0, use_sina_today=False):
     t0     = time.time()
     total  = len(stock_rows)
     ok, fail = 0, 0
     fail_codes = []
 
-    for i, (code, market) in enumerate(stock_rows):
-        try:
-            sync_one(conn, code, market, mode=mode)
-            ok += 1
-        except Exception as e:
-            fail += 1
-            fail_codes.append(code)
-            log.warning(f"  ❌ {code} 失败: {e}")
+    # 如果是daily模式且使用新浪接口，批量获取今日价格
+    if mode == "daily" and use_sina_today:
+        log.info("使用新浪接口批量获取今日价格...")
+        batch_size = 100
+        all_codes = [code for code, _ in stock_rows]
 
-        if (i + 1) % 100 == 0 or (i + 1) == total:
-            elapsed = (time.time() - t0) / 60
-            done    = ok + fail
-            eta     = (elapsed / done * (total - done)) if done > 0 else 0
-            log.info(f"  进度 {i+1}/{total}  "
-                     f"成功:{ok}  失败:{fail}  "
-                     f"已用:{elapsed:.1f}min  预计剩余:{eta:.1f}min")
+        for batch_start in range(0, len(all_codes), batch_size):
+            batch_codes = all_codes[batch_start:batch_start + batch_size]
+            sina_prices = get_price_sina_batch(batch_codes)
+
+            for code in batch_codes:
+                if code in sina_prices:
+                    try:
+                        rows = [sina_prices[code]]
+                        insert_daily_prices(conn, code, rows)
+                        update_stock_price_range(conn, code, rows)
+                        ok += 1
+                    except Exception as e:
+                        fail += 1
+                        fail_codes.append(code)
+                        log.warning(f"  ❌ {code} 失败: {e}")
+                else:
+                    fail += 1
+                    fail_codes.append(code)
+
+            if (batch_start + batch_size) % 500 == 0 or (batch_start + batch_size) >= total:
+                elapsed = (time.time() - t0) / 60
+                done = ok + fail
+                eta = (elapsed / done * (total - done)) if done > 0 else 0
+                log.info(f"  进度 {done}/{total}  成功:{ok}  失败:{fail}  "
+                        f"已用:{elapsed:.1f}min  预计剩余:{eta:.1f}min")
+
+            time.sleep(0.1)  # 批量请求间隔
+    else:
+        # 原有逻辑：逐个同步
+        for i, (code, market) in enumerate(stock_rows):
+            try:
+                sync_one(conn, code, market, mode=mode, use_sina_today=False)
+                ok += 1
+            except Exception as e:
+                fail += 1
+                fail_codes.append(code)
+                log.warning(f"  ❌ {code} 失败: {e}")
+
+            if (i + 1) % 100 == 0 or (i + 1) == total:
+                elapsed = (time.time() - t0) / 60
+                done    = ok + fail
+                eta     = (elapsed / done * (total - done)) if done > 0 else 0
+                log.info(f"  进度 {i+1}/{total}  "
+                         f"成功:{ok}  失败:{fail}  "
+                         f"已用:{elapsed:.1f}min  预计剩余:{eta:.1f}min")
 
     duration   = time.time() - t0
     fail_ratio = fail / total if total > 0 else 0
@@ -422,6 +550,11 @@ def run_daily_sync(conn):
     log.info("=" * 55)
     log.info(f"每日同步  {datetime.today().strftime('%Y-%m-%d %H:%M')}")
 
+    # 判断是否为交易日
+    if not is_trading_day():
+        log.info("今天不是交易日，跳过同步")
+        return
+
     # 刷新股票列表，自动捕获新上市
     new_list = fetch_stock_list()
     cur = conn.cursor()
@@ -434,7 +567,7 @@ def run_daily_sync(conn):
 
     cur.execute("SELECT code, market FROM stocks ORDER BY code")
     rows = cur.fetchall()
-    run_batch(conn, rows, mode="daily", sync_type="daily", new_stocks=len(new_codes))
+    run_batch(conn, rows, mode="daily", sync_type="daily", new_stocks=len(new_codes), use_sina_today=True)
 
 
 def run_status(conn):
