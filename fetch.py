@@ -75,6 +75,9 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger(__name__)
+# urllib3 的逐次重试日志噪音很大，保留我们自己的最终失败日志即可。
+logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
+logging.getLogger("urllib3.util.retry").setLevel(logging.ERROR)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -167,6 +170,19 @@ def to_sina_symbol(code):
     if code.startswith("92"):
         return "bj" + code
     return ("sh" if code.startswith(("5", "6", "9")) else "sz") + code
+
+
+def is_today_quote(row, today_dash):
+    return bool(row and row.get("trade_date") == today_dash)
+
+
+def should_skip_kline_fallback(row, today_dash):
+    """新浪返回旧日期且价格为0时，通常已停牌或当日无成交，无需再打东财回退。"""
+    if not row:
+        return False
+    trade_date = row.get("trade_date")
+    close = row.get("close")
+    return bool(trade_date and trade_date < today_dash and (close is None or close == 0))
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -454,8 +470,9 @@ def sync_one(conn, code, market, mode="init", use_sina_today=False):
         if use_sina_today and last and last >= today_dash:
             # 已经有今天的数据，用新浪接口更新今天的价格
             sina_data = get_price_sina_batch([code])
-            if code in sina_data:
-                rows = [sina_data[code]]
+            row = sina_data.get(code)
+            if is_today_quote(row, today_dash):
+                rows = [row]
                 insert_daily_prices(conn, code, rows)
                 update_stock_price_range(conn, code, rows)
             return
@@ -502,7 +519,7 @@ def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0, use_sina_today=Fa
 
             for code in batch_codes:
                 row = sina_prices.get(code)
-                if row and row.get("trade_date") == today_dash:
+                if is_today_quote(row, today_dash):
                     try:
                         rows = [row]
                         insert_daily_prices(conn, code, rows)
@@ -513,6 +530,10 @@ def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0, use_sina_today=Fa
                         fail_codes.append(code)
                         log.warning(f"  ❌ {code} 失败: {e}")
                 else:
+                    if should_skip_kline_fallback(row, today_dash):
+                        fail += 1
+                        fail_codes.append(code)
+                        continue
                     try:
                         fallback_rows = fetch_kline(code, market_by_code[code], today)
                         if fallback_rows and fallback_rows[-1]["trade_date"] == today_dash:
