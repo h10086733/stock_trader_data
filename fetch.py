@@ -162,6 +162,13 @@ def parse_sina_quote_line(line):
     return code, fields
 
 
+def to_sina_symbol(code):
+    """将证券代码映射为新浪行情前缀代码"""
+    if code.startswith("92"):
+        return "bj" + code
+    return ("sh" if code.startswith(("5", "6", "9")) else "sz") + code
+
+
 # ─────────────────────────────────────────────────────────────────
 # 交易日判断
 # ─────────────────────────────────────────────────────────────────
@@ -192,10 +199,7 @@ def is_trading_day():
 
 def get_price_sina_batch(codes):
     """批量获取多只股票当日实时价格（新浪接口）"""
-    symbols = ",".join(
-        ("sh" if c.startswith(("6", "5")) else "sz") + c
-        for c in codes
-    )
+    symbols = ",".join(to_sina_symbol(c) for c in codes)
 
     try:
         resp = safe_get_sina(symbols, timeout=10)
@@ -207,14 +211,20 @@ def get_price_sina_batch(codes):
             code, data = parsed
             if len(data) > 30 and data[3]:
                 try:
+                    prev_close = float(data[2]) if data[2] else None
+                    close = float(data[3])
                     result[code] = {
                         "trade_date": data[30],      # 交易日期
                         "open":       float(data[1]),
-                        "close":      float(data[3]), # 当前价
+                        "close":      close,          # 当前价
                         "high":       float(data[4]),
                         "low":        float(data[5]),
-                        "volume":     float(data[8]),
+                        # 新浪实时接口返回的是股数，这里统一换算成“手”以匹配日K数据口径
+                        "volume":     float(data[8]) / 100.0,
                         "amount":     float(data[9]),
+                        "pct_change": ((close - prev_close) / prev_close * 100.0)
+                                      if prev_close else None,
+                        "turnover":   None,
                     }
                 except (ValueError, IndexError):
                     continue
@@ -396,8 +406,8 @@ def insert_daily_prices(conn, code, rows):
             amount     = excluded.amount,
             pct_change = excluded.pct_change,
             turnover   = excluded.turnover
-    """, [(code, r["trade_date"], r["open"], r["close"], r["high"],
-           r["low"], r["volume"], r["amount"], r["pct_change"], r["turnover"])
+    """, [(code, r.get("trade_date"), r.get("open"), r.get("close"), r.get("high"),
+           r.get("low"), r.get("volume"), r.get("amount"), r.get("pct_change"), r.get("turnover"))
           for r in rows])
     conn.commit()
     return len(rows)
@@ -481,16 +491,20 @@ def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0, use_sina_today=Fa
     if mode == "daily" and use_sina_today:
         log.info("使用新浪接口批量获取今日价格...")
         batch_size = 100
+        market_by_code = dict(stock_rows)
         all_codes = [code for code, _ in stock_rows]
+        today_dash = datetime.today().strftime("%Y-%m-%d")
+        today = datetime.today().strftime("%Y%m%d")
 
         for batch_start in range(0, len(all_codes), batch_size):
             batch_codes = all_codes[batch_start:batch_start + batch_size]
             sina_prices = get_price_sina_batch(batch_codes)
 
             for code in batch_codes:
-                if code in sina_prices:
+                row = sina_prices.get(code)
+                if row and row.get("trade_date") == today_dash:
                     try:
-                        rows = [sina_prices[code]]
+                        rows = [row]
                         insert_daily_prices(conn, code, rows)
                         update_stock_price_range(conn, code, rows)
                         ok += 1
@@ -499,8 +513,20 @@ def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0, use_sina_today=Fa
                         fail_codes.append(code)
                         log.warning(f"  ❌ {code} 失败: {e}")
                 else:
-                    fail += 1
-                    fail_codes.append(code)
+                    try:
+                        fallback_rows = fetch_kline(code, market_by_code[code], today)
+                        if fallback_rows and fallback_rows[-1]["trade_date"] == today_dash:
+                            rows = [fallback_rows[-1]]
+                            insert_daily_prices(conn, code, rows)
+                            update_stock_price_range(conn, code, rows)
+                            ok += 1
+                        else:
+                            fail += 1
+                            fail_codes.append(code)
+                    except Exception as e:
+                        fail += 1
+                        fail_codes.append(code)
+                        log.warning(f"  ❌ {code} fallback失败: {e}")
 
             if (batch_start + batch_size) % 500 == 0 or (batch_start + batch_size) >= total:
                 elapsed = (time.time() - t0) / 60
