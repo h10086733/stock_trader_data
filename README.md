@@ -97,7 +97,7 @@ stock_trader_data/
 ### 1. 安装依赖
 
 ```bash
-pip install requests flask xlrd openpyxl
+pip install requests flask xlrd openpyxl baostock
 ```
 
 ### 2. 初始化价格数据
@@ -170,7 +170,7 @@ python index_stats.py --calc-intraday
 # 收盘后做最终日线计算
 python index_stats.py --calc-today
 
-# 启动 Web 页面（访问 http://localhost:5000）
+# 启动 Web 页面（行业宽度 http://localhost:5000，14:30 选股 http://localhost:5000/momentum）
 python app.py
 ```
 
