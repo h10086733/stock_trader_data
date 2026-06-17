@@ -13,11 +13,13 @@ from datetime import datetime, timedelta, time as dt_time
 import argparse
 import json
 import math
+import os
 import sys
 import threading
 import time
 import sqlite3
 import requests
+from werkzeug.exceptions import HTTPException
 
 try:
     import baostock as bs
@@ -25,7 +27,12 @@ except ImportError:
     bs = None
 
 app = Flask(__name__)
-DB_PATH = "stock_data.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = (
+    os.environ.get("STOCK_TRADER_DB_PATH")
+    or os.environ.get("STOCK_DB_PATH")
+    or os.path.join(BASE_DIR, "stock_data.db")
+)
 EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 EASTMONEY_TRENDS_URLS = [
     "https://push2delay.eastmoney.com/api/qt/stock/trends2/get",
@@ -50,9 +57,36 @@ KLINE_CACHE_DB_READY = False
 
 
 def get_db():
+    if not os.path.exists(DB_PATH):
+        raise FileNotFoundError(f"数据库文件不存在: {DB_PATH}")
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+@app.errorhandler(Exception)
+def handle_error(error):
+    if isinstance(error, HTTPException):
+        status_code = error.code or 500
+        message = error.description
+    else:
+        status_code = 500
+        message = str(error) or error.__class__.__name__
+        app.logger.exception("Unhandled exception while handling %s", request.path)
+
+    if request.path.startswith("/api/"):
+        return jsonify({
+            "error": message,
+            "type": error.__class__.__name__,
+            "status": status_code,
+        }), status_code
+
+    if isinstance(error, HTTPException):
+        return error
+    return render_template_string(
+        "<h1>Internal Server Error</h1><p>{{ message }}</p>",
+        message=message,
+    ), status_code
 
 
 def ensure_kline_cache_table(conn):
