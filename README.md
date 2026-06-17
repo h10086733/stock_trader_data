@@ -183,8 +183,41 @@ python app.py
 ```bash
 # crontab -e
 30 11 * * 1-5  cd ~/project/stock_trader_data && python3 fetch.py --sync && python3 index_stats.py --calc-intraday >> cron.log 2>&1
+30 14 * * 1-5  cd ~/project/stock_trader_data && python3 app.py --momentum-daily >> momentum_cron.log 2>&1
 00 15 * * 1-5 cd ~/project/stock_trader_data && python3 fetch.py --sync && python3 index_stats.py --calc-intraday >> cron.log 2>&1
 35 16 * * 1-5  cd ~/project/stock_trader_data && python3 fetch.py --sync && python3 index_stats.py --calc-today >> cron.log 2>&1
+20 18 * * 0 cd ~/project/stock_trader_data && python3 index.py --update-all >> index_constituents_cron.log 2>&1
+```
+
+14:30 动量选股任务会先结算最近一个已保存买入日的次日 10:00 前卖出收益，再扫描并保存当天 14:30 入选股票。常用命令：
+
+```bash
+# 手动执行完整日任务
+python3 app.py --momentum-daily
+
+# 只扫描并保存当天14:30选股
+python3 app.py --momentum-scan-save
+
+# 只补算前一交易日买入、今天10:00前卖出的收益
+python3 app.py --momentum-settle
+
+# 查看最近收益记录
+python3 app.py --momentum-report --report-limit 50
+
+# 回填最近30个自然日内的交易日，并统计下一交易日10:00前卖出收益
+python3 app.py --momentum-backfill --backfill-days 30 --verify-limit 200
+
+# 指定日期区间回填
+python3 app.py --momentum-backfill --backfill-start 2026-05-15 --backfill-end 2026-06-15 --verify-limit 200
+```
+
+历史回填优先使用历史分钟线复算 14:30 买入和次日 10:00 前卖出。如果历史分钟线接口不可用，会自动回退为日线近似口径：当天收盘价近似买入、下一交易日开盘价近似 10:00 前卖出，并在记录中标记 `daily_open_fallback`。如需禁用近似口径：
+
+```bash
+python3 app.py --momentum-backfill --backfill-days 30 --no-daily-fallback
+
+# 已确认历史分钟线不可用时，可直接用日线近似口径快速回填
+python3 app.py --momentum-backfill --backfill-days 30 --daily-fallback-only
 ```
 
 ### 添加指数成分股

@@ -56,6 +56,10 @@ CSINDEX_URL_TEMPLATE = (
     "https://oss-ch.csindex.com.cn/static/html/csindex/public/"
     "uploads/file/autofile/cons/{code}cons.xls"
 )
+CSINDEX_WEIGHT_URL_TEMPLATE = (
+    "https://oss-ch.csindex.com.cn/static/html/csindex/public/"
+    "uploads/file/autofile/closeweight/{code}closeweight.xls"
+)
 
 # 国证指数官网样本下载URL模板
 CNINDEX_URL_TEMPLATE = (
@@ -126,6 +130,7 @@ def init_db(conn):
             stock_name   TEXT,               -- 股票名称
             exchange     TEXT,               -- 交易所：SH / SZ
             weight       REAL,               -- 权重%（如有）
+            weight_date  DATE,               -- 权重文件日期（如有）
             in_date      DATE,               -- 纳入日期（如有）
             updated_at   DATETIME DEFAULT (datetime('now','localtime')),
             PRIMARY KEY (index_code, stock_code)
@@ -138,6 +143,7 @@ def init_db(conn):
     """)
 
     migrate_indices_schema(conn)
+    migrate_constituents_schema(conn)
     conn.commit()
     log.info("指数相关表就绪")
 
@@ -157,6 +163,12 @@ def migrate_indices_schema(conn):
         END
         WHERE channel IS NULL OR TRIM(channel) = ''
     """)
+
+
+def migrate_constituents_schema(conn):
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(index_constituents)")}
+    if "weight_date" not in cols:
+        conn.execute("ALTER TABLE index_constituents ADD COLUMN weight_date DATE")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -224,16 +236,40 @@ def parse_weight(value):
         return None
 
 
+def parse_date_value(value):
+    if value is None:
+        return None
+    if isinstance(value, float) and value.is_integer():
+        text = str(int(value))
+    else:
+        text = str(value).strip()
+    text = text.replace("/", "-")
+    if not text:
+        return None
+    if text.endswith(".0"):
+        text = text[:-2]
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    return None
+
+
 def find_header_columns(row):
-    code_col = name_col = exch_col = weight_col = None
+    date_col = code_col = name_col = exch_col = weight_col = None
 
     for idx, cell in enumerate(row):
         val = str(cell or "").strip().replace(" ", "").replace("\n", "")
         if not val:
             continue
 
+        if date_col is None and ("日期" in val or val.lower() == "date"):
+            date_col = idx
+            continue
+
         if code_col is None and (
             "成分券代码" in val
+            or "成份券代码" in val
             or "样本代码" in val
             or ("代码" in val and "指数" not in val and "日期" not in val)
         ):
@@ -242,6 +278,7 @@ def find_header_columns(row):
 
         if name_col is None and (
             "成分券名称" in val
+            or "成份券名称" in val
             or "样本简称" in val
             or ("名称" in val and "指数" not in val)
         ):
@@ -255,10 +292,10 @@ def find_header_columns(row):
         if weight_col is None and "权重" in val:
             weight_col = idx
 
-    return code_col, name_col, exch_col, weight_col
+    return date_col, code_col, name_col, exch_col, weight_col
 
 
-def parse_constituent_row(row, code_col, name_col, exch_col, weight_col):
+def parse_constituent_row(row, date_col, code_col, name_col, exch_col, weight_col):
     if code_col is None or code_col >= len(row):
         return None
 
@@ -280,10 +317,17 @@ def parse_constituent_row(row, code_col, name_col, exch_col, weight_col):
         "exchange": infer_exchange(stock_code, exch_text),
     }
 
+    if date_col is not None and date_col < len(row):
+        as_of_date = parse_date_value(row[date_col])
+        if as_of_date:
+            item["as_of_date"] = as_of_date
+
     if weight_col is not None and weight_col < len(row):
         weight = parse_weight(row[weight_col])
         if weight is not None:
             item["weight"] = weight
+            if item.get("as_of_date"):
+                item["weight_date"] = item["as_of_date"]
 
     return item
 
@@ -318,28 +362,28 @@ def parse_xls(content, index_code):
 
             # 自动识别列位置（兼容中证/国证两类格式）
             header_row = 0
-            code_col = name_col = exch_col = weight_col = None
+            date_col = code_col = name_col = exch_col = weight_col = None
             for r in range(min(5, ws.nrows)):
                 row = [str(ws.cell_value(r, c)).strip() for c in range(ws.ncols)]
-                code_col, name_col, exch_col, weight_col = find_header_columns(row)
+                date_col, code_col, name_col, exch_col, weight_col = find_header_columns(row)
                 if code_col is not None and name_col is not None:
                     header_row = r
                     break
 
             # 如果找不到表头，用中证默认列（第3/4/5列）
             if code_col is None:
-                code_col, name_col, exch_col, weight_col = 3, 4, 5, None
+                date_col, code_col, name_col, exch_col, weight_col = 0, 3, 4, 5, None
                 header_row = 1
                 log.warning(f"  未识别到表头，使用默认列位置 code={code_col} name={name_col}")
 
             log.info(
-                f"  表头行={header_row} 代码列={code_col} 名称列={name_col} "
+                f"  表头行={header_row} 日期列={date_col} 代码列={code_col} 名称列={name_col} "
                 f"交易所列={exch_col} 权重列={weight_col}"
             )
 
             for r in range(header_row + 1, ws.nrows):
                 row = [ws.cell_value(r, c) for c in range(ws.ncols)]
-                item = parse_constituent_row(row, code_col, name_col, exch_col, weight_col)
+                item = parse_constituent_row(row, date_col, code_col, name_col, exch_col, weight_col)
                 if item:
                     constituents.append(item)
             return constituents
@@ -356,22 +400,22 @@ def parse_xls(content, index_code):
 
             # 找表头行
             header_row = 0
-            code_col = name_col = exch_col = weight_col = None
+            date_col = code_col = name_col = exch_col = weight_col = None
             for r_idx, row in enumerate(rows[:5]):
                 row = [str(c).strip() if c else "" for c in row]
-                code_col, name_col, exch_col, weight_col = find_header_columns(row)
+                date_col, code_col, name_col, exch_col, weight_col = find_header_columns(row)
                 if code_col is not None and name_col is not None:
                     header_row = r_idx
                     break
 
             if code_col is None:
-                code_col, name_col, exch_col, weight_col = 3, 4, 5, None
+                date_col, code_col, name_col, exch_col, weight_col = 0, 3, 4, 5, None
                 header_row = 1
 
             for row in rows[header_row + 1:]:
                 if not row:
                     continue
-                item = parse_constituent_row(row, code_col, name_col, exch_col, weight_col)
+                item = parse_constituent_row(row, date_col, code_col, name_col, exch_col, weight_col)
                 if item:
                     constituents.append(item)
             return constituents
@@ -379,6 +423,45 @@ def parse_xls(content, index_code):
             log.error(f"  openpyxl解析也失败: {e}")
 
     raise RuntimeError("xlrd 和 openpyxl 都不可用，请先安装：pip install xlrd openpyxl")
+
+
+def merge_constituent_weights(constituents, weight_rows):
+    """按股票代码把官方权重表合并到当前成分股表。"""
+    weights = {
+        row["stock_code"]: row
+        for row in weight_rows
+        if row.get("stock_code") and row.get("weight") is not None
+    }
+    matched = 0
+    for item in constituents:
+        weight_row = weights.get(item["stock_code"])
+        if not weight_row:
+            continue
+        item["weight"] = weight_row["weight"]
+        item["weight_date"] = weight_row.get("weight_date") or weight_row.get("as_of_date")
+        if not item.get("stock_name") and weight_row.get("stock_name"):
+            item["stock_name"] = weight_row["stock_name"]
+        if not item.get("exchange") and weight_row.get("exchange"):
+            item["exchange"] = weight_row["exchange"]
+        matched += 1
+    return matched
+
+
+def enrich_csindex_weights(index_code, constituents, headers):
+    """中证成分文件不带权重；权重在 closeweight 独立文件。"""
+    url = CSINDEX_WEIGHT_URL_TEMPLATE.format(code=index_code)
+    try:
+        log.info(f"  下载权重文件: {url}")
+        content = download_xls(url, headers)
+        weight_rows = parse_xls(content, index_code)
+        matched = merge_constituent_weights(constituents, weight_rows)
+        log.info(
+            f"  权重合并完成，权重文件 {len(weight_rows)} 条，匹配当前成分 {matched} 条"
+        )
+    except requests.HTTPError as e:
+        log.warning(f"  权重文件下载失败，保留无权重成分: {e}")
+    except Exception as e:
+        log.warning(f"  权重文件解析失败，保留无权重成分: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -418,13 +501,14 @@ def save_constituents(conn, index_code, constituents):
     # 批量插入新成分股
     conn.executemany("""
         INSERT INTO index_constituents
-            (index_code, stock_code, stock_name, exchange, weight, in_date, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, datetime('now','localtime'))
+            (index_code, stock_code, stock_name, exchange, weight, weight_date, in_date, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))
     """, [(index_code,
            c["stock_code"],
            c["stock_name"],
            c["exchange"],
            c.get("weight"),
+           c.get("weight_date"),
            c.get("in_date"))
           for c in constituents])
 
@@ -504,6 +588,9 @@ def import_index(conn, index_code, index_name=None, channel=None):
         if not constituents:
             log.error(f"  [{index_code}] 解析结果为空，请检查XLS格式")
             return False
+
+        if resolved_channel == "csindex":
+            enrich_csindex_weights(index_code, constituents, headers)
 
         log.info(f"  解析完成，共 {len(constituents)} 只成分股")
         log.info(f"  前5只: {[c['stock_code'] + ' ' + c['stock_name'] for c in constituents[:5]]}")

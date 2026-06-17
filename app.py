@@ -10,8 +10,10 @@
 from flask import Flask, jsonify, render_template_string, request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, time as dt_time
+import argparse
 import json
 import math
+import sys
 import threading
 import time
 import sqlite3
@@ -72,6 +74,86 @@ def ensure_kline_cache_table(conn):
     KLINE_CACHE_DB_READY = True
 
 
+def ensure_momentum_tables(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS momentum_scan_runs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date      DATE NOT NULL,
+            cutoff          TEXT NOT NULL,
+            pool            TEXT NOT NULL,
+            index_code      TEXT,
+            min_gain        REAL,
+            max_gain        REAL,
+            min_vol_ratio   REAL,
+            min_amount_wan  REAL,
+            limit_count     INTEGER,
+            verify_limit    INTEGER,
+            workers         INTEGER,
+            universe        INTEGER,
+            quoted          INTEGER,
+            prefiltered     INTEGER,
+            verified        INTEGER,
+            minute_success  INTEGER,
+            minute_failed   INTEGER,
+            cache_hits      INTEGER,
+            elapsed_s       REAL,
+            row_count       INTEGER,
+            status          TEXT,
+            error           TEXT,
+            params_json     TEXT,
+            created_at      DATETIME DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS momentum_picks (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id             INTEGER,
+            trade_date         DATE NOT NULL,
+            cutoff             TEXT NOT NULL,
+            pool               TEXT NOT NULL,
+            index_code         TEXT,
+            code               TEXT NOT NULL,
+            name               TEXT,
+            buy_price          REAL,
+            buy_pct            REAL,
+            score              REAL,
+            amount_yi          REAL,
+            volume_ratio       REAL,
+            volume_full_ratio  REAL,
+            close_position     REAL,
+            pullback_pct       REAL,
+            high_time          TEXT,
+            reasons            TEXT,
+            row_json           TEXT,
+            created_at         DATETIME DEFAULT (datetime('now','localtime')),
+            updated_at         DATETIME DEFAULT (datetime('now','localtime')),
+            UNIQUE(trade_date, cutoff, pool, index_code, code)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS momentum_pick_returns (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            pick_id        INTEGER NOT NULL UNIQUE,
+            buy_date       DATE NOT NULL,
+            sell_date      DATE NOT NULL,
+            code           TEXT NOT NULL,
+            name           TEXT,
+            buy_price      REAL,
+            sell_price     REAL,
+            return_pct     REAL,
+            sell_cutoff    TEXT NOT NULL,
+            sell_time      TEXT,
+            status         TEXT NOT NULL,
+            error          TEXT,
+            created_at     DATETIME DEFAULT (datetime('now','localtime')),
+            updated_at     DATETIME DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mom_picks_date ON momentum_picks(trade_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mom_returns_date ON momentum_pick_returns(sell_date)")
+    conn.commit()
+
+
 def clamp(value, low, high):
     return max(low, min(high, value))
 
@@ -111,6 +193,79 @@ def to_float_arg(name, default, min_value=None, max_value=None):
     return value
 
 
+def coerce_int(value, default, min_value=None, max_value=None):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def coerce_float(value, default, min_value=None, max_value=None):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def get_source_value(source, *names, default=None):
+    for name in names:
+        value = source.get(name)
+        if value is not None:
+            return value
+    return default
+
+
+def build_momentum_params(source=None):
+    source = source or {}
+    pool = source.get("pool", "all")
+    index_code = get_source_value(source, "indexCode", "index_code", default="") or ""
+    if pool == "index" and not index_code:
+        pool = "all"
+    cutoff_text = source.get("cutoff", "14:30")
+    cutoff = parse_cutoff_time(cutoff_text)
+    cutoff_text = cutoff.strftime("%H:%M")
+    min_gain = coerce_float(get_source_value(source, "minGain", "min_gain"),
+                            2.0, -5, 15)
+    max_gain = coerce_float(get_source_value(source, "maxGain", "max_gain"),
+                            7.5, min_gain, 20)
+    return {
+        "pool": pool,
+        "index_code": index_code,
+        "cutoff": cutoff_text,
+        "trade_date": (
+            source.get("tradeDate")
+            or source.get("trade_date")
+            or default_scan_trade_date()
+        ),
+        "min_gain": min_gain,
+        "max_gain": max_gain,
+        "min_vol_ratio": coerce_float(
+            get_source_value(source, "minVolRatio", "min_vol_ratio"),
+            1.5, 0.2, 10,
+        ),
+        "min_amount_wan": coerce_float(
+            get_source_value(source, "minAmount", "min_amount"),
+            8000, 0, 1000000,
+        ),
+        "limit": coerce_int(source.get("limit"), 80, 1, 300),
+        "verify_limit": coerce_int(
+            get_source_value(source, "verifyLimit", "verify_limit"),
+            50, 1, 1000,
+        ),
+        "workers": coerce_int(source.get("workers"), 6, 2, 12),
+    }
+
+
 def to_sina_symbol(code):
     if code.startswith("92"):
         return "bj" + code
@@ -140,6 +295,10 @@ def default_scan_trade_date():
     if now.time() < dt_time(6, 0):
         now = now - timedelta(days=1)
     return now.strftime("%Y-%m-%d")
+
+
+def is_current_scan_date(trade_date):
+    return (trade_date or default_scan_trade_date()) == default_scan_trade_date()
 
 
 def trade_elapsed_ratio(cutoff):
@@ -387,6 +546,55 @@ def fetch_eastmoney_5m_kline(stock, cutoff_text):
     return []
 
 
+def fetch_eastmoney_1m_kline_for_date(stock, cutoff_text, trade_date):
+    secid = f"{infer_market(stock['code'], stock.get('market'))}.{stock['code']}"
+    today = trade_date.replace("-", "")
+    params = {
+        "secid": secid,
+        "ut": "8dec03ba335b81bf4ebdf7b29ec27d15",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": 1,
+        "fqt": 1,
+        "beg": today,
+        "end": today,
+        "lmt": 360,
+    }
+    headers = {
+        "User-Agent": HTTP_HEADERS["User-Agent"],
+        "Referer": "https://quote.eastmoney.com/",
+    }
+    try:
+        klines = (get_json_with_retry(
+            EASTMONEY_KLINE_URL,
+            params,
+            headers,
+            timeout=4,
+            retries=1,
+        ).get("data") or {}).get("klines") or []
+    except Exception:
+        return []
+
+    bars = []
+    for item in klines:
+        parts = item.split(",")
+        if len(parts) < 7:
+            continue
+        hhmm = parts[0][-5:]
+        if hhmm > cutoff_text:
+            continue
+        bars.append({
+            "time": hhmm,
+            "open": to_float(parts[1]),
+            "close": to_float(parts[2]),
+            "high": to_float(parts[3]),
+            "low": to_float(parts[4]),
+            "volume": to_float(parts[5], 0) or 0,
+            "amount": to_float(parts[6], 0) or 0,
+        })
+    return bars
+
+
 def get_cached_kline(code, cutoff_text, trade_date=None):
     today = trade_date or default_scan_trade_date()
     key = (today, code, cutoff_text)
@@ -455,27 +663,53 @@ def fetch_baostock_5m_klines_parallel(stocks, cutoff_text, max_workers=4,
     if not missing:
         return result, len(cached)
 
-    still_missing = []
-    with ThreadPoolExecutor(max_workers=min(max_workers, 10)) as executor:
-        futures = {
-            executor.submit(fetch_eastmoney_5m_kline, stock, cutoff_text): stock
-            for stock in missing
-        }
-        for future in as_completed(futures):
-            stock = futures[future]
-            try:
-                bars = future.result()
-            except Exception:
-                bars = []
-            if bars:
-                result[stock["code"]] = bars
-                set_cached_kline(stock["code"], cutoff_text, bars,
-                                 source="eastmoney", trade_date=scan_date)
-            else:
-                still_missing.append(stock)
+    if not is_current_scan_date(scan_date):
+        with ThreadPoolExecutor(max_workers=min(max_workers, 10)) as executor:
+            futures = {
+                executor.submit(
+                    fetch_eastmoney_1m_kline_for_date,
+                    stock,
+                    cutoff_text,
+                    scan_date,
+                ): stock
+                for stock in missing
+            }
+            for future in as_completed(futures):
+                stock = futures[future]
+                try:
+                    bars = future.result()
+                except Exception:
+                    bars = []
+                if bars:
+                    result[stock["code"]] = bars
+                    set_cached_kline(stock["code"], cutoff_text, bars,
+                                 source="eastmoney-history", trade_date=scan_date)
+        return result, len(cached)
 
-    # baostock 很慢，只兜底少量失败项，避免页面长时间卡住。
-    for stock in still_missing[:5]:
+    still_missing = missing
+    if is_current_scan_date(scan_date):
+        still_missing = []
+        with ThreadPoolExecutor(max_workers=min(max_workers, 10)) as executor:
+            futures = {
+                executor.submit(fetch_eastmoney_5m_kline, stock, cutoff_text): stock
+                for stock in missing
+            }
+            for future in as_completed(futures):
+                stock = futures[future]
+                try:
+                    bars = future.result()
+                except Exception:
+                    bars = []
+                if bars:
+                    result[stock["code"]] = bars
+                    set_cached_kline(stock["code"], cutoff_text, bars,
+                                     source="eastmoney", trade_date=scan_date)
+                else:
+                    still_missing.append(stock)
+
+    # baostock 很慢：实时页面只兜底少量失败项；历史回填需要完整获取候选项。
+    fallback_limit = len(still_missing) if not is_current_scan_date(scan_date) else 5
+    for stock in still_missing[:fallback_limit]:
         bars = fetch_baostock_5m_kline_uncached(stock, cutoff_text, scan_date)
         if bars:
             result[stock["code"]] = bars
@@ -674,11 +908,19 @@ def fetch_minute_kline(stock, cutoff_text, trade_date=None):
     if bars:
         return bars
 
-    bars = fetch_eastmoney_5m_kline(stock, cutoff_text)
-    if bars:
-        set_cached_kline(stock["code"], cutoff_text, bars,
-                         source="eastmoney", trade_date=scan_date)
-        return bars
+    if is_current_scan_date(scan_date):
+        bars = fetch_eastmoney_5m_kline(stock, cutoff_text)
+        if bars:
+            set_cached_kline(stock["code"], cutoff_text, bars,
+                             source="eastmoney", trade_date=scan_date)
+            return bars
+    else:
+        bars = fetch_eastmoney_1m_kline_for_date(stock, cutoff_text, scan_date)
+        if bars:
+            set_cached_kline(stock["code"], cutoff_text, bars,
+                             source="eastmoney-history", trade_date=scan_date)
+            return bars
+        return []
 
     bars = fetch_baostock_5m_kline_uncached(stock, cutoff_text, scan_date)
     if bars:
@@ -687,91 +929,51 @@ def fetch_minute_kline(stock, cutoff_text, trade_date=None):
         return bars
 
     secid = f"{infer_market(stock['code'], stock.get('market'))}.{stock['code']}"
-    trend_params = {
-        "secid": secid,
-        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
-        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
-        "ndays": 1,
-        "iscr": 0,
-        "iscca": 0,
-    }
-    headers = {
-        "User-Agent": HTTP_HEADERS["User-Agent"],
-        "Referer": "https://quote.eastmoney.com/",
-    }
-    try:
-        trends = (get_json_with_retry(
-            EASTMONEY_TRENDS_URLS[-1],
-            trend_params,
-            headers,
-            timeout=4,
-            retries=2,
-        ).get("data") or {}).get("trends") or []
-        bars = []
-        for item in trends:
-            parts = item.split(",")
-            if len(parts) < 7:
-                continue
-            hhmm = parts[0][-5:]
-            if hhmm > cutoff_text:
-                continue
-            bars.append({
-                "time": hhmm,
-                "open": to_float(parts[1]),
-                "close": to_float(parts[2]),
-                "high": to_float(parts[3]),
-                "low": to_float(parts[4]),
-                "volume": to_float(parts[5], 0) or 0,
-                "amount": to_float(parts[6], 0) or 0,
-            })
-        if bars:
-            return bars
-    except Exception:
-        pass
+    if is_current_scan_date(scan_date):
+        trend_params = {
+            "secid": secid,
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+            "ndays": 1,
+            "iscr": 0,
+            "iscca": 0,
+        }
+        headers = {
+            "User-Agent": HTTP_HEADERS["User-Agent"],
+            "Referer": "https://quote.eastmoney.com/",
+        }
+        try:
+            trends = (get_json_with_retry(
+                EASTMONEY_TRENDS_URLS[-1],
+                trend_params,
+                headers,
+                timeout=4,
+                retries=2,
+            ).get("data") or {}).get("trends") or []
+            bars = []
+            for item in trends:
+                parts = item.split(",")
+                if len(parts) < 7:
+                    continue
+                hhmm = parts[0][-5:]
+                if hhmm > cutoff_text:
+                    continue
+                bars.append({
+                    "time": hhmm,
+                    "open": to_float(parts[1]),
+                    "close": to_float(parts[2]),
+                    "high": to_float(parts[3]),
+                    "low": to_float(parts[4]),
+                    "volume": to_float(parts[5], 0) or 0,
+                    "amount": to_float(parts[6], 0) or 0,
+                })
+            if bars:
+                return bars
+        except Exception:
+            pass
 
-    today = scan_date.replace("-", "")
-    params = {
-        "secid": secid,
-        "ut": "8dec03ba335b81bf4ebdf7b29ec27d15",
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "klt": 1,
-        "fqt": 1,
-        "beg": today,
-        "end": today,
-        "lmt": 360,
-    }
-    try:
-        klines = (get_json_with_retry(
-            EASTMONEY_KLINE_URL,
-            params,
-            headers,
-            timeout=3,
-            retries=1,
-        ).get("data") or {}).get("klines") or []
-    except Exception:
-        return []
-
-    bars = []
-    for item in klines:
-        parts = item.split(",")
-        if len(parts) < 7:
-            continue
-        dt_text = parts[0]
-        hhmm = dt_text[-5:]
-        if hhmm > cutoff_text:
-            continue
-        bars.append({
-            "time": hhmm,
-            "open": to_float(parts[1]),
-            "close": to_float(parts[2]),
-            "high": to_float(parts[3]),
-            "low": to_float(parts[4]),
-            "volume": to_float(parts[5], 0) or 0,
-            "amount": to_float(parts[6], 0) or 0,
-        })
-    return bars
+    return fetch_eastmoney_1m_kline_for_date(stock, cutoff_text, scan_date)
 
 
 def position_in_range(value, low, high):
@@ -1100,6 +1302,17 @@ HTML = """<!DOCTYPE html>
     color: var(--text);
     white-space: nowrap;
   }
+  .index-btn {
+    display:block;
+    width:100%;
+    border:0;
+    background:transparent;
+    color:inherit;
+    font:inherit;
+    text-align:left;
+    cursor:pointer;
+  }
+  .index-btn:hover { color:#fff; }
   .idx-code {
     display: block;
     font-size: 10px;
@@ -1153,6 +1366,62 @@ HTML = """<!DOCTYPE html>
   .negative .val-bar-fill { background:var(--green); right:50%; }
 
   .empty-cell { font-size:12px; color:var(--text-dim); }
+  .metric-btn {
+    border: 0;
+    font: inherit;
+    color: inherit;
+  }
+
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(0,0,0,.58);
+    z-index: 20;
+  }
+  .modal-backdrop.open { display:flex; }
+  .modal {
+    width: min(620px, 100%);
+    max-height: calc(100vh - 48px);
+    overflow: auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 24px 80px rgba(0,0,0,.42);
+  }
+  .modal-head {
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:16px;
+    padding:18px 20px 14px;
+    border-bottom:1px solid var(--border);
+  }
+  .modal-title { color:#fff; font-size:16px; font-weight:500; }
+  .modal-subtitle { margin-top:4px; color:var(--text-dim); font-size:11px; font-family:'DM Mono',monospace; }
+  .modal-close {
+    width:30px;
+    height:30px;
+    border:1px solid var(--border);
+    border-radius:6px;
+    background:var(--surface2);
+    color:var(--text);
+    cursor:pointer;
+    font-size:18px;
+    line-height:1;
+  }
+  .modal-close:hover { border-color:var(--accent); }
+  .modal-body { padding:16px 20px 20px; }
+  .weight-table th:first-child { min-width:52px; text-align:center; }
+  .weight-table th:nth-child(2), .weight-table td:nth-child(2) { text-align:left; }
+  .weight-table td { padding:11px 12px; border-bottom:1px solid var(--border); text-align:center; }
+  .weight-table tr:last-child td { border-bottom:0; }
+  .stock-code { display:block; margin-top:2px; color:var(--text-dim); font-size:10px; font-family:'DM Mono',monospace; }
+  .weight-value { color:var(--red); font-family:'DM Mono',monospace; font-weight:500; }
+  .weight-value.empty { color:var(--text-dim); }
 
   /* Loading */
   .loading {
@@ -1210,7 +1479,30 @@ HTML = """<!DOCTYPE html>
   <div class="loading"><div class="spinner"></div>加载中…</div>
 </div>
 
+<div class="modal-backdrop" id="weightModal" onclick="onModalBackdropClick(event)">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="weightModalTitle">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title" id="weightModalTitle">成分股权重 Top 10</div>
+        <div class="modal-subtitle" id="weightModalMeta">—</div>
+      </div>
+      <button class="modal-close" onclick="closeWeightModal()" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body" id="weightModalBody"></div>
+  </div>
+</div>
+
 <script>
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[ch]));
+}
+
 function fmtDateHeader(s) {
   const d = new Date(s);
   const m = String(d.getMonth()+1).padStart(2,'0');
@@ -1242,7 +1534,11 @@ function buildTable(data) {
   html += '</tr></thead><tbody>';
 
   indices.forEach(idx => {
-    html += `<tr><td class="name-cell">${idx.name}<span class="idx-code">${idx.code}</span></td>`;
+    html += `<tr><td class="name-cell">
+      <button class="index-btn" onclick="showConstituents('${escapeHtml(idx.code)}')" title="查看成分股">
+        ${escapeHtml(idx.name)}<span class="idx-code">${escapeHtml(idx.code)}</span>
+      </button>
+    </td>`;
     displayDates.forEach(d => {
       const v = idx.ma3[d];
       if (v === undefined || v === null) {
@@ -1253,7 +1549,7 @@ function buildTable(data) {
       const cls = v >  0.001 ? 'positive' : v < -0.001 ? 'negative' : 'zero';
       const barW = Math.min(Math.abs(v) * 100, 50);
       html += `<td class="val-cell">
-        <div class="val-inner ${cls}">
+        <div class="val-inner metric-btn ${cls}">
           <span class="val-number">${pct}</span>
           <div class="val-bar"><div class="val-bar-fill" style="width:${barW}%"></div></div>
         </div></td>`;
@@ -1264,6 +1560,63 @@ function buildTable(data) {
   html += '</tbody></table>';
   document.getElementById('tableWrap').innerHTML = html;
 }
+
+function openWeightModal(title, meta, bodyHtml) {
+  document.getElementById('weightModalTitle').textContent = title;
+  document.getElementById('weightModalMeta').textContent = meta;
+  document.getElementById('weightModalBody').innerHTML = bodyHtml;
+  document.getElementById('weightModal').classList.add('open');
+}
+
+function closeWeightModal() {
+  document.getElementById('weightModal').classList.remove('open');
+}
+
+function onModalBackdropClick(event) {
+  if (event.target.id === 'weightModal') closeWeightModal();
+}
+
+async function showConstituents(code) {
+  openWeightModal(`${code} 成分股`, code, '<div class="loading"><div class="spinner"></div>加载中…</div>');
+  try {
+    const res = await fetch('/api/index-constituents?code=' + encodeURIComponent(code) + '&limit=10');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '加载失败');
+
+    document.getElementById('weightModalTitle').textContent =
+      data.weight_count ? `${data.name} 成分股权重 Top 10` : `${data.name} 成分股前 10`;
+    const updated = data.updated_at ? ` · 成分股更新 ${data.updated_at}` : '';
+    const modeText = data.weight_count ? '按权重排序' : '暂无权重，显示成分股前 10';
+    const weightDate = data.weight_date ? ` · 权重日期 ${data.weight_date}` : '';
+    document.getElementById('weightModalMeta').textContent =
+      `${data.code} · 共 ${data.total_count} 只 · 有权重 ${data.weight_count} 只 · ${modeText}${weightDate}${updated}`;
+
+    if (!data.rows.length) {
+      document.getElementById('weightModalBody').innerHTML =
+        '<div class="loading">该指数暂无成分股数据</div>';
+      return;
+    }
+
+    let html = '<table class="weight-table"><thead><tr><th>排名</th><th>成分股</th><th>交易所</th><th>权重</th></tr></thead><tbody>';
+    data.rows.forEach((row, i) => {
+      html += `<tr>
+        <td>${i + 1}</td>
+        <td>${escapeHtml(row.name || '')}<span class="stock-code">${escapeHtml(row.code)}</span></td>
+        <td>${escapeHtml(row.exchange || '-')}</td>
+        <td class="weight-value ${row.weight === null || row.weight === undefined ? 'empty' : ''}">${row.weight === null || row.weight === undefined ? '—' : Number(row.weight).toFixed(2) + '%'}</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+    document.getElementById('weightModalBody').innerHTML = html;
+  } catch (err) {
+    document.getElementById('weightModalBody').innerHTML =
+      `<div class="loading">加载失败：${escapeHtml(err.message)}</div>`;
+  }
+}
+
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') closeWeightModal();
+});
 
 async function loadData() {
   const days = document.getElementById('daysSelect').value;
@@ -1392,6 +1745,102 @@ MOMENTUM_HTML = """<!DOCTYPE html>
     font-family:'DM Mono', monospace;
     font-weight:500;
   }
+  .profit-panel {
+    margin-bottom:16px;
+    border:1px solid var(--border);
+    border-radius:8px;
+    background:var(--surface);
+    overflow:hidden;
+  }
+  .profit-head {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
+    padding:12px 14px;
+    border-bottom:1px solid var(--border);
+    background:rgba(255,255,255,.018);
+  }
+  .profit-title { color:#fff; font-size:13px; font-weight:500; }
+  .profit-range { margin-left:8px; color:var(--text-dim); font:11px 'DM Mono', monospace; }
+  .ghost-btn {
+    width:auto;
+    min-width:64px;
+    padding:0 12px;
+    border:1px solid var(--border);
+    background:var(--surface2);
+    color:var(--text);
+  }
+  .profit-grid {
+    display:grid;
+    grid-template-columns: repeat(6, minmax(92px, 1fr));
+    gap:1px;
+    background:var(--border);
+  }
+  .profit-stat {
+    min-height:68px;
+    padding:12px;
+    background:var(--surface);
+  }
+  .profit-label { color:var(--text-dim); font-size:10px; margin-bottom:7px; }
+  .profit-value { color:var(--text); font:500 18px 'DM Mono', monospace; }
+  .profit-value.up { color:var(--red); }
+  .profit-value.down { color:var(--green); }
+  .profit-body {
+    display:grid;
+    grid-template-columns: minmax(360px, 1fr) minmax(420px, 1.15fr);
+    gap:14px;
+    padding:14px;
+  }
+  .mini-title {
+    color:var(--head);
+    font-size:11px;
+    margin-bottom:8px;
+  }
+  .profit-days {
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+  }
+  .day-row {
+    display:grid;
+    grid-template-columns: 86px 1fr 70px 58px;
+    align-items:center;
+    gap:10px;
+    min-height:24px;
+    color:var(--text-dim);
+    font-size:11px;
+  }
+  .bar-track {
+    height:6px;
+    border-radius:999px;
+    background:var(--surface2);
+    overflow:hidden;
+  }
+  .bar-fill {
+    height:100%;
+    width:0;
+    border-radius:999px;
+    background:var(--text-dim);
+  }
+  .bar-fill.up { background:var(--red); }
+  .bar-fill.down { background:var(--green); }
+  .recent-list {
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+  }
+  .recent-row {
+    display:grid;
+    grid-template-columns: 72px 70px 1fr 70px 58px;
+    gap:8px;
+    align-items:center;
+    min-height:24px;
+    color:var(--text-dim);
+    font-size:11px;
+  }
+  .recent-code { font-family:'DM Mono', monospace; color:var(--text); }
+  .recent-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .table-wrap {
     overflow-x:auto;
     border:1px solid var(--border);
@@ -1457,11 +1906,18 @@ MOMENTUM_HTML = """<!DOCTYPE html>
   @keyframes spin { to { transform:rotate(360deg); } }
   @media (max-width: 1100px) {
     .toolbar { grid-template-columns: repeat(4, minmax(92px, 1fr)); }
+    .profit-grid { grid-template-columns: repeat(3, minmax(92px, 1fr)); }
+    .profit-body { grid-template-columns: 1fr; }
   }
   @media (max-width: 640px) {
     body { padding:20px 14px; }
     .header { align-items:flex-start; flex-direction:column; }
     .toolbar { grid-template-columns: repeat(2, minmax(92px, 1fr)); }
+    .profit-grid { grid-template-columns: repeat(2, minmax(92px, 1fr)); }
+    .day-row { grid-template-columns: 78px 1fr 62px; }
+    .day-row .day-win { display:none; }
+    .recent-row { grid-template-columns: 66px 1fr 58px; }
+    .recent-row .recent-date, .recent-row .recent-status { display:none; }
   }
 </style>
 </head>
@@ -1517,6 +1973,52 @@ MOMENTUM_HTML = """<!DOCTYPE html>
   <div class="pill">时间 <b id="scanTime">—</b></div>
 </div>
 
+<div class="profit-panel">
+  <div class="profit-head">
+    <div>
+      <span class="profit-title">最近一个月收益</span>
+      <span class="profit-range" id="profitRange">—</span>
+    </div>
+    <button class="ghost-btn" onclick="loadProfit()">刷新</button>
+  </div>
+  <div class="profit-grid">
+    <div class="profit-stat">
+      <div class="profit-label">平均收益</div>
+      <div class="profit-value" id="profitAvg">—</div>
+    </div>
+    <div class="profit-stat">
+      <div class="profit-label">胜率</div>
+      <div class="profit-value" id="profitWin">—</div>
+    </div>
+    <div class="profit-stat">
+      <div class="profit-label">成交记录</div>
+      <div class="profit-value" id="profitSold">—</div>
+    </div>
+    <div class="profit-stat">
+      <div class="profit-label">未结算/失败</div>
+      <div class="profit-value" id="profitFailed">—</div>
+    </div>
+    <div class="profit-stat">
+      <div class="profit-label">最好</div>
+      <div class="profit-value" id="profitBest">—</div>
+    </div>
+    <div class="profit-stat">
+      <div class="profit-label">最差</div>
+      <div class="profit-value" id="profitWorst">—</div>
+    </div>
+  </div>
+  <div class="profit-body">
+    <div>
+      <div class="mini-title">按买入日</div>
+      <div class="profit-days" id="profitDays"><div class="loading">加载中…</div></div>
+    </div>
+    <div>
+      <div class="mini-title">最近记录</div>
+      <div class="recent-list" id="profitRecent"><div class="loading">加载中…</div></div>
+    </div>
+  </div>
+</div>
+
 <div class="table-wrap" id="tableWrap">
   <div class="loading">等待扫描</div>
 </div>
@@ -1526,6 +2028,15 @@ const fmt = (value, digits=2) => value === null || value === undefined ? '—' :
 const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
 }[ch]));
+const pctText = (value, digits=2) => value === null || value === undefined ? '—' : `${Number(value).toFixed(digits)}%`;
+const signedCls = value => Number(value || 0) > 0 ? 'up' : Number(value || 0) < 0 ? 'down' : '';
+
+function setProfitValue(id, value, suffix='', digits=2) {
+  const el = document.getElementById(id);
+  const cls = signedCls(value);
+  el.className = `profit-value ${cls}`;
+  el.textContent = value === null || value === undefined ? '—' : `${Number(value).toFixed(digits)}${suffix}`;
+}
 
 async function loadIndices() {
   const res = await fetch('/api/indices');
@@ -1587,6 +2098,68 @@ function renderRows(rows) {
   document.getElementById('tableWrap').innerHTML = html;
 }
 
+function renderProfit(data) {
+  const summary = data.summary || {};
+  document.getElementById('profitRange').textContent =
+    data.start_date && data.end_date ? `${data.start_date} ~ ${data.end_date}` : '暂无记录';
+  setProfitValue('profitAvg', summary.avg_return_pct, '%', 2);
+  setProfitValue('profitWin', summary.win_rate_pct, '%', 1);
+  document.getElementById('profitSold').textContent = summary.sold_count ?? 0;
+  document.getElementById('profitFailed').textContent = summary.failed_count ?? 0;
+  setProfitValue('profitBest', summary.max_return_pct, '%', 2);
+  setProfitValue('profitWorst', summary.min_return_pct, '%', 2);
+
+  const days = data.by_date || [];
+  const maxAbs = Math.max(1, ...days.map(x => Math.abs(Number(x.avg_return_pct || 0))));
+  if (!days.length) {
+    document.getElementById('profitDays').innerHTML = '<div class="loading">暂无收益记录</div>';
+  } else {
+    document.getElementById('profitDays').innerHTML = days.slice(0, 12).map(day => {
+      const avg = Number(day.avg_return_pct || 0);
+      const width = Math.max(2, Math.abs(avg) / maxAbs * 100);
+      const cls = signedCls(avg);
+      return `<div class="day-row">
+        <span class="num">${esc(day.buy_date)}</span>
+        <span class="bar-track"><span class="bar-fill ${cls}" style="width:${width}%"></span></span>
+        <span class="num ${cls}">${pctText(day.avg_return_pct, 2)}</span>
+        <span class="day-win">${day.sold_count || 0}笔 / ${pctText(day.win_rate_pct, 0)}</span>
+      </div>`;
+    }).join('');
+  }
+
+  const recent = data.recent || [];
+  if (!recent.length) {
+    document.getElementById('profitRecent').innerHTML = '<div class="loading">暂无最近记录</div>';
+  } else {
+    document.getElementById('profitRecent').innerHTML = recent.map(row => {
+      const cls = signedCls(row.return_pct);
+      const status = row.status === 'sold' ? (row.error === 'daily_open_fallback' ? '日线' : '分钟') : '失败';
+      return `<div class="recent-row">
+        <span class="recent-date num">${esc(row.buy_date)}</span>
+        <span class="recent-code">${esc(row.code)}</span>
+        <span class="recent-name">${esc(row.name || '')}</span>
+        <span class="num ${cls}">${pctText(row.return_pct, 2)}</span>
+        <span class="recent-status">${esc(status)}</span>
+      </div>`;
+    }).join('');
+  }
+}
+
+async function loadProfit() {
+  try {
+    const res = await fetch('/api/momentum/profit?days=30');
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || '收益加载失败');
+    }
+    renderProfit(data);
+  } catch (err) {
+    document.getElementById('profitRange').textContent = '加载失败';
+    document.getElementById('profitDays').innerHTML = `<div class="loading">${esc(err.message)}</div>`;
+    document.getElementById('profitRecent').innerHTML = `<div class="loading">${esc(err.message)}</div>`;
+  }
+}
+
 async function scan() {
   const btn = document.getElementById('scanBtn');
   btn.disabled = true;
@@ -1619,6 +2192,7 @@ async function scan() {
 }
 
 loadIndices();
+loadProfit();
 </script>
 </body>
 </html>
@@ -1648,6 +2222,95 @@ def api_indices():
         conn.close()
 
 
+@app.route("/api/index-constituents")
+def api_index_constituents():
+    code = (request.args.get("code") or "").strip()
+    limit = to_int_arg("limit", 10, 1, 50)
+    if not code:
+        return jsonify({"error": "缺少指数代码"}), 400
+
+    conn = get_db()
+    try:
+        idx = conn.execute(
+            "SELECT code, name FROM indices WHERE code = ?",
+            (code,)
+        ).fetchone()
+        if not idx:
+            return jsonify({"error": "指数不存在"}), 404
+
+        summary = conn.execute("""
+            SELECT
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN weight IS NOT NULL THEN 1 ELSE 0 END) AS weight_count,
+                MAX(weight_date) AS weight_date,
+                MAX(updated_at) AS updated_at
+            FROM index_constituents
+            WHERE index_code = ?
+        """, (code,)).fetchone()
+
+        weight_count = summary["weight_count"] or 0
+        if weight_count:
+            rows = conn.execute("""
+                SELECT
+                    ic.stock_code,
+                    COALESCE(s.name, ic.stock_name) AS stock_name,
+                    ic.exchange,
+                    ic.weight,
+                    ic.weight_date
+                FROM index_constituents ic
+                LEFT JOIN stocks s ON s.code = ic.stock_code
+                WHERE ic.index_code = ?
+                  AND ic.weight IS NOT NULL
+                ORDER BY ic.weight DESC, ic.stock_code ASC
+                LIMIT ?
+            """, (code, limit)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT
+                    ic.stock_code,
+                    COALESCE(s.name, ic.stock_name) AS stock_name,
+                    ic.exchange,
+                    ic.weight,
+                    ic.weight_date
+                FROM index_constituents ic
+                LEFT JOIN stocks s ON s.code = ic.stock_code
+                WHERE ic.index_code = ?
+                ORDER BY ic.stock_code ASC
+                LIMIT ?
+            """, (code, limit)).fetchall()
+
+        return jsonify({
+            "code": idx["code"],
+            "name": idx["name"],
+            "total_count": summary["total_count"] or 0,
+            "weight_count": weight_count,
+            "weight_date": summary["weight_date"],
+            "updated_at": summary["updated_at"],
+            "rows": [
+                {
+                    "code": r["stock_code"],
+                    "name": r["stock_name"],
+                    "exchange": r["exchange"],
+                    "weight": r["weight"],
+                    "weight_date": r["weight_date"],
+                }
+                for r in rows
+            ],
+        })
+    finally:
+        conn.close()
+
+
+@app.route("/api/momentum/profit")
+def api_momentum_profit():
+    days = to_int_arg("days", 30, 1, 250)
+    conn = get_db()
+    try:
+        return jsonify(load_momentum_profit_summary(conn, days=days))
+    finally:
+        conn.close()
+
+
 @app.route("/api/momentum/scan")
 def api_momentum_scan():
     started_at = time.time()
@@ -1666,41 +2329,46 @@ def api_momentum_scan():
             "rows": [],
         }), 429
     try:
-        return run_momentum_scan(started_at)
+        payload, status = perform_momentum_scan(
+            build_momentum_params(request.args),
+            started_at=started_at,
+        )
+        return jsonify(payload), status
     finally:
         SCAN_LOCK.release()
 
 
-def run_momentum_scan(started_at):
-    pool = request.args.get("pool", "all")
-    index_code = request.args.get("indexCode", "")
-    if pool == "index" and not index_code:
-        pool = "all"
-    cutoff_text = request.args.get("cutoff", "14:30")
+def perform_momentum_scan(params, started_at=None):
+    started_at = started_at or time.time()
+    pool = params["pool"]
+    index_code = params["index_code"]
+    cutoff_text = params["cutoff"]
+    scan_trade_date = params["trade_date"]
+    min_gain = params["min_gain"]
+    max_gain = params["max_gain"]
+    min_vol_ratio = params["min_vol_ratio"]
+    min_amount_yuan = params["min_amount_wan"] * 10000
+    limit = params["limit"]
+    verify_limit = params["verify_limit"]
+    max_workers = params["workers"]
     cutoff = parse_cutoff_time(cutoff_text)
-    cutoff_text = cutoff.strftime("%H:%M")
-    scan_trade_date = request.args.get("tradeDate") or default_scan_trade_date()
-
-    min_gain = to_float_arg("minGain", 2.0, -5, 15)
-    max_gain = to_float_arg("maxGain", 7.5, min_gain, 20)
-    min_vol_ratio = to_float_arg("minVolRatio", 1.5, 0.2, 10)
-    min_amount_yuan = to_float_arg("minAmount", 8000, 0, 1000000) * 10000
-    limit = to_int_arg("limit", 80, 1, 300)
-    verify_limit = to_int_arg("verifyLimit", 50, 1, 1000)
-    max_workers = to_int_arg("workers", 6, 2, 12)
     elapsed_ratio = trade_elapsed_ratio(cutoff)
 
     conn = get_db()
     try:
         stocks = load_stock_universe(conn, pool=pool, index_code=index_code)
         if not stocks:
-            return jsonify({"error": "股票池为空"}), 400
+            return {"error": "股票池为空", "meta": build_empty_scan_meta(params)}, 400
 
         stock_by_code = {s["code"]: s for s in stocks}
         codes = list(stock_by_code.keys())
         quotes = fetch_realtime_quotes(codes)
         if not quotes:
-            return jsonify({"error": "实时行情获取失败：新浪和东方财富均无有效返回"}), 502
+            return {
+                "error": "实时行情获取失败：新浪和东方财富均无有效返回",
+                "meta": build_empty_scan_meta(params, universe=len(stocks)),
+                "rows": [],
+            }, 502
 
         valid_codes = [code for code in codes if code in quotes]
         daily_metrics = load_daily_metrics(conn, valid_codes)
@@ -1773,6 +2441,7 @@ def run_momentum_scan(started_at):
             "pool": pool,
             "cutoff": cutoff_text,
             "trade_date": scan_trade_date,
+            "index_code": index_code,
             "universe": len(stocks),
             "quoted": len(quotes),
             "prefiltered": len(prefiltered),
@@ -1782,11 +2451,11 @@ def run_momentum_scan(started_at):
             "cache_hits": cache_hits,
             "elapsed_s": round(time.time() - started_at, 1),
         }
-        return jsonify({
+        return {
             "error": "分钟线接口暂不可用，候选股无法做14:30分时验证",
             "meta": meta,
             "rows": [],
-        }), 503
+        }, 503
 
     remaining_items = verify_items[len(probe_items):]
     for _, stock, quote, daily in remaining_items:
@@ -1809,6 +2478,7 @@ def run_momentum_scan(started_at):
         "pool": pool,
         "cutoff": cutoff_text,
         "trade_date": scan_trade_date,
+        "index_code": index_code,
         "universe": len(stocks),
         "quoted": len(quotes),
         "prefiltered": len(prefiltered),
@@ -1819,12 +2489,1070 @@ def run_momentum_scan(started_at):
         "elapsed_s": round(time.time() - started_at, 1),
     }
     if verify_items and minute_success == 0:
-        return jsonify({
+        return {
             "error": "分钟线接口暂不可用，候选股无法做14:30分时验证",
             "meta": meta,
             "rows": [],
-        }), 503
-    return jsonify({"meta": meta, "rows": rows})
+        }, 503
+    return {"meta": meta, "rows": rows}, 200
+
+
+def load_daily_metrics_before(conn, codes, trade_date):
+    metrics = {}
+    for batch in chunked(codes, 600):
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(f"""
+            SELECT code, trade_date, close, high, low, volume, amount, pct_change
+            FROM (
+                SELECT code, trade_date, close, high, low, volume, amount, pct_change,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY code ORDER BY trade_date DESC
+                       ) AS rn
+                FROM daily_prices
+                WHERE code IN ({placeholders})
+                  AND trade_date < ?
+            )
+            WHERE rn <= 80
+            ORDER BY code, trade_date DESC
+        """, batch + [trade_date]).fetchall()
+
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(row["code"], []).append(row)
+
+        for code, series_desc in grouped.items():
+            series = list(reversed(series_desc[:80]))
+            closes = [r["close"] for r in series if r["close"] is not None]
+            volumes = [r["volume"] for r in series[-20:] if r["volume"] is not None]
+            if not closes:
+                continue
+            ma5 = sum(closes[-5:]) / min(len(closes), 5)
+            ma20 = sum(closes[-20:]) / min(len(closes), 20)
+            high20 = max((r["high"] for r in series[-20:] if r["high"] is not None),
+                         default=None)
+            low20 = min((r["low"] for r in series[-20:] if r["low"] is not None),
+                        default=None)
+            avg_volume20 = sum(volumes) / len(volumes) if volumes else None
+            prev_ma5 = (sum(closes[-6:-1]) / 5) if len(closes) >= 6 else None
+            last = series[-1]
+            metrics[code] = {
+                "last_trade_date": last["trade_date"],
+                "last_close": last["close"],
+                "prev_low": last["low"],
+                "ma5": ma5,
+                "ma5_prev": prev_ma5,
+                "ma5_up": bool(prev_ma5 is not None and ma5 > prev_ma5),
+                "ma20": ma20,
+                "high20": high20,
+                "low20": low20,
+                "avg_volume20": avg_volume20,
+            }
+    return metrics
+
+
+def load_historical_daily_quotes(conn, codes, trade_date, daily_metrics):
+    quotes = {}
+    for batch in chunked(codes, 600):
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(f"""
+            SELECT code, open, close, high, low, volume, amount, pct_change
+            FROM daily_prices
+            WHERE code IN ({placeholders})
+              AND trade_date = ?
+        """, batch + [trade_date]).fetchall()
+        for row in rows:
+            daily = daily_metrics.get(row["code"])
+            prev_close = daily.get("last_close") if daily else None
+            close = row["close"]
+            if not prev_close or not close:
+                continue
+            pct = row["pct_change"]
+            if pct is None:
+                pct = (close - prev_close) / prev_close * 100.0
+            quotes[row["code"]] = {
+                "open": row["open"],
+                "prev_close": prev_close,
+                "price": close,
+                "high": row["high"],
+                "low": row["low"],
+                "volume": row["volume"] or 0,
+                "amount": row["amount"] or 0,
+                "trade_date": trade_date,
+                "quote_time": "15:00:00",
+                "pct": pct,
+            }
+    return quotes
+
+
+def perform_historical_momentum_scan(params, started_at=None):
+    started_at = started_at or time.time()
+    pool = params["pool"]
+    index_code = params["index_code"]
+    cutoff_text = params["cutoff"]
+    scan_trade_date = params["trade_date"]
+    min_gain = params["min_gain"]
+    max_gain = params["max_gain"]
+    min_vol_ratio = params["min_vol_ratio"]
+    min_amount_yuan = params["min_amount_wan"] * 10000
+    limit = params["limit"]
+    verify_limit = params["verify_limit"]
+    max_workers = params["workers"]
+    cutoff = parse_cutoff_time(cutoff_text)
+    elapsed_ratio = trade_elapsed_ratio(cutoff)
+
+    conn = get_db()
+    try:
+        stocks = load_stock_universe(conn, pool=pool, index_code=index_code)
+        if not stocks:
+            return {"error": "股票池为空", "meta": build_empty_scan_meta(params)}, 400
+        stock_by_code = {s["code"]: s for s in stocks}
+        codes = list(stock_by_code.keys())
+        daily_metrics = load_daily_metrics_before(conn, codes, scan_trade_date)
+        quotes = load_historical_daily_quotes(
+            conn, codes, scan_trade_date, daily_metrics
+        )
+    finally:
+        conn.close()
+
+    valid_codes = [code for code in codes if code in quotes]
+    prefiltered = []
+    for code in valid_codes:
+        quote = quotes[code]
+        daily = daily_metrics.get(code)
+        if not daily:
+            continue
+        pct = quote["pct"]
+        if pct < min_gain - 2.5 or pct > max_gain + 3.0:
+            continue
+        if quote["amount"] < min_amount_yuan * 0.45:
+            continue
+        avg_volume20 = daily.get("avg_volume20")
+        if not avg_volume20:
+            continue
+        day_volume_ratio = quote["volume"] / avg_volume20
+        if day_volume_ratio < min_vol_ratio * 0.35:
+            continue
+        ma5 = daily.get("ma5")
+        ma20 = daily.get("ma20")
+        price = quote["price"]
+        if not ma5 or price <= ma5 * 0.96:
+            continue
+        if not daily.get("ma5_up"):
+            continue
+        if ma20 and price < ma20 * 0.94:
+            continue
+        pre_score = (
+            pct * 5
+            + min(day_volume_ratio, 4) * 12
+            + min(quote["amount"] / 100000000, 5) * 4
+        )
+        prefiltered.append((pre_score, stock_by_code[code], quote, daily))
+
+    prefiltered.sort(key=lambda x: x[0], reverse=True)
+    verify_items = prefiltered[:verify_limit]
+    stock_items = [stock for _, stock, _, _ in verify_items]
+    kline_map, cache_hits = fetch_baostock_5m_klines_parallel(
+        stock_items,
+        cutoff_text,
+        max_workers=max_workers,
+        trade_date=scan_trade_date,
+    )
+
+    rows = []
+    minute_success = 0
+    minute_failed = 0
+    for _, stock, quote, daily in verify_items:
+        bars = kline_map.get(stock["code"])
+        row = evaluate_candidate_with_bars(
+            stock, quote, daily, cutoff_text, elapsed_ratio, bars
+        )
+        if not row:
+            minute_failed += 1
+            continue
+        minute_success += 1
+        if not passes_momentum_filters(row, min_gain, max_gain, min_vol_ratio):
+            continue
+        rows.append(row)
+
+    rows.sort(key=lambda r: (r["score"], r["volume_ratio"], r["amount_yi"]),
+              reverse=True)
+    rows = rows[:limit]
+    meta = {
+        "pool": pool,
+        "cutoff": cutoff_text,
+        "trade_date": scan_trade_date,
+        "index_code": index_code,
+        "universe": len(stocks),
+        "quoted": len(quotes),
+        "prefiltered": len(prefiltered),
+        "verified": len(verify_items),
+        "minute_success": minute_success,
+        "minute_failed": minute_failed,
+        "cache_hits": cache_hits,
+        "elapsed_s": round(time.time() - started_at, 1),
+        "historical": True,
+    }
+    if verify_items and minute_success == 0:
+        return {
+            "error": "历史分钟线接口暂不可用，候选股无法做14:30分时验证",
+            "meta": meta,
+            "rows": [],
+        }, 503
+    return {"meta": meta, "rows": rows}, 200
+
+
+def perform_daily_fallback_momentum_scan(params, started_at=None):
+    started_at = started_at or time.time()
+    pool = params["pool"]
+    index_code = params["index_code"]
+    scan_trade_date = params["trade_date"]
+    min_gain = params["min_gain"]
+    max_gain = params["max_gain"]
+    min_vol_ratio = params["min_vol_ratio"]
+    min_amount_yuan = params["min_amount_wan"] * 10000
+    limit = params["limit"]
+
+    conn = get_db()
+    try:
+        stocks = load_stock_universe(conn, pool=pool, index_code=index_code)
+        if not stocks:
+            return {"error": "股票池为空", "meta": build_empty_scan_meta(params)}, 400
+        stock_by_code = {s["code"]: s for s in stocks}
+        codes = list(stock_by_code.keys())
+        daily_metrics = load_daily_metrics_before(conn, codes, scan_trade_date)
+        quotes = load_historical_daily_quotes(
+            conn, codes, scan_trade_date, daily_metrics
+        )
+    finally:
+        conn.close()
+
+    rows = []
+    for code, quote in quotes.items():
+        stock = stock_by_code.get(code)
+        daily = daily_metrics.get(code)
+        if not stock or not daily:
+            continue
+        pct = quote["pct"]
+        price = quote["price"]
+        avg_volume20 = daily.get("avg_volume20")
+        if pct < min_gain or pct > max_gain:
+            continue
+        if quote["amount"] < min_amount_yuan:
+            continue
+        if not avg_volume20:
+            continue
+        volume_ratio = quote["volume"] / avg_volume20
+        if volume_ratio < min_vol_ratio:
+            continue
+        ma5 = daily.get("ma5")
+        if not ma5 or price <= ma5:
+            continue
+        if not daily.get("ma5_up"):
+            continue
+        prev_low = daily.get("prev_low")
+        if prev_low and quote.get("low") and quote["low"] < prev_low:
+            continue
+        ma20 = daily.get("ma20")
+        if ma20 and price < ma20 * 0.97:
+            continue
+
+        close_position = position_in_range(price, quote.get("low"), quote.get("high"))
+        pullback_pct = (
+            (quote["high"] - price) / price * 100.0
+            if quote.get("high") and price else None
+        )
+        if close_position is not None and close_position < 0.65:
+            continue
+        if pullback_pct is not None and pullback_pct > 3.0:
+            continue
+
+        score = round(
+            clamp(20 - abs(pct - 4.8) * 3.0, 0, 20)
+            + clamp((volume_ratio - 1.0) / 1.8 * 25, 0, 25)
+            + clamp((quote["amount"] or 0) / 100000000 / 3.0 * 10, 0, 10)
+            + (close_position or 0) * 15
+            + 10,
+            1,
+        )
+        reasons = ["日线回退", "强于5日线", "5日线向上", "放量"]
+        rows.append({
+            "code": code,
+            "name": stock["name"] or "",
+            "price": round(price, 3),
+            "pct": round(pct, 2),
+            "amount_yi": round((quote["amount"] or 0) / 100000000, 2),
+            "volume_ratio": round(volume_ratio, 2),
+            "volume_full_ratio": round(volume_ratio, 2),
+            "close_position": round(close_position * 100, 1) if close_position is not None else None,
+            "pullback_pct": round(pullback_pct, 2) if pullback_pct is not None else None,
+            "afternoon_pct": None,
+            "above_vwap": None,
+            "trend_above_ma5": True,
+            "ma5_up": True,
+            "not_break_prev_low": True,
+            "high_time": "15:00",
+            "high_after_14": True,
+            "close_strong": True,
+            "has_minute": False,
+            "historical_fallback": "daily_close_buy_next_open_sell",
+            "score": score,
+            "reasons": " / ".join(reasons),
+            "sparkline": "",
+            "quote_time": "15:00:00",
+            "trade_date": scan_trade_date,
+        })
+
+    rows.sort(key=lambda r: (r["score"], r["volume_ratio"], r["amount_yi"]),
+              reverse=True)
+    rows = rows[:limit]
+    meta = {
+        "pool": pool,
+        "cutoff": params["cutoff"],
+        "trade_date": scan_trade_date,
+        "index_code": index_code,
+        "universe": len(stocks),
+        "quoted": len(quotes),
+        "prefiltered": len(rows),
+        "verified": len(rows),
+        "minute_success": 0,
+        "minute_failed": 0,
+        "cache_hits": 0,
+        "elapsed_s": round(time.time() - started_at, 1),
+        "historical": True,
+        "fallback": "daily",
+    }
+    return {"meta": meta, "rows": rows}, 200
+
+
+def metric_from_previous_series(series):
+    closes = [r["close"] for r in series if r["close"] is not None]
+    volumes = [r["volume"] for r in series[-20:] if r["volume"] is not None]
+    if not closes:
+        return None
+    ma5 = sum(closes[-5:]) / min(len(closes), 5)
+    ma20 = sum(closes[-20:]) / min(len(closes), 20)
+    prev_ma5 = (sum(closes[-6:-1]) / 5) if len(closes) >= 6 else None
+    last = series[-1]
+    return {
+        "last_trade_date": last["trade_date"],
+        "last_close": last["close"],
+        "prev_low": last["low"],
+        "ma5": ma5,
+        "ma5_prev": prev_ma5,
+        "ma5_up": bool(prev_ma5 is not None and ma5 > prev_ma5),
+        "ma20": ma20,
+        "high20": max((r["high"] for r in series[-20:] if r["high"] is not None),
+                      default=None),
+        "low20": min((r["low"] for r in series[-20:] if r["low"] is not None),
+                     default=None),
+        "avg_volume20": sum(volumes) / len(volumes) if volumes else None,
+    }
+
+
+def build_daily_fallback_row(stock, quote, daily, params):
+    min_gain = params["min_gain"]
+    max_gain = params["max_gain"]
+    min_vol_ratio = params["min_vol_ratio"]
+    min_amount_yuan = params["min_amount_wan"] * 10000
+    pct = quote["pct"]
+    price = quote["price"]
+    avg_volume20 = daily.get("avg_volume20")
+    if pct < min_gain or pct > max_gain:
+        return None
+    if quote["amount"] < min_amount_yuan:
+        return None
+    if not avg_volume20:
+        return None
+    volume_ratio = quote["volume"] / avg_volume20
+    if volume_ratio < min_vol_ratio:
+        return None
+    ma5 = daily.get("ma5")
+    if not ma5 or price <= ma5:
+        return None
+    if not daily.get("ma5_up"):
+        return None
+    prev_low = daily.get("prev_low")
+    if prev_low and quote.get("low") and quote["low"] < prev_low:
+        return None
+    ma20 = daily.get("ma20")
+    if ma20 and price < ma20 * 0.97:
+        return None
+
+    close_position = position_in_range(price, quote.get("low"), quote.get("high"))
+    pullback_pct = (
+        (quote["high"] - price) / price * 100.0
+        if quote.get("high") and price else None
+    )
+    if close_position is not None and close_position < 0.65:
+        return None
+    if pullback_pct is not None and pullback_pct > 3.0:
+        return None
+
+    score = round(
+        clamp(20 - abs(pct - 4.8) * 3.0, 0, 20)
+        + clamp((volume_ratio - 1.0) / 1.8 * 25, 0, 25)
+        + clamp((quote["amount"] or 0) / 100000000 / 3.0 * 10, 0, 10)
+        + (close_position or 0) * 15
+        + 10,
+        1,
+    )
+    return {
+        "code": stock["code"],
+        "name": stock["name"] or "",
+        "price": round(price, 3),
+        "pct": round(pct, 2),
+        "amount_yi": round((quote["amount"] or 0) / 100000000, 2),
+        "volume_ratio": round(volume_ratio, 2),
+        "volume_full_ratio": round(volume_ratio, 2),
+        "close_position": round(close_position * 100, 1) if close_position is not None else None,
+        "pullback_pct": round(pullback_pct, 2) if pullback_pct is not None else None,
+        "afternoon_pct": None,
+        "above_vwap": None,
+        "trend_above_ma5": True,
+        "ma5_up": True,
+        "not_break_prev_low": True,
+        "high_time": "15:00",
+        "high_after_14": True,
+        "close_strong": True,
+        "has_minute": False,
+        "historical_fallback": "daily_close_buy_next_open_sell",
+        "score": score,
+        "reasons": "日线回退 / 强于5日线 / 5日线向上 / 放量",
+        "sparkline": "",
+        "quote_time": "15:00:00",
+        "trade_date": quote["trade_date"],
+    }
+
+
+def load_daily_history_for_backfill(conn, codes, start_date, end_date):
+    histories = {code: [] for code in codes}
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=180)
+    history_start = start_dt.strftime("%Y-%m-%d")
+    code_set = set(codes)
+    rows = conn.execute("""
+        SELECT code, trade_date, open, close, high, low, volume, amount, pct_change
+        FROM daily_prices
+        WHERE trade_date >= ?
+          AND trade_date <= ?
+        ORDER BY code, trade_date
+    """, (history_start, end_date)).fetchall()
+    for row in rows:
+        code = row["code"]
+        if code in code_set:
+            histories[code].append(row)
+    return histories
+
+
+def build_daily_fallback_payload_from_history(params, stocks, histories,
+                                              trade_date, started_at=None):
+    started_at = started_at or time.time()
+    rows = []
+    quoted = 0
+    for stock in stocks:
+        series = histories.get(stock["code"]) or []
+        idx = None
+        for i in range(len(series) - 1, -1, -1):
+            if series[i]["trade_date"] == trade_date:
+                idx = i
+                break
+        if idx is None or idx == 0:
+            continue
+        prev_series = series[max(0, idx - 80):idx]
+        daily = metric_from_previous_series(prev_series)
+        if not daily or not daily.get("last_close"):
+            continue
+        current = series[idx]
+        close = current["close"]
+        if not close:
+            continue
+        pct = current["pct_change"]
+        if pct is None:
+            pct = (close - daily["last_close"]) / daily["last_close"] * 100.0
+        quote = {
+            "trade_date": trade_date,
+            "price": close,
+            "pct": pct,
+            "open": current["open"],
+            "high": current["high"],
+            "low": current["low"],
+            "volume": current["volume"] or 0,
+            "amount": current["amount"] or 0,
+        }
+        quoted += 1
+        row = build_daily_fallback_row(stock, quote, daily, params)
+        if row:
+            rows.append(row)
+
+    rows.sort(key=lambda r: (r["score"], r["volume_ratio"], r["amount_yi"]),
+              reverse=True)
+    rows = rows[:params["limit"]]
+    meta = {
+        "pool": params["pool"],
+        "cutoff": params["cutoff"],
+        "trade_date": trade_date,
+        "index_code": params["index_code"],
+        "universe": len(stocks),
+        "quoted": quoted,
+        "prefiltered": len(rows),
+        "verified": len(rows),
+        "minute_success": 0,
+        "minute_failed": 0,
+        "cache_hits": 0,
+        "elapsed_s": round(time.time() - started_at, 1),
+        "historical": True,
+        "fallback": "daily-fast",
+    }
+    return {"meta": meta, "rows": rows}, 200
+
+
+def build_empty_scan_meta(params, universe=0):
+    return {
+        "pool": params["pool"],
+        "cutoff": params["cutoff"],
+        "trade_date": params["trade_date"],
+        "index_code": params["index_code"],
+        "universe": universe,
+        "quoted": 0,
+        "prefiltered": 0,
+        "verified": 0,
+        "minute_success": 0,
+        "minute_failed": 0,
+        "cache_hits": 0,
+        "elapsed_s": 0,
+    }
+
+
+def save_momentum_scan_result(conn, params, payload, status_code):
+    ensure_momentum_tables(conn)
+    meta = payload.get("meta") or build_empty_scan_meta(params)
+    rows = payload.get("rows") or []
+    status = "ok" if status_code == 200 else "error"
+    cur = conn.execute("""
+        INSERT INTO momentum_scan_runs (
+            trade_date, cutoff, pool, index_code,
+            min_gain, max_gain, min_vol_ratio, min_amount_wan,
+            limit_count, verify_limit, workers,
+            universe, quoted, prefiltered, verified,
+            minute_success, minute_failed, cache_hits, elapsed_s,
+            row_count, status, error, params_json
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        params["trade_date"], params["cutoff"], params["pool"], params["index_code"],
+        params["min_gain"], params["max_gain"], params["min_vol_ratio"],
+        params["min_amount_wan"], params["limit"], params["verify_limit"],
+        params["workers"], meta.get("universe"), meta.get("quoted"),
+        meta.get("prefiltered"), meta.get("verified"), meta.get("minute_success"),
+        meta.get("minute_failed"), meta.get("cache_hits"), meta.get("elapsed_s"),
+        len(rows), status, payload.get("error"),
+        json.dumps(params, ensure_ascii=False, sort_keys=True),
+    ))
+    run_id = cur.lastrowid
+
+    for row in rows:
+        conn.execute("""
+            INSERT INTO momentum_picks (
+                run_id, trade_date, cutoff, pool, index_code,
+                code, name, buy_price, buy_pct, score, amount_yi,
+                volume_ratio, volume_full_ratio, close_position,
+                pullback_pct, high_time, reasons, row_json,
+                created_at, updated_at
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))
+            ON CONFLICT(trade_date, cutoff, pool, index_code, code) DO UPDATE SET
+                run_id = excluded.run_id,
+                name = excluded.name,
+                buy_price = excluded.buy_price,
+                buy_pct = excluded.buy_pct,
+                score = excluded.score,
+                amount_yi = excluded.amount_yi,
+                volume_ratio = excluded.volume_ratio,
+                volume_full_ratio = excluded.volume_full_ratio,
+                close_position = excluded.close_position,
+                pullback_pct = excluded.pullback_pct,
+                high_time = excluded.high_time,
+                reasons = excluded.reasons,
+                row_json = excluded.row_json,
+                updated_at = datetime('now','localtime')
+        """, (
+            run_id, params["trade_date"], params["cutoff"], params["pool"],
+            params["index_code"], row.get("code"), row.get("name"),
+            row.get("price"), row.get("pct"), row.get("score"),
+            row.get("amount_yi"), row.get("volume_ratio"),
+            row.get("volume_full_ratio"), row.get("close_position"),
+            row.get("pullback_pct"), row.get("high_time"), row.get("reasons"),
+            json.dumps(row, ensure_ascii=False, sort_keys=True),
+        ))
+    conn.commit()
+    return run_id, len(rows)
+
+
+def latest_pick_trade_date_before(conn, sell_date):
+    row = conn.execute("""
+        SELECT MAX(trade_date) AS trade_date
+        FROM momentum_picks
+        WHERE trade_date < ?
+    """, (sell_date,)).fetchone()
+    return row["trade_date"] if row and row["trade_date"] else None
+
+
+def load_momentum_picks_for_settlement(conn, buy_date, sell_date):
+    return conn.execute("""
+        SELECT p.*, CASE
+                   WHEN p.code LIKE '5%' OR p.code LIKE '6%' OR p.code LIKE '9%' THEN '1'
+                   ELSE '0'
+               END AS market
+        FROM momentum_picks p
+        LEFT JOIN momentum_pick_returns r ON r.pick_id = p.id
+        WHERE p.trade_date = ?
+          AND (r.id IS NULL OR r.status != 'sold')
+        ORDER BY p.score DESC, p.code
+    """, (buy_date,)).fetchall()
+
+
+def get_daily_open_price(conn, code, trade_date):
+    row = conn.execute("""
+        SELECT open
+        FROM daily_prices
+        WHERE code = ?
+          AND trade_date = ?
+    """, (code, trade_date)).fetchone()
+    return row["open"] if row and row["open"] else None
+
+
+def settle_momentum_picks(conn, sell_date=None, sell_cutoff="10:00", buy_date=None,
+                          allow_daily_fallback=False):
+    sell_date = sell_date or default_scan_trade_date()
+    sell_cutoff = parse_cutoff_time(sell_cutoff).strftime("%H:%M")
+    ensure_momentum_tables(conn)
+    buy_date = buy_date or latest_pick_trade_date_before(conn, sell_date)
+    if not buy_date:
+        return {
+            "buy_date": None,
+            "sell_date": sell_date,
+            "sell_cutoff": sell_cutoff,
+            "settled": 0,
+            "failed": 0,
+            "message": "没有找到待结算的前一交易日选股记录",
+            "rows": [],
+        }
+
+    picks = load_momentum_picks_for_settlement(conn, buy_date, sell_date)
+    settled = 0
+    failed = 0
+    result_rows = []
+    for pick in picks:
+        stock = {
+            "code": pick["code"],
+            "name": pick["name"] or "",
+            "market": infer_market(pick["code"], pick["market"]),
+        }
+        buy_price = pick["buy_price"]
+        status = "sold"
+        error = None
+        sell_price = None
+        sell_time = None
+        return_pct = None
+
+        if not buy_price or buy_price <= 0:
+            status = "invalid_buy_price"
+            error = "买入价为空"
+        else:
+            bars = fetch_minute_kline(stock, sell_cutoff, trade_date=sell_date)
+            sell_bars = [b for b in bars if b.get("close") and b.get("time") <= sell_cutoff]
+            if not sell_bars:
+                fallback_open = (
+                    get_daily_open_price(conn, pick["code"], sell_date)
+                    if allow_daily_fallback else None
+                )
+                if fallback_open:
+                    sell_price = fallback_open
+                    sell_time = "09:30*"
+                    return_pct = (sell_price - buy_price) / buy_price * 100.0
+                    error = "daily_open_fallback"
+                else:
+                    status = "no_sell_kline"
+                    error = "10点前分钟线为空"
+            else:
+                bar = sell_bars[-1]
+                sell_price = bar["close"]
+                sell_time = bar["time"]
+                return_pct = (sell_price - buy_price) / buy_price * 100.0
+
+        if status == "sold":
+            settled += 1
+        else:
+            failed += 1
+
+        conn.execute("""
+            INSERT INTO momentum_pick_returns (
+                pick_id, buy_date, sell_date, code, name,
+                buy_price, sell_price, return_pct,
+                sell_cutoff, sell_time, status, error,
+                created_at, updated_at
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))
+            ON CONFLICT(pick_id) DO UPDATE SET
+                sell_date = excluded.sell_date,
+                buy_price = excluded.buy_price,
+                sell_price = excluded.sell_price,
+                return_pct = excluded.return_pct,
+                sell_cutoff = excluded.sell_cutoff,
+                sell_time = excluded.sell_time,
+                status = excluded.status,
+                error = excluded.error,
+                updated_at = datetime('now','localtime')
+        """, (
+            pick["id"], buy_date, sell_date, pick["code"], pick["name"],
+            buy_price, sell_price,
+            round(return_pct, 4) if return_pct is not None else None,
+            sell_cutoff, sell_time, status, error,
+        ))
+        result_rows.append({
+            "code": pick["code"],
+            "name": pick["name"],
+            "buy_price": buy_price,
+            "sell_price": sell_price,
+            "return_pct": round(return_pct, 4) if return_pct is not None else None,
+            "sell_time": sell_time,
+            "status": status,
+            "error": error,
+        })
+
+    conn.commit()
+    sold_returns = [r["return_pct"] for r in result_rows if r["return_pct"] is not None]
+    avg_return = sum(sold_returns) / len(sold_returns) if sold_returns else None
+    return {
+        "buy_date": buy_date,
+        "sell_date": sell_date,
+        "sell_cutoff": sell_cutoff,
+        "settled": settled,
+        "failed": failed,
+        "avg_return_pct": round(avg_return, 4) if avg_return is not None else None,
+        "rows": result_rows,
+    }
+
+
+def run_momentum_daily_job(params, sell_date=None, sell_cutoff="10:00",
+                           settle_buy_date=None):
+    conn = get_db()
+    try:
+        settlement = settle_momentum_picks(
+            conn,
+            sell_date=sell_date or params["trade_date"],
+            sell_cutoff=sell_cutoff,
+            buy_date=settle_buy_date,
+        )
+    finally:
+        conn.close()
+
+    payload, status_code = perform_momentum_scan(params, started_at=time.time())
+
+    conn = get_db()
+    try:
+        run_id, saved = save_momentum_scan_result(conn, params, payload, status_code)
+    finally:
+        conn.close()
+
+    return {
+        "scan_status": status_code,
+        "run_id": run_id,
+        "saved": saved,
+        "scan": payload,
+        "settlement": settlement,
+    }
+
+
+def get_backfill_trade_dates(conn, start_date=None, end_date=None, days=30):
+    if end_date is None:
+        row = conn.execute("SELECT MAX(trade_date) FROM daily_prices").fetchone()
+        end_date = row[0] if row and row[0] else default_scan_trade_date()
+    if start_date is None:
+        start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)
+        start_date = start_dt.strftime("%Y-%m-%d")
+    rows = conn.execute("""
+        SELECT DISTINCT trade_date
+        FROM daily_prices
+        WHERE trade_date >= ?
+          AND trade_date <= ?
+        ORDER BY trade_date
+    """, (start_date, end_date)).fetchall()
+    return [r["trade_date"] for r in rows]
+
+
+def summarize_backfill_returns(conn, start_date, end_date):
+    row = conn.execute("""
+        SELECT COUNT(*) AS n,
+               AVG(return_pct) AS avg_return,
+               SUM(CASE WHEN return_pct > 0 THEN 1 ELSE 0 END) AS win_count,
+               MIN(return_pct) AS min_return,
+               MAX(return_pct) AS max_return
+        FROM momentum_pick_returns
+        WHERE buy_date >= ?
+          AND buy_date <= ?
+          AND status = 'sold'
+    """, (start_date, end_date)).fetchone()
+    n = row["n"] if row else 0
+    return {
+        "count": n,
+        "avg_return_pct": round(row["avg_return"], 4) if row and row["avg_return"] is not None else None,
+        "win_rate_pct": round(row["win_count"] / n * 100.0, 2) if n else None,
+        "min_return_pct": round(row["min_return"], 4) if row and row["min_return"] is not None else None,
+        "max_return_pct": round(row["max_return"], 4) if row and row["max_return"] is not None else None,
+    }
+
+
+def exact_return_clause():
+    return """
+        AND status = 'sold'
+        AND COALESCE(error, '') != 'daily_open_fallback'
+        AND sell_time = '10:00'
+    """
+
+
+def load_momentum_profit_summary(conn, days=30, exact_only=True):
+    ensure_momentum_tables(conn)
+    exact_filter = exact_return_clause() if exact_only else ""
+    row = conn.execute("""
+        SELECT MAX(buy_date) AS end_date
+        FROM momentum_pick_returns
+        WHERE 1 = 1
+        """ + exact_filter + """
+    """).fetchone()
+    end_date = row["end_date"] if row and row["end_date"] else None
+    if not end_date:
+        return {
+            "start_date": None,
+            "end_date": None,
+            "days": days,
+            "summary": {
+                "sold_count": 0,
+                "failed_count": 0,
+                "avg_return_pct": None,
+                "win_rate_pct": None,
+                "min_return_pct": None,
+                "max_return_pct": None,
+            },
+            "by_date": [],
+            "recent": [],
+            "exact_only": exact_only,
+        }
+
+    start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)
+    start_date = start_dt.strftime("%Y-%m-%d")
+    summary_row = conn.execute("""
+        SELECT
+            SUM(CASE WHEN status = 'sold' THEN 1 ELSE 0 END) AS sold_count,
+            SUM(CASE WHEN status != 'sold' THEN 1 ELSE 0 END) AS failed_count,
+            AVG(CASE WHEN status = 'sold' THEN return_pct END) AS avg_return,
+            SUM(CASE WHEN status = 'sold' AND return_pct > 0 THEN 1 ELSE 0 END) AS win_count,
+            MIN(CASE WHEN status = 'sold' THEN return_pct END) AS min_return,
+            MAX(CASE WHEN status = 'sold' THEN return_pct END) AS max_return
+        FROM momentum_pick_returns
+        WHERE buy_date >= ?
+          AND buy_date <= ?
+        """ + exact_filter + """
+    """, (start_date, end_date)).fetchone()
+    sold_count = summary_row["sold_count"] or 0
+    failed_count = summary_row["failed_count"] or 0
+    summary = {
+        "sold_count": sold_count,
+        "failed_count": failed_count,
+        "avg_return_pct": (
+            round(summary_row["avg_return"], 4)
+            if summary_row["avg_return"] is not None else None
+        ),
+        "win_rate_pct": (
+            round((summary_row["win_count"] or 0) / sold_count * 100.0, 2)
+            if sold_count else None
+        ),
+        "min_return_pct": (
+            round(summary_row["min_return"], 4)
+            if summary_row["min_return"] is not None else None
+        ),
+        "max_return_pct": (
+            round(summary_row["max_return"], 4)
+            if summary_row["max_return"] is not None else None
+        ),
+    }
+
+    by_date = []
+    for row in conn.execute("""
+        SELECT buy_date,
+               COUNT(*) AS total_count,
+               SUM(CASE WHEN status = 'sold' THEN 1 ELSE 0 END) AS sold_count,
+               SUM(CASE WHEN status != 'sold' THEN 1 ELSE 0 END) AS failed_count,
+               AVG(CASE WHEN status = 'sold' THEN return_pct END) AS avg_return,
+               SUM(CASE WHEN status = 'sold' AND return_pct > 0 THEN 1 ELSE 0 END) AS win_count
+        FROM momentum_pick_returns
+        WHERE buy_date >= ?
+          AND buy_date <= ?
+          """ + exact_filter + """
+        GROUP BY buy_date
+        ORDER BY buy_date DESC
+    """, (start_date, end_date)).fetchall():
+        day_sold = row["sold_count"] or 0
+        by_date.append({
+            "buy_date": row["buy_date"],
+            "total_count": row["total_count"] or 0,
+            "sold_count": day_sold,
+            "failed_count": row["failed_count"] or 0,
+            "avg_return_pct": (
+                round(row["avg_return"], 4)
+                if row["avg_return"] is not None else None
+            ),
+            "win_rate_pct": (
+                round((row["win_count"] or 0) / day_sold * 100.0, 2)
+                if day_sold else None
+            ),
+        })
+
+    recent = []
+    for row in conn.execute("""
+        SELECT buy_date, sell_date, code, name,
+               buy_price, sell_price, return_pct,
+               sell_time, status, error
+        FROM momentum_pick_returns
+        WHERE buy_date >= ?
+          AND buy_date <= ?
+          """ + exact_filter + """
+        ORDER BY buy_date DESC, return_pct DESC
+        LIMIT 12
+    """, (start_date, end_date)).fetchall():
+        recent.append({
+            "buy_date": row["buy_date"],
+            "sell_date": row["sell_date"],
+            "code": row["code"],
+            "name": row["name"],
+            "buy_price": row["buy_price"],
+            "sell_price": row["sell_price"],
+            "return_pct": row["return_pct"],
+            "sell_time": row["sell_time"],
+            "status": row["status"],
+            "error": row["error"],
+        })
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "days": days,
+        "summary": summary,
+        "by_date": by_date,
+        "recent": recent,
+        "exact_only": exact_only,
+    }
+
+
+def run_momentum_backfill(params, start_date=None, end_date=None, days=30,
+                          sell_cutoff="10:00", progress=None,
+                          use_daily_fallback=True,
+                          daily_fallback_only=False):
+    conn = get_db()
+    try:
+        ensure_momentum_tables(conn)
+        trade_dates = get_backfill_trade_dates(
+            conn,
+            start_date=start_date,
+            end_date=end_date,
+            days=days,
+        )
+        fast_stocks = None
+        fast_histories = None
+        if daily_fallback_only and trade_dates:
+            fast_stocks = load_stock_universe(
+                conn,
+                pool=params["pool"],
+                index_code=params["index_code"],
+            )
+            fast_histories = load_daily_history_for_backfill(
+                conn,
+                [s["code"] for s in fast_stocks],
+                trade_dates[0],
+                trade_dates[-1],
+            )
+    finally:
+        conn.close()
+
+    results = []
+    for i, trade_date in enumerate(trade_dates):
+        day_params = dict(params)
+        day_params["trade_date"] = trade_date
+        next_trade_date = trade_dates[i + 1] if i + 1 < len(trade_dates) else None
+
+        if daily_fallback_only:
+            payload, status_code = build_daily_fallback_payload_from_history(
+                day_params,
+                fast_stocks or [],
+                fast_histories or {},
+                trade_date,
+                started_at=time.time(),
+            )
+            fallback_used = True
+        else:
+            payload, status_code = perform_historical_momentum_scan(
+                day_params,
+                started_at=time.time(),
+            )
+            fallback_used = False
+            if use_daily_fallback and (
+                status_code != 200
+                or not payload.get("rows")
+                or (payload.get("meta") or {}).get("minute_success", 0) == 0
+            ):
+                payload, status_code = perform_daily_fallback_momentum_scan(
+                    day_params,
+                    started_at=time.time(),
+                )
+                fallback_used = True
+        conn = get_db()
+        try:
+            run_id, saved = save_momentum_scan_result(
+                conn, day_params, payload, status_code
+            )
+            settlement = None
+            if next_trade_date:
+                settlement = settle_momentum_picks(
+                    conn,
+                    sell_date=next_trade_date,
+                    sell_cutoff=sell_cutoff,
+                    buy_date=trade_date,
+                    allow_daily_fallback=(use_daily_fallback or fallback_used),
+                )
+        finally:
+            conn.close()
+
+        item = {
+            "trade_date": trade_date,
+            "sell_date": next_trade_date,
+            "status": status_code,
+            "run_id": run_id,
+            "saved": saved,
+            "picked": len(payload.get("rows") or []),
+            "error": payload.get("error"),
+            "meta": payload.get("meta") or {},
+            "fallback_used": fallback_used,
+            "settlement": settlement,
+        }
+        results.append(item)
+        if progress:
+            progress(item, i + 1, len(trade_dates))
+
+    summary = {}
+    if trade_dates:
+        conn = get_db()
+        try:
+            summary = summarize_backfill_returns(conn, trade_dates[0], trade_dates[-1])
+        finally:
+            conn.close()
+
+    return {
+        "start_date": trade_dates[0] if trade_dates else start_date,
+        "end_date": trade_dates[-1] if trade_dates else end_date,
+        "trade_dates": trade_dates,
+        "days": len(trade_dates),
+        "summary": summary,
+        "results": results,
+    }
 
 
 @app.route("/api/stats")
@@ -1920,8 +3648,223 @@ def api_stats():
     return jsonify({"dates": dates_asc, "indices": result})
 
 
+def build_cli_momentum_params(args):
+    return build_momentum_params({
+        "pool": args.pool,
+        "index_code": args.index_code,
+        "cutoff": args.cutoff,
+        "trade_date": args.trade_date,
+        "min_gain": args.min_gain,
+        "max_gain": args.max_gain,
+        "min_vol_ratio": args.min_vol_ratio,
+        "min_amount": args.min_amount,
+        "limit": args.limit,
+        "verify_limit": args.verify_limit,
+        "workers": args.workers,
+    })
+
+
+def print_settlement_summary(result):
+    print(
+        f"收益结算: buy_date={result.get('buy_date') or '-'} "
+        f"sell_date={result['sell_date']} cutoff={result['sell_cutoff']} "
+        f"sold={result['settled']} failed={result['failed']} "
+        f"avg={result.get('avg_return_pct') if result.get('avg_return_pct') is not None else '-'}%"
+    )
+    for row in result.get("rows", [])[:20]:
+        ret = row["return_pct"] if row["return_pct"] is not None else "-"
+        print(
+            f"  {row['code']} {row.get('name') or ''} "
+            f"buy={row.get('buy_price') or '-'} sell={row.get('sell_price') or '-'} "
+            f"ret={ret}% status={row['status']}"
+        )
+    if len(result.get("rows", [])) > 20:
+        print(f"  ... 还有 {len(result['rows']) - 20} 条")
+    if result.get("message"):
+        print(result["message"])
+
+
+def print_scan_summary(payload, status_code, run_id=None, saved=None):
+    meta = payload.get("meta") or {}
+    print(
+        f"扫描保存: status={status_code} run_id={run_id or '-'} "
+        f"trade_date={meta.get('trade_date')} cutoff={meta.get('cutoff')} "
+        f"quoted={meta.get('quoted', 0)} prefiltered={meta.get('prefiltered', 0)} "
+        f"verified={meta.get('verified', 0)} picked={len(payload.get('rows') or [])} "
+        f"saved={saved if saved is not None else '-'} elapsed={meta.get('elapsed_s', 0)}s"
+    )
+    if payload.get("error"):
+        print(f"错误: {payload['error']}")
+    for row in (payload.get("rows") or [])[:20]:
+        print(
+            f"  {row['code']} {row.get('name') or ''} "
+            f"price={row.get('price')} pct={row.get('pct')}% "
+            f"score={row.get('score')} reasons={row.get('reasons') or ''}"
+        )
+    if len(payload.get("rows") or []) > 20:
+        print(f"  ... 还有 {len(payload['rows']) - 20} 条")
+
+
+def print_recent_returns(limit=30):
+    conn = get_db()
+    try:
+        ensure_momentum_tables(conn)
+        rows = conn.execute("""
+            SELECT r.buy_date, r.sell_date, r.code, r.name,
+                   r.buy_price, r.sell_price, r.return_pct,
+                   r.sell_time, r.status, r.error
+            FROM momentum_pick_returns r
+            ORDER BY r.sell_date DESC, r.return_pct DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        print("暂无收益记录")
+        return
+    for row in rows:
+        ret = row["return_pct"] if row["return_pct"] is not None else "-"
+        print(
+            f"{row['buy_date']} -> {row['sell_date']} "
+            f"{row['code']} {row['name'] or ''} "
+            f"buy={row['buy_price'] or '-'} sell={row['sell_price'] or '-'} "
+            f"time={row['sell_time'] or '-'} ret={ret}% "
+            f"status={row['status']} {row['error'] or ''}"
+        )
+
+
+def print_backfill_progress(item, index, total):
+    settlement = item.get("settlement") or {}
+    avg_return = settlement.get("avg_return_pct")
+    avg_text = f"{avg_return}%" if avg_return is not None else "-"
+    fallback = " fallback=daily" if item.get("fallback_used") else ""
+    print(
+        f"[{index}/{total}] {item['trade_date']} "
+        f"picked={item['picked']} saved={item['saved']} "
+        f"sold={settlement.get('settled', 0)} failed={settlement.get('failed', 0)} "
+        f"avg={avg_text} elapsed={item.get('meta', {}).get('elapsed_s', 0)}s"
+        f"{fallback}"
+    )
+    if item.get("error"):
+        print(f"  error: {item['error']}")
+
+
+def print_backfill_summary(result):
+    summary = result.get("summary") or {}
+    print(
+        f"回填完成: {result.get('start_date')} -> {result.get('end_date')} "
+        f"交易日={result.get('days', 0)} "
+        f"成交记录={summary.get('count', 0)} "
+        f"平均收益={summary.get('avg_return_pct') if summary.get('avg_return_pct') is not None else '-'}% "
+        f"胜率={summary.get('win_rate_pct') if summary.get('win_rate_pct') is not None else '-'}% "
+        f"最差={summary.get('min_return_pct') if summary.get('min_return_pct') is not None else '-'}% "
+        f"最好={summary.get('max_return_pct') if summary.get('max_return_pct') is not None else '-'}%"
+    )
+
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser(description="行业宽度与14:30动量选股服务")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--serve", action="store_true", help="启动 Web 服务")
+    actions.add_argument("--momentum-daily", action="store_true",
+                         help="结算前一交易日选股收益，并扫描保存今日14:30选股")
+    actions.add_argument("--momentum-scan-save", action="store_true",
+                         help="只扫描并保存选股")
+    actions.add_argument("--momentum-settle", action="store_true",
+                         help="只结算前一交易日选股收益")
+    actions.add_argument("--momentum-report", action="store_true",
+                         help="查看最近收益记录")
+    actions.add_argument("--momentum-backfill", action="store_true",
+                         help="回填历史14:30选股并按下一交易日10:00前卖出统计收益")
+
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--pool", default="all", choices=["all", "sector", "index"])
+    parser.add_argument("--index-code", default="")
+    parser.add_argument("--cutoff", default="14:30")
+    parser.add_argument("--trade-date", default=None)
+    parser.add_argument("--sell-date", default=None)
+    parser.add_argument("--sell-cutoff", default="10:00")
+    parser.add_argument("--settle-buy-date", default=None)
+    parser.add_argument("--min-gain", type=float, default=2.0)
+    parser.add_argument("--max-gain", type=float, default=7.5)
+    parser.add_argument("--min-vol-ratio", type=float, default=1.5)
+    parser.add_argument("--min-amount", type=float, default=8000,
+                        help="最低成交额，单位万元")
+    parser.add_argument("--limit", type=int, default=80)
+    parser.add_argument("--verify-limit", type=int, default=50)
+    parser.add_argument("--workers", type=int, default=6)
+    parser.add_argument("--report-limit", type=int, default=30)
+    parser.add_argument("--backfill-days", type=int, default=30)
+    parser.add_argument("--backfill-start", default=None)
+    parser.add_argument("--backfill-end", default=None)
+    parser.add_argument("--no-daily-fallback", action="store_true",
+                        help="历史分钟线不可用时不使用日线近似回退")
+    parser.add_argument("--daily-fallback-only", action="store_true",
+                        help="历史回填直接使用日线近似口径，不尝试分钟线")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_cli_args()
+    if len(sys.argv) == 1 or args.serve:
+        app.run(debug=args.debug, host=args.host, port=args.port)
+        return
+
+    params = build_cli_momentum_params(args)
+    if args.momentum_daily:
+        result = run_momentum_daily_job(
+            params,
+            sell_date=args.sell_date or params["trade_date"],
+            sell_cutoff=args.sell_cutoff,
+            settle_buy_date=args.settle_buy_date,
+        )
+        print_settlement_summary(result["settlement"])
+        print_scan_summary(
+            result["scan"],
+            result["scan_status"],
+            run_id=result["run_id"],
+            saved=result["saved"],
+        )
+    elif args.momentum_scan_save:
+        payload, status_code = perform_momentum_scan(params, started_at=time.time())
+        conn = get_db()
+        try:
+            run_id, saved = save_momentum_scan_result(conn, params, payload, status_code)
+        finally:
+            conn.close()
+        print_scan_summary(payload, status_code, run_id=run_id, saved=saved)
+    elif args.momentum_settle:
+        conn = get_db()
+        try:
+            result = settle_momentum_picks(
+                conn,
+                sell_date=args.sell_date or params["trade_date"],
+                sell_cutoff=args.sell_cutoff,
+                buy_date=args.settle_buy_date,
+            )
+        finally:
+            conn.close()
+        print_settlement_summary(result)
+    elif args.momentum_report:
+        print_recent_returns(args.report_limit)
+    elif args.momentum_backfill:
+        result = run_momentum_backfill(
+            params,
+            start_date=args.backfill_start,
+            end_date=args.backfill_end,
+            days=args.backfill_days,
+            sell_cutoff=args.sell_cutoff,
+            progress=print_backfill_progress,
+            use_daily_fallback=not args.no_daily_fallback,
+            daily_fallback_only=args.daily_fallback_only,
+        )
+        print_backfill_summary(result)
+
+
 # ─────────────────────────────────────────────────────────────────
 # 启动
 # ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    main()
