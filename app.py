@@ -2370,7 +2370,11 @@ def perform_pattern_scan_with_histories(params, stocks, histories, market_dates,
     return {"meta": meta, "rows": rows}, 200
 
 
-def get_pattern_backfill_trade_dates(conn, end_date=None, days=548):
+def default_pattern_backfill_days(params):
+    return 365 if (params or {}).get("pattern_type") == "four_pin" else 30
+
+
+def get_pattern_backfill_trade_dates(conn, end_date=None, days=30):
     end_date = end_date or latest_daily_trade_date(conn)
     start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)
     start_date = start_dt.strftime("%Y-%m-%d")
@@ -2384,8 +2388,9 @@ def get_pattern_backfill_trade_dates(conn, end_date=None, days=548):
     return [r["trade_date"] for r in rows]
 
 
-def run_pattern_backfill(params, days=548, end_date=None, progress=None):
+def run_pattern_backfill(params, days=None, end_date=None, progress=None):
     started_at = time.time()
+    days = days or default_pattern_backfill_days(params)
     conn = get_db()
     try:
         ensure_pattern_tables(conn)
@@ -2550,8 +2555,9 @@ def run_pattern_backfill(params, days=548, end_date=None, progress=None):
     }
 
 
-def run_pattern_backfill_job(params, days=548, end_date=None, job_key="pattern_backfill"):
+def run_pattern_backfill_job(params, days=None, end_date=None, job_key="pattern_backfill"):
     started_at = time.time()
+    days = days or default_pattern_backfill_days(params)
     save_pattern_progress(
         job_key,
         job_type="backfill",
@@ -2644,11 +2650,79 @@ def build_empty_pattern_meta(params, universe=0):
     }
 
 
+def pattern_type_from_params_json(params_json):
+    try:
+        return (json.loads(params_json or "{}").get("pattern_type") or "four_pin")
+    except (TypeError, json.JSONDecodeError):
+        return "four_pin"
+
+
+def delete_existing_pattern_scope(conn, params):
+    rows = conn.execute("""
+        SELECT id, params_json
+        FROM pattern_scan_runs
+        WHERE trade_date = ?
+          AND pool = ?
+          AND COALESCE(index_code, '') = COALESCE(?, '')
+    """, (
+        params["trade_date"],
+        params["pool"],
+        params["index_code"],
+    )).fetchall()
+    run_ids = [
+        row["id"] for row in rows
+        if pattern_type_from_params_json(row["params_json"]) == params.get("pattern_type", "four_pin")
+    ]
+    if not run_ids:
+        return 0
+    placeholders = ",".join("?" for _ in run_ids)
+    conn.execute(f"DELETE FROM pattern_picks WHERE run_id IN ({placeholders})", run_ids)
+    conn.execute(f"DELETE FROM pattern_scan_runs WHERE id IN ({placeholders})", run_ids)
+    return len(run_ids)
+
+
+def chunked(items, size=500):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def delete_pattern_history(conn, pattern_type=None):
+    ensure_pattern_tables(conn)
+    rows = conn.execute("""
+        SELECT id, params_json
+        FROM pattern_scan_runs
+        ORDER BY id
+    """).fetchall()
+    if pattern_type in ("four_pin", "bottom_reversal"):
+        run_ids = [
+            row["id"] for row in rows
+            if pattern_type_from_params_json(row["params_json"]) == pattern_type
+        ]
+    else:
+        run_ids = [row["id"] for row in rows]
+
+    pick_count = 0
+    for batch in chunked(run_ids):
+        placeholders = ",".join("?" for _ in batch)
+        row = conn.execute(
+            f"SELECT COUNT(*) AS count FROM pattern_picks WHERE run_id IN ({placeholders})",
+            batch,
+        ).fetchone()
+        pick_count += row["count"] if row else 0
+        conn.execute(f"DELETE FROM pattern_picks WHERE run_id IN ({placeholders})", batch)
+        conn.execute(f"DELETE FROM pattern_scan_runs WHERE id IN ({placeholders})", batch)
+
+    conn.execute("DELETE FROM pattern_scan_progress WHERE job_key IN ('pattern_scan', 'pattern_backfill')")
+    conn.commit()
+    return {"deleted_runs": len(run_ids), "deleted_picks": pick_count}
+
+
 def save_pattern_scan_result(conn, params, payload, status_code):
     ensure_pattern_tables(conn)
     meta = payload.get("meta") or build_empty_pattern_meta(params)
     rows = payload.get("rows") or []
     status = "ok" if status_code == 200 else "error"
+    delete_existing_pattern_scope(conn, params)
     cur = conn.execute("""
         INSERT INTO pattern_scan_runs (
             trade_date, pool, index_code, lookback_days, chart_bars,
@@ -2934,17 +3008,16 @@ def load_pattern_history(conn, days=None, hits_only=True, pattern_type=None,
     where_sql = " AND ".join(conditions)
     offset = (page - 1) * page_size
 
-    if hits_only and pattern_type == "four_pin":
+    if hits_only:
         trade_date_rows = conn.execute(f"""
             SELECT DISTINCT r.trade_date
             FROM pattern_scan_runs r
             WHERE {where_sql}
             ORDER BY r.trade_date DESC
         """, values).fetchall()
-        page_trade_dates = []
-        result_runs = []
         run_conditions = ["trade_date = ?", "row_count > 0"]
         run_where_sql = " AND ".join(run_conditions)
+        matching_runs = []
         for date_row in trade_date_rows:
             trade_date = date_row["trade_date"]
             runs = conn.execute(f"""
@@ -2961,7 +3034,7 @@ def load_pattern_history(conn, days=None, hits_only=True, pattern_type=None,
                 if not picks:
                     continue
                 params = pattern_run_params(run)
-                result_runs.append({
+                matching_runs.append({
                     "run_id": run["id"],
                     "trade_date": run["trade_date"],
                     "pool": run["pool"],
@@ -2974,9 +3047,10 @@ def load_pattern_history(conn, days=None, hits_only=True, pattern_type=None,
                     "created_at": run["created_at"],
                     "rows": picks,
                 })
-                page_trade_dates.append(trade_date)
                 break
 
+        page_trade_dates = [run["trade_date"] for run in matching_runs]
+        total_rows = sum(len(run["rows"]) for run in matching_runs)
         return {
             "start_date": start_date,
             "end_date": end_date,
@@ -2988,79 +3062,9 @@ def load_pattern_history(conn, days=None, hits_only=True, pattern_type=None,
             "has_prev": False,
             "has_next": False,
             "page_trade_dates": page_trade_dates,
-            "page_row_count": sum(len(run["rows"]) for run in result_runs),
-            "runs": result_runs,
-        }
-
-    if hits_only:
-        run_rows = conn.execute(f"""
-            SELECT r.*
-            FROM pattern_scan_runs r
-            WHERE {where_sql}
-            ORDER BY r.trade_date DESC, r.id DESC
-        """, values).fetchall()
-        result_runs = []
-        page_trade_dates = []
-        skipped = 0
-        collected = 0
-        has_next = False
-        for run_index, run in enumerate(run_rows):
-            if not pattern_run_matches_type(run, pattern_type):
-                continue
-            picks = load_pattern_rows_for_run(conn, run, highlight=4, filters=filters)
-            if not picks:
-                continue
-            if skipped + len(picks) <= offset:
-                skipped += len(picks)
-                continue
-
-            start = max(0, offset - skipped)
-            available = picks[start:]
-            take = max(0, page_size - collected)
-            page_picks = available[:take]
-            if page_picks:
-                params = pattern_run_params(run)
-                result_runs.append({
-                    "run_id": run["id"],
-                    "trade_date": run["trade_date"],
-                    "pool": run["pool"],
-                    "pattern_type": params.get("pattern_type", "four_pin"),
-                    "index_code": run["index_code"],
-                    "universe": run["universe"],
-                    "scanned": run["scanned"],
-                    "matched": run["row_count"],
-                    "elapsed_s": run["elapsed_s"],
-                    "created_at": run["created_at"],
-                    "rows": page_picks,
-                })
-                if run["trade_date"] not in page_trade_dates:
-                    page_trade_dates.append(run["trade_date"])
-                collected += len(page_picks)
-            skipped += len(picks)
-            if collected >= page_size:
-                has_next = len(available) > len(page_picks)
-                if not has_next:
-                    remaining_runs = run_rows[run_index + 1:]
-                    has_next = any(
-                        pattern_run_matches_type(item, pattern_type)
-                        and load_pattern_rows_for_run(conn, item, highlight=4, filters=filters)
-                        for item in remaining_runs
-                    )
-                break
-
-        return {
-            "start_date": start_date,
-            "end_date": end_date,
-            "days": days,
-            "hits_only": hits_only,
-            "page": page,
-            "page_size": page_size,
-            "pagination_mode": "rows",
-            "has_prev": page > 1,
-            "has_next": has_next,
-            "page_trade_dates": page_trade_dates,
-            "page_row_count": sum(len(run["rows"]) for run in result_runs),
-            "runs": result_runs,
+            "page_row_count": total_rows,
+            "total_rows": total_rows,
+            "runs": matching_runs,
         }
 
     trade_date_rows = conn.execute(f"""
@@ -4658,7 +4662,10 @@ PATTERN_HTML = """<!DOCTYPE html>
   </label>
   <button id="scanBtn" onclick="scan()">扫描并保存</button>
   <button class="secondary" onclick="loadLatest()">最近结果</button>
-  <button class="secondary" id="backfillBtn" onclick="backfillEighteenMonths()">回扫1.5年</button>
+  <button class="secondary" id="clearBtn" onclick="clearPatternHistory(false)">清空当前形态</button>
+  <button class="secondary" id="clearAllBtn" onclick="clearPatternHistory(false, true)">清空全部历史</button>
+  <button class="secondary" id="clearBackfillBtn" onclick="clearPatternHistory(true)">清空并回扫</button>
+  <button class="secondary" id="backfillBtn" onclick="backfillPattern()">回扫</button>
 </div>
 
 <div class="status">
@@ -4755,6 +4762,22 @@ function progressText(job) {
   return job.status || '—';
 }
 
+function patternBackfillDays(patternType=document.getElementById('patternType')?.value) {
+  return patternType === 'four_pin' ? 365 : 30;
+}
+
+function patternBackfillLabel(patternType=document.getElementById('patternType')?.value) {
+  return patternType === 'four_pin' ? '1年' : '1个月';
+}
+
+function updateBackfillButtons() {
+  const label = patternBackfillLabel();
+  const backfillBtn = document.getElementById('backfillBtn');
+  const clearBackfillBtn = document.getElementById('clearBackfillBtn');
+  if (backfillBtn) backfillBtn.textContent = `回扫${label}`;
+  if (clearBackfillBtn) clearBackfillBtn.textContent = `清空并回扫${label}`;
+}
+
 async function loadPatternProgress(renderBox=false) {
   const res = await fetch('/api/pattern/progress?job=pattern_backfill');
   const job = await res.json();
@@ -4764,8 +4787,9 @@ async function loadPatternProgress(renderBox=false) {
   if (renderBox && job.status === 'running') {
     const detail = job.trade_date ? `当前 ${esc(job.trade_date)} · ` : '';
     const elapsed = job.elapsed_s === null || job.elapsed_s === undefined ? '' : ` · ${fmt(job.elapsed_s, 1)}s`;
+    const label = patternBackfillLabel(job.params?.pattern_type);
     document.getElementById('history').innerHTML =
-      `<div class="loading"><span class="spinner"></span>正在回扫最近1.5年：${detail}${esc(text)}${elapsed}</div>`;
+      `<div class="loading"><span class="spinner"></span>正在回扫最近${label}：${detail}${esc(text)}${elapsed}</div>`;
   }
   return job;
 }
@@ -4905,6 +4929,7 @@ function toggleHistoryRun(head) {
 
 function onPatternTypeChange() {
   historyPage = 1;
+  updateBackfillButtons();
   loadLatest(false);
   loadHistory(1);
 }
@@ -4958,14 +4983,16 @@ async function scan() {
   }
 }
 
-async function backfillEighteenMonths() {
+async function backfillPattern() {
   const btn = document.getElementById('backfillBtn');
+  const days = patternBackfillDays();
+  const label = patternBackfillLabel();
   btn.disabled = true;
   btn.textContent = '回扫中…';
-  document.getElementById('history').innerHTML = '<div class="loading"><span class="spinner"></span>正在回扫最近1.5年…</div>';
+  document.getElementById('history').innerHTML = `<div class="loading"><span class="spinner"></span>正在回扫最近${label}…</div>`;
   try {
     const p = new URLSearchParams(params());
-    p.set('days', '548');
+    p.set('days', String(days));
     p.delete('save');
     const res = await fetch('/api/pattern/backfill?' + p.toString());
     const data = await res.json();
@@ -4974,7 +5001,7 @@ async function backfillEighteenMonths() {
       const job = await loadPatternProgress(true);
       if (job.status === 'done') {
         document.getElementById('statSaved').textContent =
-          `1.5年 ${job.matched_days || 0} 天 / ${job.matched_rows || 0} 条`;
+          `${label} ${job.matched_days || 0} 天 / ${job.matched_rows || 0} 条`;
         break;
       }
       if (job.status === 'error') {
@@ -4989,12 +5016,56 @@ async function backfillEighteenMonths() {
     document.getElementById('history').innerHTML = `<div class="loading">回扫失败：${esc(err.message)}</div>`;
   } finally {
     btn.disabled = false;
-    btn.textContent = '回扫1.5年';
+    updateBackfillButtons();
+  }
+}
+
+async function clearPatternHistory(thenBackfill=false, clearAll=false) {
+  const patternSelect = document.getElementById('patternType');
+  const patternLabel = clearAll
+    ? '全部形态'
+    : (patternSelect.options[patternSelect.selectedIndex]?.text || '当前形态');
+  const backfillLabel = patternBackfillLabel();
+  const message = thenBackfill
+    ? `确认清空所有${patternLabel}历史记录，并重新回扫最近${backfillLabel}？`
+    : `确认清空所有${patternLabel}历史记录？`;
+  if (!window.confirm(message)) return;
+
+  const clearBtn = document.getElementById('clearBtn');
+  const clearAllBtn = document.getElementById('clearAllBtn');
+  const clearBackfillBtn = document.getElementById('clearBackfillBtn');
+  clearBtn.disabled = true;
+  clearAllBtn.disabled = true;
+  clearBackfillBtn.disabled = true;
+  clearBackfillBtn.textContent = thenBackfill ? '清空中…' : clearBackfillBtn.textContent;
+  document.getElementById('history').innerHTML = `<div class="loading"><span class="spinner"></span>正在清空${esc(patternLabel)}历史…</div>`;
+  try {
+    const p = new URLSearchParams(params());
+    p.delete('save');
+    if (clearAll) p.set('patternType', 'all');
+    p.set('confirm', '1');
+    const res = await fetch('/api/pattern/clear?' + p.toString(), { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '清空失败');
+    document.getElementById('statSaved').textContent =
+      `已清空 ${data.deleted_runs || 0} 次 / ${data.deleted_picks || 0} 条`;
+    historyPage = 1;
+    await loadHistory(1);
+    await loadLatest(false);
+    if (thenBackfill) await backfillPattern();
+  } catch (err) {
+    document.getElementById('history').innerHTML = `<div class="loading">清空失败：${esc(err.message)}</div>`;
+  } finally {
+    clearBtn.disabled = false;
+    clearAllBtn.disabled = false;
+    clearBackfillBtn.disabled = false;
+    updateBackfillButtons();
   }
 }
 
 loadIndices();
 loadPatternProgress();
+updateBackfillButtons();
 loadLatest(false);
 loadHistory(1);
 </script>
@@ -5244,12 +5315,35 @@ def api_pattern_history():
     return jsonify(payload)
 
 
+@app.route("/api/pattern/clear", methods=["POST"])
+def api_pattern_clear():
+    if request.args.get("confirm") != "1":
+        return jsonify({"error": "缺少确认参数"}), 400
+    if not SCAN_LOCK.acquire(blocking=False):
+        return jsonify({"error": "已有扫描任务进行中，请等待上一次扫描结束"}), 429
+    try:
+        raw_pattern_type = get_source_value(request.args, "patternType", "pattern_type")
+        pattern_type = None if raw_pattern_type in ("all", "*") else build_pattern_params(request.args)["pattern_type"]
+        conn = get_db()
+        try:
+            result = delete_pattern_history(conn, pattern_type=pattern_type)
+        finally:
+            conn.close()
+        result["pattern_type"] = pattern_type or "all"
+        return jsonify(result)
+    finally:
+        SCAN_LOCK.release()
+
+
 @app.route("/api/pattern/backfill")
 def api_pattern_backfill():
     if not SCAN_LOCK.acquire(blocking=False):
         return jsonify({"error": "已有扫描任务进行中，请等待上一次扫描结束"}), 429
     params = build_pattern_params(request.args)
-    days = to_int_arg("days", 548, 1, 3650)
+    if request.args.get("days") in (None, ""):
+        days = default_pattern_backfill_days(params)
+    else:
+        days = to_int_arg("days", default_pattern_backfill_days(params), 1, 3650)
     save_pattern_progress(
         "pattern_backfill",
         job_type="backfill",
@@ -6938,8 +7032,8 @@ def parse_cli_args():
                         help="最低总市值，单位亿元；0表示不限制")
     parser.add_argument("--pattern-min-amount", type=float, default=None,
                         help="收盘形态扫描最低成交额，单位万元；不填则不限制")
-    parser.add_argument("--pattern-backfill-days", type=int, default=548,
-                        help="四针形态历史回扫天数")
+    parser.add_argument("--pattern-backfill-days", type=int, default=None,
+                        help="收盘形态历史回扫天数；不填时四根针365天，底部反转30天")
     return parser.parse_args()
 
 
@@ -7021,7 +7115,7 @@ def main():
         pattern_params = build_cli_pattern_params(args)
         result = run_pattern_backfill(
             pattern_params,
-            days=args.pattern_backfill_days,
+            days=args.pattern_backfill_days or default_pattern_backfill_days(pattern_params),
             end_date=args.trade_date,
             progress=print_pattern_backfill_progress,
         )
