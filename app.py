@@ -54,6 +54,11 @@ SCAN_LOCK = threading.Lock()
 KLINE_CACHE = {}
 KLINE_CACHE_LOCK = threading.Lock()
 KLINE_CACHE_DB_READY = False
+PATTERN_PROGRESS_COLUMNS = [
+    "job_key", "job_type", "status", "started_at", "updated_at", "trade_date",
+    "current_index", "total", "picked", "matched_rows", "matched_days",
+    "elapsed_s", "message", "params_json", "result_json", "error",
+]
 
 
 def get_db():
@@ -232,9 +237,91 @@ def ensure_pattern_tables(conn):
             created_at     DATETIME DEFAULT (datetime('now','localtime'))
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pattern_scan_progress (
+            job_key       TEXT PRIMARY KEY,
+            job_type      TEXT,
+            status        TEXT,
+            started_at    DATETIME,
+            updated_at    DATETIME,
+            trade_date    DATE,
+            current_index INTEGER,
+            total         INTEGER,
+            picked        INTEGER,
+            matched_rows  INTEGER,
+            matched_days  INTEGER,
+            elapsed_s     REAL,
+            message       TEXT,
+            params_json   TEXT,
+            result_json   TEXT,
+            error         TEXT
+        )
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_runs_date ON pattern_scan_runs(trade_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_picks_run ON pattern_picks(run_id)")
     conn.commit()
+
+
+def local_now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def save_pattern_progress(job_key="pattern_backfill", **updates):
+    now = local_now_text()
+    conn = get_db()
+    try:
+        ensure_pattern_tables(conn)
+        row = conn.execute(
+            "SELECT * FROM pattern_scan_progress WHERE job_key = ?",
+            (job_key,),
+        ).fetchone()
+        data = {column: None for column in PATTERN_PROGRESS_COLUMNS}
+        data["job_key"] = job_key
+        if row:
+            data.update(dict(row))
+        else:
+            data["started_at"] = now
+        for key, value in updates.items():
+            if key in data:
+                data[key] = value
+        data["updated_at"] = now
+        if updates.get("status") in ("running", "queued") and not updates.get("started_at") and not row:
+            data["started_at"] = now
+        placeholders = ",".join("?" for _ in PATTERN_PROGRESS_COLUMNS)
+        columns = ",".join(PATTERN_PROGRESS_COLUMNS)
+        conn.execute(
+            f"REPLACE INTO pattern_scan_progress ({columns}) VALUES ({placeholders})",
+            [data[column] for column in PATTERN_PROGRESS_COLUMNS],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_pattern_progress(job_key="pattern_backfill"):
+    conn = get_db()
+    try:
+        ensure_pattern_tables(conn)
+        row = conn.execute(
+            "SELECT * FROM pattern_scan_progress WHERE job_key = ?",
+            (job_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {"job_key": job_key, "status": "idle"}
+    data = dict(row)
+    for key in ("params_json", "result_json"):
+        raw = data.pop(key, None)
+        plain_key = key[:-5]
+        if raw:
+            try:
+                data[plain_key] = json.loads(raw)
+            except (TypeError, ValueError):
+                data[plain_key] = raw
+        else:
+            data[plain_key] = None
+    return data
 
 
 def clamp(value, low, high):
@@ -1830,6 +1917,7 @@ def run_pattern_backfill(params, days=3650, end_date=None, progress=None):
 
     results = []
     matched_rows = 0
+    matched_days = 0
     for i, trade_date in enumerate(trade_dates, 1):
         day_params = dict(params)
         day_params["trade_date"] = trade_date
@@ -1852,12 +1940,16 @@ def run_pattern_backfill(params, days=3650, end_date=None, progress=None):
             conn.close()
         picked = len(payload.get("rows") or [])
         matched_rows += picked
+        if picked > 0:
+            matched_days += 1
         item = {
             "trade_date": trade_date,
             "status": status_code,
             "run_id": run_id,
             "saved": saved,
             "picked": picked,
+            "matched_rows_so_far": matched_rows,
+            "matched_days_so_far": matched_days,
             "meta": payload.get("meta") or {},
         }
         results.append(item)
@@ -1868,11 +1960,91 @@ def run_pattern_backfill(params, days=3650, end_date=None, progress=None):
         "start_date": trade_dates[0],
         "end_date": trade_dates[-1],
         "days": len(trade_dates),
-        "matched_days": sum(1 for item in results if item["picked"] > 0),
+        "matched_days": matched_days,
         "matched_rows": matched_rows,
         "elapsed_s": round(time.time() - started_at, 1),
         "results": results,
     }
+
+
+def run_pattern_backfill_job(params, days=3650, end_date=None, job_key="pattern_backfill"):
+    started_at = time.time()
+    save_pattern_progress(
+        job_key,
+        job_type="backfill",
+        status="running",
+        started_at=local_now_text(),
+        trade_date=end_date or params.get("trade_date"),
+        current_index=0,
+        total=0,
+        picked=0,
+        matched_rows=0,
+        matched_days=0,
+        elapsed_s=0,
+        message="准备回扫",
+        params_json=json.dumps(params, ensure_ascii=False, sort_keys=True),
+        result_json=None,
+        error=None,
+    )
+
+    def on_progress(item, index, total):
+        picked = item.get("picked", 0)
+        save_pattern_progress(
+            job_key,
+            job_type="backfill",
+            status="running",
+            trade_date=item.get("trade_date"),
+            current_index=index,
+            total=total,
+            picked=picked,
+            matched_rows=item.get("matched_rows_so_far", 0),
+            matched_days=item.get("matched_days_so_far", 0),
+            elapsed_s=round(time.time() - started_at, 1),
+            message=f"正在回扫 {item.get('trade_date')}，当天命中 {picked} 条",
+            error=None,
+        )
+
+    try:
+        result = run_pattern_backfill(
+            params,
+            days=days,
+            end_date=end_date,
+            progress=on_progress,
+        )
+        save_pattern_progress(
+            job_key,
+            job_type="backfill",
+            status="done",
+            trade_date=result.get("end_date"),
+            current_index=result.get("days"),
+            total=result.get("days"),
+            picked=0,
+            matched_rows=result.get("matched_rows", 0),
+            matched_days=result.get("matched_days", 0),
+            elapsed_s=result.get("elapsed_s", round(time.time() - started_at, 1)),
+            message="回扫完成",
+            result_json=json.dumps({
+                "start_date": result.get("start_date"),
+                "end_date": result.get("end_date"),
+                "days": result.get("days"),
+                "matched_days": result.get("matched_days"),
+                "matched_rows": result.get("matched_rows"),
+                "elapsed_s": result.get("elapsed_s"),
+            }, ensure_ascii=False, sort_keys=True),
+            error=None,
+        )
+    except Exception as exc:
+        app.logger.exception("Pattern backfill job failed")
+        save_pattern_progress(
+            job_key,
+            job_type="backfill",
+            status="error",
+            elapsed_s=round(time.time() - started_at, 1),
+            message="回扫失败",
+            error=str(exc),
+        )
+    finally:
+        SCAN_LOCK.release()
 
 
 def build_empty_pattern_meta(params, universe=0):
@@ -3538,6 +3710,7 @@ PATTERN_HTML = """<!DOCTYPE html>
   <div class="pill">扫描 <b id="statScanned">—</b></div>
   <div class="pill">命中 <b id="statMatched">—</b></div>
   <div class="pill">耗时 <b id="statElapsed">—</b></div>
+  <div class="pill">进度 <b id="statProgress">—</b></div>
   <div class="pill">保存 <b id="statSaved">—</b></div>
 </div>
 
@@ -3554,6 +3727,7 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
 }[ch]));
 const fmt = (value, digits=2) => value === null || value === undefined ? '—' : Number(value).toFixed(digits);
 const cls = value => Number(value || 0) > 0 ? 'up' : Number(value || 0) < 0 ? 'down' : '';
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function loadIndices() {
   const res = await fetch('/api/indices');
@@ -3595,6 +3769,41 @@ function setMeta(meta, savedText='—') {
   document.getElementById('statMatched').textContent = meta?.matched ?? '—';
   document.getElementById('statElapsed').textContent = meta?.elapsed_s === undefined ? '—' : `${meta.elapsed_s}s`;
   document.getElementById('statSaved').textContent = savedText;
+}
+
+function setProgressText(text) {
+  document.getElementById('statProgress').textContent = text || '—';
+}
+
+function progressText(job) {
+  if (!job || job.status === 'idle') return '—';
+  if (job.status === 'running') {
+    const total = Number(job.total || 0);
+    const current = Number(job.current_index || 0);
+    const pct = total > 0 ? ` ${Math.floor(current * 100 / total)}%` : '';
+    const hits = job.matched_rows === null || job.matched_rows === undefined ? '' : ` 命中${job.matched_rows}`;
+    return `${current}/${total || '?'}${pct}${hits}`;
+  }
+  if (job.status === 'done') {
+    return `完成 ${job.matched_days || 0}天/${job.matched_rows || 0}条`;
+  }
+  if (job.status === 'error') return '失败';
+  return job.status || '—';
+}
+
+async function loadPatternProgress(renderBox=false) {
+  const res = await fetch('/api/pattern/progress?job=pattern_backfill');
+  const job = await res.json();
+  if (!res.ok) throw new Error(job.error || '进度加载失败');
+  const text = progressText(job);
+  setProgressText(text);
+  if (renderBox && job.status === 'running') {
+    const detail = job.trade_date ? `当前 ${esc(job.trade_date)} · ` : '';
+    const elapsed = job.elapsed_s === null || job.elapsed_s === undefined ? '' : ` · ${fmt(job.elapsed_s, 1)}s`;
+    document.getElementById('history').innerHTML =
+      `<div class="loading"><span class="spinner"></span>正在回扫最近10年：${detail}${esc(text)}${elapsed}</div>`;
+  }
+  return job;
 }
 
 function metric(label, value, className='') {
@@ -3715,8 +3924,18 @@ async function backfillTenYears() {
     const res = await fetch('/api/pattern/backfill?' + p.toString());
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '回扫失败');
-    document.getElementById('statSaved').textContent =
-      `10年 ${data.matched_days || 0} 天 / ${data.matched_rows || 0} 条`;
+    for (;;) {
+      const job = await loadPatternProgress(true);
+      if (job.status === 'done') {
+        document.getElementById('statSaved').textContent =
+          `10年 ${job.matched_days || 0} 天 / ${job.matched_rows || 0} 条`;
+        break;
+      }
+      if (job.status === 'error') {
+        throw new Error(job.error || '回扫失败');
+      }
+      await sleep(2000);
+    }
     await loadHistory();
     await loadLatest();
   } catch (err) {
@@ -3728,6 +3947,7 @@ async function backfillTenYears() {
 }
 
 loadIndices();
+loadPatternProgress();
 loadLatest();
 loadHistory();
 </script>
@@ -3881,6 +4101,23 @@ def api_pattern_scan():
         }), 429
     try:
         params = build_pattern_params(request.args)
+        save_pattern_progress(
+            "pattern_scan",
+            job_type="scan",
+            status="running",
+            started_at=local_now_text(),
+            trade_date=params.get("trade_date"),
+            current_index=0,
+            total=1,
+            picked=0,
+            matched_rows=0,
+            matched_days=0,
+            elapsed_s=0,
+            message="正在扫描",
+            params_json=json.dumps(params, ensure_ascii=False, sort_keys=True),
+            result_json=None,
+            error=None,
+        )
         payload, status = perform_pattern_scan(params, started_at=started_at)
         save_requested = request.args.get("save", "0") in ("1", "true", "yes")
         if save_requested:
@@ -3891,7 +4128,37 @@ def api_pattern_scan():
                 conn.close()
             payload["run_id"] = run_id
             payload["saved"] = saved
+        matched = len(payload.get("rows") or [])
+        save_pattern_progress(
+            "pattern_scan",
+            job_type="scan",
+            status="done" if status == 200 else "error",
+            trade_date=(payload.get("meta") or {}).get("trade_date"),
+            current_index=1,
+            total=1,
+            picked=matched,
+            matched_rows=matched,
+            matched_days=1 if matched else 0,
+            elapsed_s=(payload.get("meta") or {}).get("elapsed_s"),
+            message="扫描完成" if status == 200 else "扫描失败",
+            result_json=json.dumps({
+                "trade_date": (payload.get("meta") or {}).get("trade_date"),
+                "matched_rows": matched,
+                "elapsed_s": (payload.get("meta") or {}).get("elapsed_s"),
+            }, ensure_ascii=False, sort_keys=True),
+            error=payload.get("error"),
+        )
         return jsonify(payload), status
+    except Exception as exc:
+        save_pattern_progress(
+            "pattern_scan",
+            job_type="scan",
+            status="error",
+            elapsed_s=round(time.time() - started_at, 1),
+            message="扫描失败",
+            error=str(exc),
+        )
+        raise
     finally:
         SCAN_LOCK.release()
 
@@ -3918,17 +4185,47 @@ def api_pattern_history():
 def api_pattern_backfill():
     if not SCAN_LOCK.acquire(blocking=False):
         return jsonify({"error": "已有扫描任务进行中，请等待上一次扫描结束"}), 429
+    params = build_pattern_params(request.args)
+    days = to_int_arg("days", 3650, 1, 3650)
+    save_pattern_progress(
+        "pattern_backfill",
+        job_type="backfill",
+        status="running",
+        started_at=local_now_text(),
+        trade_date=params.get("trade_date"),
+        current_index=0,
+        total=0,
+        picked=0,
+        matched_rows=0,
+        matched_days=0,
+        elapsed_s=0,
+        message="回扫任务已启动",
+        params_json=json.dumps(params, ensure_ascii=False, sort_keys=True),
+        result_json=None,
+        error=None,
+    )
+    thread = threading.Thread(
+        target=run_pattern_backfill_job,
+        args=(params, days, params.get("trade_date")),
+        daemon=True,
+    )
     try:
-        params = build_pattern_params(request.args)
-        days = to_int_arg("days", 3650, 1, 3650)
-        result = run_pattern_backfill(
-            params,
-            days=days,
-            end_date=params.get("trade_date"),
-        )
-        return jsonify(result)
-    finally:
+        thread.start()
+    except Exception:
         SCAN_LOCK.release()
+        raise
+    return jsonify({
+        "status": "running",
+        "job_key": "pattern_backfill",
+        "message": "回扫任务已启动",
+        "days": days,
+    })
+
+
+@app.route("/api/pattern/progress")
+def api_pattern_progress():
+    job_key = request.args.get("job", "pattern_backfill")
+    return jsonify(load_pattern_progress(job_key))
 
 
 @app.route("/api/momentum/profit")
