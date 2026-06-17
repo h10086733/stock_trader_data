@@ -477,10 +477,10 @@ def build_pattern_params(source=None):
     if pool == "index" and not index_code:
         pool = "all"
     pattern_type = get_source_value(
-        source, "patternType", "pattern_type", default="four_pin"
+        source, "patternType", "pattern_type", default="bottom_reversal"
     )
     if pattern_type not in ("four_pin", "bottom_reversal"):
-        pattern_type = "four_pin"
+        pattern_type = "bottom_reversal"
     return {
         "pattern_type": pattern_type,
         "pool": pool,
@@ -3049,22 +3049,25 @@ def load_pattern_history(conn, days=None, hits_only=True, pattern_type=None,
                 })
                 break
 
-        page_trade_dates = [run["trade_date"] for run in matching_runs]
         total_rows = sum(len(run["rows"]) for run in matching_runs)
+        page_runs = matching_runs[offset:offset + page_size]
+        page_trade_dates = [run["trade_date"] for run in page_runs]
+        page_row_count = sum(len(run["rows"]) for run in page_runs)
         return {
             "start_date": start_date,
             "end_date": end_date,
             "days": days,
             "hits_only": hits_only,
-            "page": 1,
-            "page_size": None,
-            "pagination_mode": "none",
-            "has_prev": False,
-            "has_next": False,
+            "page": page,
+            "page_size": page_size,
+            "pagination_mode": "trade_dates",
+            "has_prev": page > 1,
+            "has_next": offset + page_size < len(matching_runs),
             "page_trade_dates": page_trade_dates,
-            "page_row_count": total_rows,
+            "page_row_count": page_row_count,
             "total_rows": total_rows,
-            "runs": matching_runs,
+            "total_trade_dates": len(matching_runs),
+            "runs": page_runs,
         }
 
     trade_date_rows = conn.execute(f"""
@@ -4579,7 +4582,7 @@ PATTERN_HTML = """<!DOCTYPE html>
   <label>形态
     <select id="patternType" onchange="onPatternTypeChange()">
       <option value="four_pin">四根十字针</option>
-      <option value="bottom_reversal">底部反转</option>
+      <option value="bottom_reversal" selected>底部反转</option>
     </select>
   </label>
   <label>指数
