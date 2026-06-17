@@ -188,6 +188,55 @@ def ensure_momentum_tables(conn):
     conn.commit()
 
 
+def ensure_pattern_tables(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pattern_scan_runs (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date           DATE NOT NULL,
+            pool                 TEXT NOT NULL,
+            index_code           TEXT,
+            lookback_days        INTEGER,
+            chart_bars           INTEGER,
+            min_amount_wan       REAL,
+            min_turnover         REAL,
+            max_body_pct         REAL,
+            max_body_range_pct   REAL,
+            max_amp_pct          REAL,
+            doji_body_pct        REAL,
+            max_ma40_distance    REAL,
+            universe             INTEGER,
+            scanned              INTEGER,
+            row_count            INTEGER,
+            elapsed_s            REAL,
+            status               TEXT,
+            error                TEXT,
+            params_json          TEXT,
+            created_at           DATETIME DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pattern_picks (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id         INTEGER NOT NULL,
+            trade_date     DATE NOT NULL,
+            code           TEXT NOT NULL,
+            name           TEXT,
+            close_price    REAL,
+            pct_change     REAL,
+            amount_yi      REAL,
+            turnover       REAL,
+            score          REAL,
+            reasons        TEXT,
+            row_json       TEXT,
+            bars_json      TEXT,
+            created_at     DATETIME DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_runs_date ON pattern_scan_runs(trade_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_picks_run ON pattern_picks(run_id)")
+    conn.commit()
+
+
 def clamp(value, low, high):
     return max(low, min(high, value))
 
@@ -297,6 +346,84 @@ def build_momentum_params(source=None):
             50, 1, 1000,
         ),
         "workers": coerce_int(source.get("workers"), 6, 2, 12),
+    }
+
+
+def build_pattern_params(source=None):
+    source = source or {}
+    pool = source.get("pool", "all")
+    index_code = get_source_value(source, "indexCode", "index_code", default="") or ""
+    if pool == "index" and not index_code:
+        pool = "all"
+    return {
+        "pool": pool,
+        "index_code": index_code,
+        "trade_date": (
+            source.get("tradeDate")
+            or source.get("trade_date")
+            or None
+        ),
+        "lookback_days": coerce_int(
+            get_source_value(source, "lookbackDays", "lookback_days"),
+            120, 60, 260,
+        ),
+        "chart_bars": coerce_int(
+            get_source_value(source, "chartBars", "chart_bars"),
+            70, 40, 140,
+        ),
+        "min_amount_wan": coerce_float(
+            get_source_value(source, "minAmount", "min_amount"),
+            0, 0, 1000000,
+        ),
+        "min_turnover": coerce_float(
+            get_source_value(source, "minTurnover", "min_turnover"),
+            0, 0, 100,
+        ),
+        "min_market_cap_yi": coerce_float(
+            get_source_value(source, "minMarketCapYi", "min_market_cap_yi"),
+            100, 0, 100000,
+        ),
+        "max_body_pct": coerce_float(
+            get_source_value(source, "maxBodyPct", "max_body_pct"),
+            1.05, 0.1, 10,
+        ),
+        "max_body_range_pct": coerce_float(
+            get_source_value(source, "maxBodyRangePct", "max_body_range_pct"),
+            35, 5, 95,
+        ),
+        "max_amp_pct": coerce_float(
+            get_source_value(source, "maxAmpPct", "max_amp_pct"),
+            6.0, 0.5, 20,
+        ),
+        "doji_body_pct": coerce_float(
+            get_source_value(source, "dojiBodyPct", "doji_body_pct"),
+            1.05, 0.1, 5,
+        ),
+        "max_ma40_distance": coerce_float(
+            get_source_value(source, "maxMa40Distance", "max_ma40_distance"),
+            0.0, 0, 50,
+        ),
+        "max_pair_distance": coerce_float(
+            get_source_value(source, "maxPairDistance", "max_pair_distance"),
+            0.5, 0.1, 10,
+        ),
+        "max_close_pair_distance": coerce_float(
+            get_source_value(source, "maxClosePairDistance", "max_close_pair_distance"),
+            1.0, 0.1, 10,
+        ),
+        "min_level_gap": coerce_float(
+            get_source_value(source, "minLevelGap", "min_level_gap"),
+            0.8, 0.0, 10,
+        ),
+        "min_shadow_pct": coerce_float(
+            get_source_value(source, "minShadowPct", "min_shadow_pct"),
+            1.0, 0.0, 50,
+        ),
+        "max_shadowless_count": coerce_int(
+            get_source_value(source, "maxShadowlessCount", "max_shadowless_count"),
+            0, 0, 4,
+        ),
+        "limit": coerce_int(source.get("limit"), 80, 1, 300),
     }
 
 
@@ -867,6 +994,51 @@ def fetch_eastmoney_quotes(codes):
     return quotes
 
 
+def fetch_eastmoney_market_caps(codes):
+    caps = {}
+    if not codes:
+        return caps
+    fields = "f12,f20,f21"
+    for batch in chunked(list(dict.fromkeys(codes)), 80):
+        params = {
+            "fltt": 2,
+            "invt": 2,
+            "fields": fields,
+            "secids": ",".join(f"{infer_market(code)}.{code}" for code in batch),
+        }
+        diff = []
+        for url in EASTMONEY_QUOTE_URLS:
+            for attempt in range(2):
+                try:
+                    resp = requests.get(
+                        url,
+                        params=params,
+                        headers={
+                            "User-Agent": HTTP_HEADERS["User-Agent"],
+                            "Referer": "https://quote.eastmoney.com/",
+                        },
+                        timeout=8,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json().get("data") or {}
+                    diff = data.get("diff") or []
+                    if diff:
+                        break
+                except Exception:
+                    time.sleep(0.25 * (attempt + 1))
+            if diff:
+                break
+        for item in diff:
+            code = str(item.get("f12") or "")
+            total_cap = to_float(item.get("f20"))
+            float_cap = to_float(item.get("f21"))
+            caps[code] = {
+                "market_cap_yi": total_cap / 100000000.0 if total_cap else None,
+                "float_market_cap_yi": float_cap / 100000000.0 if float_cap else None,
+            }
+    return caps
+
+
 def fetch_realtime_quotes(codes):
     quotes = fetch_sina_quotes(codes)
     if len(quotes) >= len(codes) * 0.7:
@@ -1071,6 +1243,831 @@ def build_sparkline(bars, width=132, height=34):
         f'aria-hidden="true"><polyline fill="none" stroke="{color}" '
         f'stroke-width="2" points="{" ".join(points)}"/></svg>'
     )
+
+
+def latest_daily_trade_date(conn):
+    row = conn.execute("SELECT MAX(trade_date) AS trade_date FROM daily_prices").fetchone()
+    return row["trade_date"] if row and row["trade_date"] else default_scan_trade_date()
+
+
+def recent_market_trade_dates(conn, trade_date, count):
+    rows = conn.execute("""
+        SELECT DISTINCT trade_date
+        FROM daily_prices
+        WHERE trade_date <= ?
+        ORDER BY trade_date DESC
+        LIMIT ?
+    """, (trade_date, count)).fetchall()
+    return list(reversed([r["trade_date"] for r in rows]))
+
+
+def candle_metrics(row):
+    open_price = row["open"]
+    close_price = row["close"]
+    high = row["high"]
+    low = row["low"]
+    if not open_price or not close_price or not high or not low:
+        return None
+    base = close_price or open_price
+    span = max(high - low, 0)
+    body = abs(close_price - open_price)
+    body_pct = body / base * 100.0 if base else None
+    amp_pct = span / base * 100.0 if base else None
+    body_range_pct = body / span * 100.0 if span else 0.0
+    upper = high - max(open_price, close_price)
+    lower = min(open_price, close_price) - low
+    upper_pct = upper / span * 100.0 if span else 0.0
+    lower_pct = lower / span * 100.0 if span else 0.0
+    return {
+        "body_pct": body_pct,
+        "amp_pct": amp_pct,
+        "body_range_pct": body_range_pct,
+        "upper_pct": upper_pct,
+        "lower_pct": lower_pct,
+    }
+
+
+def is_small_body_candle(row, params):
+    metrics = candle_metrics(row)
+    if not metrics:
+        return False
+    return (
+        metrics["body_pct"] <= params["max_body_pct"]
+        and metrics["body_range_pct"] <= params["max_body_range_pct"]
+        and metrics["amp_pct"] <= params["max_amp_pct"]
+    )
+
+
+def is_doji_candle(row, params):
+    metrics = candle_metrics(row)
+    if not metrics:
+        return False
+    body_limit = min(params["doji_body_pct"], params["max_body_pct"])
+    return (
+        metrics["body_pct"] <= body_limit
+        and metrics["body_range_pct"] <= params["max_body_range_pct"]
+        and metrics["amp_pct"] <= params["max_amp_pct"]
+    )
+
+
+def has_balanced_shadows(row, params):
+    metrics = candle_metrics(row)
+    if not metrics:
+        return False
+    min_shadow_pct = params.get("min_shadow_pct", 6.0)
+    return (
+        metrics["upper_pct"] >= min_shadow_pct
+        and metrics["lower_pct"] >= min_shadow_pct
+    )
+
+
+def candle_body_mid(row):
+    if not row["open"] or not row["close"]:
+        return None
+    return (row["open"] + row["close"]) / 2.0
+
+
+def pct_distance(a, b, base):
+    if a is None or b is None or not base:
+        return None
+    return abs(a - b) / base * 100.0
+
+
+def four_pin_levels(rows, params):
+    mids = [candle_body_mid(row) for row in rows]
+    if any(mid is None for mid in mids):
+        return None
+    base = rows[-1]["close"]
+    first_third_gap = pct_distance(mids[0], mids[2], base)
+    second_fourth_gap = pct_distance(mids[1], mids[3], base)
+    first_third_close_gap = pct_distance(rows[0]["close"], rows[2]["close"], base)
+    second_fourth_close_gap = pct_distance(rows[1]["close"], rows[3]["close"], base)
+    high_level = (mids[0] + mids[2]) / 2.0
+    low_level = (mids[1] + mids[3]) / 2.0
+    level_gap = (high_level - low_level) / base * 100.0 if base else None
+    if (
+        first_third_gap is None
+        or second_fourth_gap is None
+        or first_third_close_gap is None
+        or second_fourth_close_gap is None
+        or level_gap is None
+    ):
+        return None
+    if first_third_gap > params["max_pair_distance"]:
+        return None
+    if second_fourth_gap > params["max_pair_distance"]:
+        return None
+    if first_third_close_gap > params["max_close_pair_distance"]:
+        return None
+    if second_fourth_close_gap > params["max_close_pair_distance"]:
+        return None
+    if level_gap < params["min_level_gap"]:
+        return None
+    if max(mids[1], mids[3]) >= min(mids[0], mids[2]):
+        return None
+    return {
+        "first_third_gap": first_third_gap,
+        "second_fourth_gap": second_fourth_gap,
+        "first_third_close_gap": first_third_close_gap,
+        "second_fourth_close_gap": second_fourth_close_gap,
+        "level_gap": level_gap,
+        "high_level": high_level,
+        "low_level": low_level,
+    }
+
+
+def build_candlestick_chart(series, highlight=5, width=360, height=172):
+    bars = [r for r in series if r["open"] and r["close"] and r["high"] and r["low"]]
+    if len(bars) < 2:
+        return ""
+
+    pad_l, pad_r, pad_t, pad_b = 34, 8, 10, 22
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+    lows = [r["low"] for r in bars]
+    highs = [r["high"] for r in bars]
+    low, high = min(lows), max(highs)
+    span = high - low or 1
+
+    def x_at(i):
+        return pad_l + (i + 0.5) / len(bars) * plot_w
+
+    def y_at(price):
+        return pad_t + (high - price) / span * plot_h
+
+    ma20 = []
+    ma40 = []
+    closes = [r["close"] for r in bars]
+    for i in range(len(bars)):
+        if i >= 19:
+            ma20.append((x_at(i), y_at(sum(closes[i - 19:i + 1]) / 20)))
+        if i >= 39:
+            ma40.append((x_at(i), y_at(sum(closes[i - 39:i + 1]) / 40)))
+
+    def polyline(points, color):
+        if len(points) < 2:
+            return ""
+        pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+        return f'<polyline fill="none" stroke="{color}" stroke-width="1.5" points="{pts}"/>'
+
+    candle_w = clamp(plot_w / len(bars) * 0.58, 2.0, 7.0)
+    start_highlight = max(0, len(bars) - highlight)
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" aria-hidden="true">',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="transparent"/>',
+    ]
+    for tick in (0.25, 0.5, 0.75):
+        y = pad_t + plot_h * tick
+        parts.append(f'<line x1="{pad_l}" y1="{y:.1f}" x2="{width - pad_r}" y2="{y:.1f}" stroke="#252a3a" stroke-width="1"/>')
+    parts.append(polyline(ma20, "#d7a53f"))
+    parts.append(polyline(ma40, "#5c84e8"))
+
+    for i, row in enumerate(bars):
+        open_y = y_at(row["open"])
+        close_y = y_at(row["close"])
+        high_y = y_at(row["high"])
+        low_y = y_at(row["low"])
+        x = x_at(i)
+        up = row["close"] >= row["open"]
+        color = "#ff4d6a" if up else "#00c97a"
+        if i >= start_highlight:
+            parts.append(
+                f'<rect x="{x - candle_w * .82:.1f}" y="{pad_t:.1f}" '
+                f'width="{candle_w * 1.64:.1f}" height="{plot_h:.1f}" '
+                f'fill="rgba(61,127,255,.10)"/>'
+            )
+        parts.append(f'<line x1="{x:.1f}" y1="{high_y:.1f}" x2="{x:.1f}" y2="{low_y:.1f}" stroke="{color}" stroke-width="1.2"/>')
+        y = min(open_y, close_y)
+        h = max(abs(close_y - open_y), 1.4)
+        fill = color if not up else "transparent"
+        parts.append(
+            f'<rect x="{x - candle_w / 2:.1f}" y="{y:.1f}" width="{candle_w:.1f}" '
+            f'height="{h:.1f}" fill="{fill}" stroke="{color}" stroke-width="1.2"/>'
+        )
+
+    last_date = bars[-1]["trade_date"][5:].replace("-", "/")
+    first_date = bars[0]["trade_date"][5:].replace("-", "/")
+    parts.append(f'<text x="{pad_l}" y="{height - 6}" fill="#697082" font-size="10">{first_date}</text>')
+    parts.append(f'<text x="{width - pad_r}" y="{height - 6}" fill="#697082" font-size="10" text-anchor="end">{last_date}</text>')
+    parts.append(f'<text x="{pad_l}" y="9" fill="#d7a53f" font-size="9">MA20</text>')
+    parts.append(f'<text x="{pad_l + 34}" y="9" fill="#5c84e8" font-size="9">MA40</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def load_daily_histories_for_pattern(conn, codes, trade_date, lookback_days):
+    histories = {code: [] for code in codes}
+    start_dt = datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=lookback_days)
+    start_date = start_dt.strftime("%Y-%m-%d")
+    for batch in chunked(codes, 600):
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(f"""
+            SELECT code, trade_date, open, close, high, low, volume, amount,
+                   pct_change, turnover
+            FROM daily_prices
+            WHERE code IN ({placeholders})
+              AND trade_date >= ?
+              AND trade_date <= ?
+            ORDER BY code, trade_date
+        """, batch + [start_date, trade_date]).fetchall()
+        for row in rows:
+            histories[row["code"]].append(row)
+    return histories
+
+
+def load_daily_histories_for_pattern_range(conn, codes, start_date, end_date,
+                                           lookback_days):
+    histories = {code: [] for code in codes}
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=lookback_days)
+    history_start = start_dt.strftime("%Y-%m-%d")
+    for batch in chunked(codes, 600):
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(f"""
+            SELECT code, trade_date, open, close, high, low, volume, amount,
+                   pct_change, turnover
+            FROM daily_prices
+            WHERE code IN ({placeholders})
+              AND trade_date >= ?
+              AND trade_date <= ?
+            ORDER BY code, trade_date
+        """, batch + [history_start, end_date]).fetchall()
+        for row in rows:
+            histories[row["code"]].append(row)
+    return histories
+
+
+def evaluate_pattern_candidate(stock, series, params):
+    if len(series) < max(45, params["chart_bars"] // 2):
+        return None
+    if series[-1]["trade_date"] != params["trade_date"]:
+        return None
+    last_four = series[-4:]
+    if len(last_four) < 4:
+        return None
+    required_dates = params.get("required_pattern_dates") or []
+    if required_dates and [row["trade_date"] for row in last_four] != required_dates:
+        return None
+    if not all(is_doji_candle(row, params) for row in last_four):
+        return None
+    shadowless_count = sum(
+        1 for row in last_four if not has_balanced_shadows(row, params)
+    )
+    if shadowless_count > params["max_shadowless_count"]:
+        return None
+    levels = four_pin_levels(last_four, params)
+    if not levels:
+        return None
+
+    last = last_four[-1]
+    if (last["amount"] or 0) < params["min_amount_wan"] * 10000:
+        return None
+    if params["min_turnover"] and (last["turnover"] is None or last["turnover"] < params["min_turnover"]):
+        return None
+
+    closes = [r["close"] for r in series if r["close"] is not None]
+    volumes = [r["volume"] for r in series[-20:] if r["volume"] is not None]
+    if len(closes) < 40:
+        return None
+    ma20 = sum(closes[-20:]) / 20
+    ma40 = sum(closes[-40:]) / 40
+    ma40_distance = abs(last["close"] - ma40) / ma40 * 100.0 if ma40 else None
+    if params["max_ma40_distance"] and ma40_distance is not None:
+        if ma40_distance > params["max_ma40_distance"]:
+            return None
+
+    metrics = [candle_metrics(row) for row in last_four]
+    if any(m is None for m in metrics):
+        return None
+    avg_body = sum(m["body_pct"] for m in metrics) / len(metrics)
+    avg_amp = sum(m["amp_pct"] for m in metrics) / len(metrics)
+    max_body = max(m["body_pct"] for m in metrics)
+    avg_volume20 = sum(volumes) / len(volumes) if volumes else None
+    pattern_volume = sum((r["volume"] or 0) for r in last_four) / 4
+    volume_ratio = pattern_volume / avg_volume20 if avg_volume20 else None
+    high4 = max(r["high"] for r in last_four if r["high"] is not None)
+    low4 = min(r["low"] for r in last_four if r["low"] is not None)
+    range4_pct = (high4 - low4) / last["close"] * 100.0 if last["close"] else None
+    closes20 = closes[-20:]
+    position20 = position_in_range(last["close"], min(closes20), max(closes20))
+    ma40_score = (
+        10
+        if not params["max_ma40_distance"]
+        else clamp((params["max_ma40_distance"] - (ma40_distance or 0)) / max(params["max_ma40_distance"], 1) * 10, 0, 10)
+    )
+
+    score = (
+        clamp((params["doji_body_pct"] - max_body) / params["doji_body_pct"] * 22, 0, 22)
+        + clamp((params["max_amp_pct"] - avg_amp) / params["max_amp_pct"] * 14, 0, 14)
+        + clamp((params["max_pair_distance"] - levels["first_third_gap"]) / params["max_pair_distance"] * 18, 0, 18)
+        + clamp((params["max_pair_distance"] - levels["second_fourth_gap"]) / params["max_pair_distance"] * 18, 0, 18)
+        + clamp((levels["level_gap"] - params["min_level_gap"]) / 1.8 * 10, 0, 10)
+        + ma40_score
+        + clamp((1.25 - (volume_ratio or 1.25)) / 1.25 * 8, 0, 8)
+    )
+
+    reasons = [
+        "1/3在上2/4在下",
+        f"1/3偏差{levels['first_third_gap']:.2f}%",
+        f"2/4偏差{levels['second_fourth_gap']:.2f}%",
+        f"1/3收差{levels['first_third_close_gap']:.2f}%",
+        f"2/4收差{levels['second_fourth_close_gap']:.2f}%",
+        f"高低差{levels['level_gap']:.2f}%",
+    ]
+    if shadowless_count:
+        reasons.append(f"影线不完整{shadowless_count}根")
+    if ma40_distance is not None:
+        reasons.append(f"MA40距离{ma40_distance:.1f}%")
+    if volume_ratio is not None and volume_ratio <= 0.85:
+        reasons.append("缩量整理")
+    if last["close"] >= ma20:
+        reasons.append("收在MA20上方")
+
+    chart_series = series[-params["chart_bars"]:]
+    return {
+        "code": stock["code"],
+        "name": stock["name"] or "",
+        "trade_date": last["trade_date"],
+        "close": round(last["close"], 3) if last["close"] is not None else None,
+        "pct": round(last["pct_change"], 2) if last["pct_change"] is not None else None,
+        "amount_yi": round((last["amount"] or 0) / 100000000, 2),
+        "turnover": round(last["turnover"], 2) if last["turnover"] is not None else None,
+        "avg_body_pct": round(avg_body, 2),
+        "doji_body_pct": round(max_body, 2),
+        "avg_amp_pct": round(avg_amp, 2),
+        "range5_pct": round(range4_pct, 2) if range4_pct is not None else None,
+        "volume_ratio": round(volume_ratio, 2) if volume_ratio is not None else None,
+        "first_third_gap": round(levels["first_third_gap"], 2),
+        "second_fourth_gap": round(levels["second_fourth_gap"], 2),
+        "first_third_close_gap": round(levels["first_third_close_gap"], 2),
+        "second_fourth_close_gap": round(levels["second_fourth_close_gap"], 2),
+        "level_gap": round(levels["level_gap"], 2),
+        "shadowless_count": shadowless_count,
+        "ma20": round(ma20, 3),
+        "ma40": round(ma40, 3),
+        "ma40_distance": round(ma40_distance, 2) if ma40_distance is not None else None,
+        "score": round(score, 1),
+        "reasons": " / ".join(reasons),
+        "chart": build_candlestick_chart(chart_series, highlight=4),
+        "bars": [
+            {
+                "trade_date": r["trade_date"],
+                "open": r["open"],
+                "close": r["close"],
+                "high": r["high"],
+                "low": r["low"],
+                "volume": r["volume"],
+                "amount": r["amount"],
+                "pct_change": r["pct_change"],
+                "turnover": r["turnover"],
+            }
+            for r in chart_series
+        ],
+    }
+
+
+def apply_market_cap_filter(rows, params):
+    min_cap = params.get("min_market_cap_yi") or 0
+    if not min_cap or not rows:
+        return rows, {"market_cap_checked": 0, "market_cap_missing": 0, "market_cap_filtered": 0}
+
+    caps = fetch_eastmoney_market_caps([row["code"] for row in rows])
+    kept = []
+    missing = 0
+    filtered = 0
+    for row in rows:
+        cap = caps.get(row["code"]) or {}
+        market_cap = cap.get("market_cap_yi")
+        float_cap = cap.get("float_market_cap_yi")
+        if market_cap is None:
+            missing += 1
+            filtered += 1
+            continue
+        row["market_cap_yi"] = round(market_cap, 2)
+        row["float_market_cap_yi"] = round(float_cap, 2) if float_cap is not None else None
+        if market_cap < min_cap:
+            filtered += 1
+            continue
+        kept.append(row)
+    return kept, {
+        "market_cap_checked": len(rows),
+        "market_cap_missing": missing,
+        "market_cap_filtered": filtered,
+    }
+
+
+def perform_pattern_scan(params, started_at=None):
+    started_at = started_at or time.time()
+    conn = get_db()
+    try:
+        if not params.get("trade_date"):
+            params["trade_date"] = latest_daily_trade_date(conn)
+        params["required_pattern_dates"] = recent_market_trade_dates(
+            conn,
+            params["trade_date"],
+            4,
+        )
+        stocks = load_stock_universe(conn, pool=params["pool"], index_code=params["index_code"])
+        if not stocks:
+            return {"error": "股票池为空", "meta": build_empty_pattern_meta(params)}, 400
+        codes = [s["code"] for s in stocks]
+        histories = load_daily_histories_for_pattern(
+            conn, codes, params["trade_date"], params["lookback_days"]
+        )
+    finally:
+        conn.close()
+
+    rows = []
+    scanned = 0
+    for stock in stocks:
+        series = histories.get(stock["code"]) or []
+        if not series:
+            continue
+        scanned += 1
+        row = evaluate_pattern_candidate(stock, series, params)
+        if row:
+            rows.append(row)
+
+    pre_cap_matched = len(rows)
+    rows, cap_meta = apply_market_cap_filter(rows, params)
+    rows.sort(key=lambda r: (r["score"], r["amount_yi"]), reverse=True)
+    rows = rows[:params["limit"]]
+    meta = {
+        "pool": params["pool"],
+        "trade_date": params["trade_date"],
+        "index_code": params["index_code"],
+        "universe": len(stocks),
+        "scanned": scanned,
+        "pre_cap_matched": pre_cap_matched,
+        "matched": len(rows),
+        "elapsed_s": round(time.time() - started_at, 1),
+        **cap_meta,
+        "params": {
+            "max_body_pct": params["max_body_pct"],
+            "doji_body_pct": params["doji_body_pct"],
+            "max_amp_pct": params["max_amp_pct"],
+            "max_ma40_distance": params["max_ma40_distance"],
+            "max_pair_distance": params["max_pair_distance"],
+            "max_close_pair_distance": params["max_close_pair_distance"],
+            "min_level_gap": params["min_level_gap"],
+            "min_shadow_pct": params["min_shadow_pct"],
+            "max_shadowless_count": params["max_shadowless_count"],
+            "min_amount_wan": params["min_amount_wan"],
+            "min_turnover": params["min_turnover"],
+            "min_market_cap_yi": params["min_market_cap_yi"],
+        },
+    }
+    return {"meta": meta, "rows": rows}, 200
+
+
+def perform_pattern_scan_with_histories(params, stocks, histories, market_dates,
+                                        started_at=None):
+    started_at = started_at or time.time()
+    trade_date = params["trade_date"]
+    if trade_date not in market_dates:
+        return {"meta": build_empty_pattern_meta(params, universe=len(stocks)), "rows": []}, 200
+    date_index = market_dates.index(trade_date)
+    if date_index < 3:
+        return {"meta": build_empty_pattern_meta(params, universe=len(stocks)), "rows": []}, 200
+    params["required_pattern_dates"] = market_dates[date_index - 3:date_index + 1]
+
+    rows = []
+    scanned = 0
+    for stock in stocks:
+        series = histories.get(stock["code"]) or []
+        if not series:
+            continue
+        idx = None
+        for i in range(len(series) - 1, -1, -1):
+            if series[i]["trade_date"] == trade_date:
+                idx = i
+                break
+            if series[i]["trade_date"] < trade_date:
+                break
+        if idx is None:
+            continue
+        scanned += 1
+        window = series[max(0, idx - params["lookback_days"]):idx + 1]
+        row = evaluate_pattern_candidate(stock, window, params)
+        if row:
+            rows.append(row)
+
+    pre_cap_matched = len(rows)
+    rows, cap_meta = apply_market_cap_filter(rows, params)
+    rows.sort(key=lambda r: (r["score"], r["amount_yi"]), reverse=True)
+    rows = rows[:params["limit"]]
+    meta = {
+        "pool": params["pool"],
+        "trade_date": trade_date,
+        "index_code": params["index_code"],
+        "universe": len(stocks),
+        "scanned": scanned,
+        "pre_cap_matched": pre_cap_matched,
+        "matched": len(rows),
+        "elapsed_s": round(time.time() - started_at, 1),
+        **cap_meta,
+        "params": {
+            "max_body_pct": params["max_body_pct"],
+            "doji_body_pct": params["doji_body_pct"],
+            "max_amp_pct": params["max_amp_pct"],
+            "max_ma40_distance": params["max_ma40_distance"],
+            "max_pair_distance": params["max_pair_distance"],
+            "max_close_pair_distance": params["max_close_pair_distance"],
+            "min_level_gap": params["min_level_gap"],
+            "min_shadow_pct": params["min_shadow_pct"],
+            "max_shadowless_count": params["max_shadowless_count"],
+            "min_amount_wan": params["min_amount_wan"],
+            "min_turnover": params["min_turnover"],
+            "min_market_cap_yi": params["min_market_cap_yi"],
+        },
+    }
+    return {"meta": meta, "rows": rows}, 200
+
+
+def get_pattern_backfill_trade_dates(conn, end_date=None, days=3650):
+    end_date = end_date or latest_daily_trade_date(conn)
+    start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)
+    start_date = start_dt.strftime("%Y-%m-%d")
+    rows = conn.execute("""
+        SELECT DISTINCT trade_date
+        FROM daily_prices
+        WHERE trade_date >= ?
+          AND trade_date <= ?
+        ORDER BY trade_date
+    """, (start_date, end_date)).fetchall()
+    return [r["trade_date"] for r in rows]
+
+
+def run_pattern_backfill(params, days=3650, end_date=None, progress=None):
+    started_at = time.time()
+    conn = get_db()
+    try:
+        ensure_pattern_tables(conn)
+        trade_dates = get_pattern_backfill_trade_dates(
+            conn,
+            end_date=end_date or params.get("trade_date"),
+            days=days,
+        )
+        if not trade_dates:
+            return {
+                "start_date": None,
+                "end_date": end_date,
+                "days": 0,
+                "matched_days": 0,
+                "matched_rows": 0,
+                "elapsed_s": 0,
+                "results": [],
+            }
+        stocks = load_stock_universe(conn, pool=params["pool"], index_code=params["index_code"])
+        histories = load_daily_histories_for_pattern_range(
+            conn,
+            [s["code"] for s in stocks],
+            trade_dates[0],
+            trade_dates[-1],
+            params["lookback_days"],
+        )
+    finally:
+        conn.close()
+
+    results = []
+    matched_rows = 0
+    for i, trade_date in enumerate(trade_dates, 1):
+        day_params = dict(params)
+        day_params["trade_date"] = trade_date
+        payload, status_code = perform_pattern_scan_with_histories(
+            day_params,
+            stocks,
+            histories,
+            trade_dates,
+            started_at=time.time(),
+        )
+        conn = get_db()
+        try:
+            run_id, saved = save_pattern_scan_result(
+                conn,
+                day_params,
+                payload,
+                status_code,
+            )
+        finally:
+            conn.close()
+        picked = len(payload.get("rows") or [])
+        matched_rows += picked
+        item = {
+            "trade_date": trade_date,
+            "status": status_code,
+            "run_id": run_id,
+            "saved": saved,
+            "picked": picked,
+            "meta": payload.get("meta") or {},
+        }
+        results.append(item)
+        if progress:
+            progress(item, i, len(trade_dates))
+
+    return {
+        "start_date": trade_dates[0],
+        "end_date": trade_dates[-1],
+        "days": len(trade_dates),
+        "matched_days": sum(1 for item in results if item["picked"] > 0),
+        "matched_rows": matched_rows,
+        "elapsed_s": round(time.time() - started_at, 1),
+        "results": results,
+    }
+
+
+def build_empty_pattern_meta(params, universe=0):
+    return {
+        "pool": params["pool"],
+        "trade_date": params.get("trade_date"),
+        "index_code": params["index_code"],
+        "universe": universe,
+        "scanned": 0,
+        "matched": 0,
+        "elapsed_s": 0,
+        "params": {},
+    }
+
+
+def save_pattern_scan_result(conn, params, payload, status_code):
+    ensure_pattern_tables(conn)
+    meta = payload.get("meta") or build_empty_pattern_meta(params)
+    rows = payload.get("rows") or []
+    status = "ok" if status_code == 200 else "error"
+    cur = conn.execute("""
+        INSERT INTO pattern_scan_runs (
+            trade_date, pool, index_code, lookback_days, chart_bars,
+            min_amount_wan, min_turnover, max_body_pct, max_body_range_pct,
+            max_amp_pct, doji_body_pct, max_ma40_distance,
+            universe, scanned, row_count, elapsed_s, status, error, params_json
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        params["trade_date"], params["pool"], params["index_code"],
+        params["lookback_days"], params["chart_bars"],
+        params["min_amount_wan"], params["min_turnover"],
+        params["max_body_pct"], params["max_body_range_pct"],
+        params["max_amp_pct"], params["doji_body_pct"],
+        params["max_ma40_distance"], meta.get("universe"),
+        meta.get("scanned"), len(rows), meta.get("elapsed_s"),
+        status, payload.get("error"),
+        json.dumps(params, ensure_ascii=False, sort_keys=True),
+    ))
+    run_id = cur.lastrowid
+    for row in rows:
+        row_copy = dict(row)
+        bars = row_copy.pop("bars", [])
+        row_copy.pop("chart", None)
+        conn.execute("""
+            INSERT INTO pattern_picks (
+                run_id, trade_date, code, name, close_price, pct_change,
+                amount_yi, turnover, score, reasons, row_json, bars_json
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            run_id, params["trade_date"], row.get("code"), row.get("name"),
+            row.get("close"), row.get("pct"), row.get("amount_yi"),
+            row.get("turnover"), row.get("score"), row.get("reasons"),
+            json.dumps(row_copy, ensure_ascii=False, sort_keys=True),
+            json.dumps(bars, ensure_ascii=False, sort_keys=True),
+        ))
+    conn.commit()
+    return run_id, len(rows)
+
+
+def load_latest_pattern_result(conn, trade_date=None):
+    ensure_pattern_tables(conn)
+    if trade_date:
+        run = conn.execute("""
+            SELECT *
+            FROM pattern_scan_runs
+            WHERE trade_date = ?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (trade_date,)).fetchone()
+    else:
+        run = conn.execute("""
+            SELECT *
+            FROM pattern_scan_runs
+            ORDER BY trade_date DESC, id DESC
+            LIMIT 1
+        """).fetchone()
+    if not run:
+        return None
+
+    rows = []
+    for pick in conn.execute("""
+        SELECT row_json, bars_json
+        FROM pattern_picks
+        WHERE run_id = ?
+        ORDER BY score DESC, amount_yi DESC, code
+    """, (run["id"],)).fetchall():
+        row = json.loads(pick["row_json"] or "{}")
+        bars = json.loads(pick["bars_json"] or "[]")
+        row["bars"] = bars
+        if not row.get("chart") and bars:
+            row["chart"] = build_candlestick_chart(bars)
+        rows.append(row)
+
+    params = json.loads(run["params_json"] or "{}")
+    return {
+        "meta": {
+            "run_id": run["id"],
+            "trade_date": run["trade_date"],
+            "pool": run["pool"],
+            "index_code": run["index_code"],
+            "universe": run["universe"],
+            "scanned": run["scanned"],
+            "matched": run["row_count"],
+            "elapsed_s": run["elapsed_s"],
+            "created_at": run["created_at"],
+            "params": {
+                "max_body_pct": run["max_body_pct"],
+                "doji_body_pct": run["doji_body_pct"],
+                "max_amp_pct": run["max_amp_pct"],
+                "max_ma40_distance": run["max_ma40_distance"],
+                "min_amount_wan": run["min_amount_wan"],
+                "min_turnover": run["min_turnover"],
+                "min_market_cap_yi": params.get("min_market_cap_yi"),
+                "max_pair_distance": params.get("max_pair_distance"),
+                "max_close_pair_distance": params.get("max_close_pair_distance"),
+                "min_level_gap": params.get("min_level_gap"),
+                "min_shadow_pct": params.get("min_shadow_pct"),
+                "max_shadowless_count": params.get("max_shadowless_count"),
+            },
+            "source_params": params,
+        },
+        "rows": rows,
+    }
+
+
+def load_pattern_history(conn, days=3650, hits_only=True, limit_dates=500):
+    ensure_pattern_tables(conn)
+    row = conn.execute("""
+        SELECT MAX(trade_date) AS end_date
+        FROM pattern_scan_runs
+    """).fetchone()
+    end_date = row["end_date"] if row and row["end_date"] else None
+    if not end_date:
+        return {
+            "start_date": None,
+            "end_date": None,
+            "days": days,
+            "runs": [],
+        }
+    start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)
+    start_date = start_dt.strftime("%Y-%m-%d")
+    hit_clause = "AND r.row_count > 0" if hits_only else ""
+    runs = conn.execute(f"""
+        WITH latest AS (
+            SELECT trade_date, MAX(id) AS run_id
+            FROM pattern_scan_runs
+            WHERE trade_date >= ?
+              AND trade_date <= ?
+            GROUP BY trade_date
+        )
+        SELECT r.*
+        FROM latest l
+        JOIN pattern_scan_runs r ON r.id = l.run_id
+        WHERE 1 = 1
+          {hit_clause}
+        ORDER BY r.trade_date DESC
+        LIMIT ?
+    """, (start_date, end_date, limit_dates)).fetchall()
+
+    result_runs = []
+    for run in runs:
+        picks = []
+        for pick in conn.execute("""
+            SELECT row_json, bars_json
+            FROM pattern_picks
+            WHERE run_id = ?
+            ORDER BY score DESC, amount_yi DESC, code
+        """, (run["id"],)).fetchall():
+            pick_row = json.loads(pick["row_json"] or "{}")
+            bars = json.loads(pick["bars_json"] or "[]")
+            pick_row["bars"] = bars
+            pick_row["chart"] = build_candlestick_chart(bars, highlight=4) if bars else ""
+            picks.append(pick_row)
+        result_runs.append({
+            "run_id": run["id"],
+            "trade_date": run["trade_date"],
+            "pool": run["pool"],
+            "index_code": run["index_code"],
+            "universe": run["universe"],
+            "scanned": run["scanned"],
+            "matched": run["row_count"],
+            "elapsed_s": run["elapsed_s"],
+            "created_at": run["created_at"],
+            "rows": picks,
+        })
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "days": days,
+        "hits_only": hits_only,
+        "runs": result_runs,
+    }
 
 
 def evaluate_candidate_with_bars(stock, quote, daily, cutoff_text, elapsed_ratio, bars):
@@ -1483,6 +2480,7 @@ HTML = """<!DOCTYPE html>
     <h1>行业宽度指标</h1>
   </div>
   <div class="header-right">
+    <a class="nav-link" href="/pattern">收盘形态</a>
     <a class="nav-link" href="/momentum">14:30 选股</a>
     <select class="days-select" id="daysSelect" onchange="loadData()">
       <option value="5">最近 5 日</option>
@@ -1964,7 +2962,10 @@ MOMENTUM_HTML = """<!DOCTYPE html>
     <h1>14:30 强势放量选股</h1>
     <div class="sub">涨幅适中、量能放大、日内位置强，默认次日 10:00 前卖出观察</div>
   </div>
-  <a class="nav-link" href="/">行业宽度</a>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
+    <a class="nav-link" href="/pattern">收盘形态</a>
+    <a class="nav-link" href="/">行业宽度</a>
+  </div>
 </div>
 
 <div class="toolbar">
@@ -2236,6 +3237,505 @@ loadProfit();
 """
 
 
+PATTERN_HTML = """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>收盘 K 线形态扫描</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:#0d0f14;
+    --surface:#141720;
+    --surface2:#1a1e2e;
+    --border:#252a3a;
+    --text:#c8cdd8;
+    --text-dim:#697082;
+    --head:#8d96a9;
+    --red:#ff4d6a;
+    --green:#00c97a;
+    --accent:#3d7fff;
+    --amber:#f5b84b;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body {
+    min-height:100vh;
+    background:var(--bg);
+    color:var(--text);
+    font-family:'Noto Sans SC', sans-serif;
+    font-size:13px;
+    padding:28px 24px;
+  }
+  .header {
+    display:flex;
+    align-items:flex-end;
+    justify-content:space-between;
+    gap:16px;
+    padding-bottom:18px;
+    margin-bottom:18px;
+    border-bottom:1px solid var(--border);
+  }
+  h1 { color:#fff; font-size:20px; font-weight:500; letter-spacing:.04em; }
+  .sub { margin-top:5px; color:var(--text-dim); font-size:11px; }
+  .nav { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+  .nav-link {
+    color:var(--text);
+    text-decoration:none;
+    border:1px solid var(--border);
+    background:var(--surface2);
+    padding:7px 12px;
+    border-radius:6px;
+    white-space:nowrap;
+  }
+  .toolbar {
+    display:grid;
+    grid-template-columns: repeat(10, minmax(86px, 1fr));
+    gap:10px;
+    align-items:end;
+    padding:14px;
+    margin-bottom:14px;
+    border:1px solid var(--border);
+    border-radius:8px;
+    background:var(--surface);
+  }
+  label { display:flex; flex-direction:column; gap:5px; color:var(--text-dim); font-size:10px; }
+  input, select {
+    height:34px;
+    background:var(--surface2);
+    color:var(--text);
+    border:1px solid var(--border);
+    border-radius:6px;
+    padding:0 10px;
+    font:12px 'Noto Sans SC', sans-serif;
+    outline:none;
+  }
+  input:focus, select:focus { border-color:var(--accent); }
+  button {
+    height:34px;
+    border:0;
+    border-radius:6px;
+    background:var(--accent);
+    color:white;
+    cursor:pointer;
+    font:500 12px 'Noto Sans SC', sans-serif;
+  }
+  button.secondary {
+    border:1px solid var(--border);
+    background:var(--surface2);
+    color:var(--text);
+  }
+  button:disabled { opacity:.55; cursor:default; }
+  .status {
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    margin-bottom:16px;
+  }
+  .pill {
+    display:flex;
+    align-items:center;
+    gap:8px;
+    min-height:32px;
+    padding:7px 10px;
+    border:1px solid var(--border);
+    border-radius:6px;
+    background:var(--surface);
+    color:var(--text-dim);
+  }
+  .pill b {
+    color:var(--text);
+    font-family:'DM Mono', monospace;
+    font-weight:500;
+  }
+  .grid {
+    display:grid;
+    grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+    gap:14px;
+  }
+  .card {
+    border:1px solid var(--border);
+    border-radius:8px;
+    background:var(--surface);
+    overflow:hidden;
+  }
+  .card-head {
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:12px;
+    padding:12px 13px 10px;
+    border-bottom:1px solid var(--border);
+    background:rgba(255,255,255,.018);
+  }
+  .stock-title { color:#fff; font-size:14px; font-weight:500; }
+  .stock-code { display:block; margin-top:2px; color:var(--text-dim); font:10px 'DM Mono', monospace; }
+  .score {
+    min-width:48px;
+    padding:4px 8px;
+    border-radius:999px;
+    background:rgba(61,127,255,.14);
+    color:#8eb1ff;
+    text-align:center;
+    font:500 12px 'DM Mono', monospace;
+  }
+  .chart { padding:10px 10px 4px; }
+  .metrics {
+    display:grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap:1px;
+    background:var(--border);
+    border-top:1px solid var(--border);
+  }
+  .metric {
+    min-height:50px;
+    padding:9px 10px;
+    background:var(--surface);
+  }
+  .metric-label { margin-bottom:5px; color:var(--text-dim); font-size:10px; }
+  .metric-value { color:var(--text); font:500 13px 'DM Mono', monospace; }
+  .up { color:var(--red); }
+  .down { color:var(--green); }
+  .reason {
+    padding:10px 12px 12px;
+    color:var(--text-dim);
+    font-size:11px;
+    line-height:1.6;
+    min-height:42px;
+  }
+  .section-title {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
+    margin:22px 0 12px;
+    color:#fff;
+    font-size:15px;
+    font-weight:500;
+  }
+  .history {
+    display:flex;
+    flex-direction:column;
+    gap:18px;
+  }
+  .history-head {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+    padding:10px 12px;
+    border:1px solid var(--border);
+    border-radius:8px;
+    background:var(--surface2);
+    color:var(--text);
+  }
+  .history-date { font:500 13px 'DM Mono', monospace; color:#fff; }
+  .history-meta { color:var(--text-dim); font-size:11px; }
+  .loading {
+    min-height:260px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:var(--text-dim);
+  }
+  .spinner {
+    width:16px;
+    height:16px;
+    margin-right:10px;
+    border:2px solid var(--border);
+    border-top-color:var(--accent);
+    border-radius:50%;
+    animation:spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  @media (max-width: 1180px) {
+    .toolbar { grid-template-columns: repeat(5, minmax(86px, 1fr)); }
+  }
+  @media (max-width: 700px) {
+    body { padding:20px 14px; }
+    .header { align-items:flex-start; flex-direction:column; }
+    .nav { justify-content:flex-start; }
+    .toolbar { grid-template-columns: repeat(2, minmax(86px, 1fr)); }
+    .grid { grid-template-columns: 1fr; }
+    .metrics { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>收盘 K 线形态扫描</h1>
+    <div class="sub">四根十字针：第 1、3 根同位，第 2、4 根在下方</div>
+  </div>
+  <div class="nav">
+    <a class="nav-link" href="/">行业宽度</a>
+    <a class="nav-link" href="/momentum">14:30 选股</a>
+  </div>
+</div>
+
+<div class="toolbar">
+  <label>股票池
+    <select id="pool" onchange="syncIndexWithPool()">
+      <option value="all">全市场</option>
+      <option value="sector">行业池</option>
+      <option value="index">指数成分</option>
+    </select>
+  </label>
+  <label>指数
+    <select id="indexCode" onchange="syncPoolWithIndex()"></select>
+  </label>
+  <label>交易日
+    <input id="tradeDate" placeholder="留空取最新">
+  </label>
+  <label>针实体%
+    <input id="maxBodyPct" type="number" value="1.05" step="0.05">
+  </label>
+  <label>十字实体%
+    <input id="dojiBodyPct" type="number" value="1.05" step="0.05">
+  </label>
+  <label>最大振幅%
+    <input id="maxAmpPct" type="number" value="6.0" step="0.1">
+  </label>
+  <label>实体占振幅%
+    <input id="maxBodyRangePct" type="number" value="35" step="1">
+  </label>
+  <label>MA40距离%
+    <input id="maxMa40Distance" type="number" value="0" step="0.5">
+  </label>
+  <label>同位偏差%
+    <input id="maxPairDistance" type="number" value="0.5" step="0.1">
+  </label>
+  <label>收盘同差%
+    <input id="maxClosePairDistance" type="number" value="1.0" step="0.1">
+  </label>
+  <label>高低差%
+    <input id="minLevelGap" type="number" value="0.8" step="0.05">
+  </label>
+  <label>影线最小%
+    <input id="minShadowPct" type="number" value="1" step="1">
+  </label>
+  <label>缺影线数
+    <input id="maxShadowlessCount" type="number" value="0" step="1" min="0" max="4">
+  </label>
+  <label>成交额万元
+    <input id="minAmount" type="number" value="0" step="1000">
+  </label>
+  <label>总市值亿
+    <input id="minMarketCapYi" type="number" value="100" step="50">
+  </label>
+  <label>换手%
+    <input id="minTurnover" type="number" value="0" step="0.1">
+  </label>
+  <button id="scanBtn" onclick="scan()">扫描并保存</button>
+  <button class="secondary" onclick="loadLatest()">最近结果</button>
+  <button class="secondary" id="backfillBtn" onclick="backfillTenYears()">回扫10年</button>
+</div>
+
+<div class="status">
+  <div class="pill">交易日 <b id="statDate">—</b></div>
+  <div class="pill">股票池 <b id="statPool">—</b></div>
+  <div class="pill">扫描 <b id="statScanned">—</b></div>
+  <div class="pill">命中 <b id="statMatched">—</b></div>
+  <div class="pill">耗时 <b id="statElapsed">—</b></div>
+  <div class="pill">保存 <b id="statSaved">—</b></div>
+</div>
+
+<div id="result"><div class="loading"><span class="spinner"></span>加载最近结果…</div></div>
+<div class="section-title">
+  <span>历史命中</span>
+  <button class="secondary" onclick="loadHistory()">刷新历史</button>
+</div>
+<div id="history"><div class="loading"><span class="spinner"></span>加载历史…</div></div>
+
+<script>
+const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+}[ch]));
+const fmt = (value, digits=2) => value === null || value === undefined ? '—' : Number(value).toFixed(digits);
+const cls = value => Number(value || 0) > 0 ? 'up' : Number(value || 0) < 0 ? 'down' : '';
+
+async function loadIndices() {
+  const res = await fetch('/api/indices');
+  const data = await res.json();
+  const select = document.getElementById('indexCode');
+  select.innerHTML = data.indices.map(x =>
+    `<option value="${esc(x.code)}">${esc(x.name)} ${esc(x.code)}</option>`
+  ).join('');
+}
+
+function syncPoolWithIndex() {
+  const indexCode = document.getElementById('indexCode').value;
+  document.getElementById('pool').value = indexCode ? 'index' : 'all';
+}
+
+function syncIndexWithPool() {
+  const pool = document.getElementById('pool').value;
+  if (pool !== 'index') document.getElementById('indexCode').value = '';
+}
+
+function params() {
+  const p = new URLSearchParams();
+  ['pool','indexCode','tradeDate','maxBodyPct','dojiBodyPct','maxAmpPct',
+   'maxBodyRangePct','maxMa40Distance','maxPairDistance','maxClosePairDistance','minLevelGap',
+   'minShadowPct','maxShadowlessCount','minAmount','minMarketCapYi','minTurnover'].forEach(id => {
+    const value = document.getElementById(id).value;
+    if (value !== '') p.set(id, value);
+  });
+  p.set('limit', '80');
+  p.set('chartBars', '70');
+  p.set('save', '1');
+  return p.toString();
+}
+
+function setMeta(meta, savedText='—') {
+  document.getElementById('statDate').textContent = meta?.trade_date || '—';
+  document.getElementById('statPool').textContent = meta?.pool || '—';
+  document.getElementById('statScanned').textContent = meta?.scanned ?? '—';
+  document.getElementById('statMatched').textContent = meta?.matched ?? '—';
+  document.getElementById('statElapsed').textContent = meta?.elapsed_s === undefined ? '—' : `${meta.elapsed_s}s`;
+  document.getElementById('statSaved').textContent = savedText;
+}
+
+function metric(label, value, className='') {
+  return `<div class="metric"><div class="metric-label">${label}</div><div class="metric-value ${className}">${value}</div></div>`;
+}
+
+function rowCard(row) {
+  return `<article class="card">
+    <div class="card-head">
+      <div>
+        <div class="stock-title">${esc(row.name || '')}</div>
+        <span class="stock-code">${esc(row.code)}</span>
+      </div>
+      <div class="score">${fmt(row.score, 1)}</div>
+    </div>
+    <div class="chart">${row.chart || ''}</div>
+    <div class="metrics">
+      ${metric('收盘', fmt(row.close, 2))}
+      ${metric('涨跌幅', `${fmt(row.pct, 2)}%`, cls(row.pct))}
+      ${metric('成交额', `${fmt(row.amount_yi, 2)}亿`)}
+      ${metric('总市值', row.market_cap_yi === null || row.market_cap_yi === undefined ? '—' : `${fmt(row.market_cap_yi, 0)}亿`)}
+      ${metric('换手', row.turnover === null || row.turnover === undefined ? '—' : `${fmt(row.turnover, 2)}%`)}
+      ${metric('最大实体', `${fmt(row.doji_body_pct, 2)}%`)}
+      ${metric('4针振幅', `${fmt(row.range5_pct, 2)}%`)}
+      ${metric('1/3偏差', `${fmt(row.first_third_gap, 2)}%`)}
+      ${metric('2/4偏差', `${fmt(row.second_fourth_gap, 2)}%`)}
+      ${metric('1/3收差', `${fmt(row.first_third_close_gap, 2)}%`)}
+      ${metric('2/4收差', `${fmt(row.second_fourth_close_gap, 2)}%`)}
+      ${metric('高低差', `${fmt(row.level_gap, 2)}%`)}
+      ${metric('缺影线', `${row.shadowless_count ?? 0}根`)}
+      ${metric('MA40距', row.ma40_distance === null || row.ma40_distance === undefined ? '—' : `${fmt(row.ma40_distance, 2)}%`)}
+    </div>
+    <div class="reason">${esc(row.reasons || '')}</div>
+  </article>`;
+}
+
+function render(data, savedText='—') {
+  setMeta(data.meta || {}, savedText);
+  const rows = data.rows || [];
+  if (!rows.length) {
+    document.getElementById('result').innerHTML = '<div class="loading">暂无符合条件的股票</div>';
+    return;
+  }
+  document.getElementById('result').innerHTML = `<div class="grid">${rows.map(rowCard).join('')}</div>`;
+}
+
+function renderHistory(data) {
+  const runs = data.runs || [];
+  if (!runs.length) {
+    document.getElementById('history').innerHTML = '<div class="loading">最近10年暂无历史命中记录</div>';
+    return;
+  }
+  document.getElementById('history').innerHTML = `<div class="history">${runs.map(run => `
+    <section>
+      <div class="history-head">
+        <div>
+          <div class="history-date">${esc(run.trade_date)}</div>
+          <div class="history-meta">run ${run.run_id} · 命中 ${run.matched} · 扫描 ${run.scanned ?? '—'} · ${esc(run.created_at || '')}</div>
+        </div>
+      </div>
+      <div class="grid" style="margin-top:10px">${(run.rows || []).map(rowCard).join('')}</div>
+    </section>
+  `).join('')}</div>`;
+}
+
+async function loadLatest() {
+  document.getElementById('result').innerHTML = '<div class="loading"><span class="spinner"></span>加载最近结果…</div>';
+  try {
+    const res = await fetch('/api/pattern/latest');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '加载失败');
+    render(data, data.meta?.created_at || '已保存');
+    loadHistory();
+  } catch (err) {
+    setMeta({}, '—');
+    document.getElementById('result').innerHTML = `<div class="loading">${esc(err.message)}</div>`;
+  }
+}
+
+async function loadHistory() {
+  document.getElementById('history').innerHTML = '<div class="loading"><span class="spinner"></span>加载历史…</div>';
+  try {
+    const res = await fetch('/api/pattern/history?days=3650&hitsOnly=1&limitDates=500');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '历史加载失败');
+    renderHistory(data);
+  } catch (err) {
+    document.getElementById('history').innerHTML = `<div class="loading">历史加载失败：${esc(err.message)}</div>`;
+  }
+}
+
+async function scan() {
+  const btn = document.getElementById('scanBtn');
+  btn.disabled = true;
+  document.getElementById('result').innerHTML = '<div class="loading"><span class="spinner"></span>扫描中…</div>';
+  try {
+    const res = await fetch('/api/pattern/scan?' + params());
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '扫描失败');
+    render(data, data.saved ? `run ${data.run_id}` : '未保存');
+    loadHistory();
+  } catch (err) {
+    document.getElementById('result').innerHTML = `<div class="loading">扫描失败：${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function backfillTenYears() {
+  const btn = document.getElementById('backfillBtn');
+  btn.disabled = true;
+  btn.textContent = '回扫中…';
+  document.getElementById('history').innerHTML = '<div class="loading"><span class="spinner"></span>正在回扫最近10年…</div>';
+  try {
+    const p = new URLSearchParams(params());
+    p.set('days', '3650');
+    p.delete('save');
+    const res = await fetch('/api/pattern/backfill?' + p.toString());
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '回扫失败');
+    document.getElementById('statSaved').textContent =
+      `10年 ${data.matched_days || 0} 天 / ${data.matched_rows || 0} 条`;
+    await loadHistory();
+    await loadLatest();
+  } catch (err) {
+    document.getElementById('history').innerHTML = `<div class="loading">回扫失败：${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '回扫10年';
+  }
+}
+
+loadIndices();
+loadLatest();
+loadHistory();
+</script>
+</body>
+</html>
+"""
+
+
 # ─────────────────────────────────────────────────────────────────
 # 路由
 # ─────────────────────────────────────────────────────────────────
@@ -2247,6 +3747,11 @@ def index():
 @app.route("/momentum")
 def momentum_page():
     return render_template_string(MOMENTUM_HTML)
+
+
+@app.route("/pattern")
+def pattern_page():
+    return render_template_string(PATTERN_HTML)
 
 
 @app.route("/api/indices")
@@ -2344,6 +3849,86 @@ def api_index_constituents():
         })
     finally:
         conn.close()
+
+
+@app.route("/api/pattern/latest")
+def api_pattern_latest():
+    trade_date = (request.args.get("tradeDate")
+                  or request.args.get("trade_date")
+                  or "").strip() or None
+    conn = get_db()
+    try:
+        payload = load_latest_pattern_result(conn, trade_date=trade_date)
+    finally:
+        conn.close()
+    if not payload:
+        return jsonify({
+            "error": "暂无保存的形态扫描结果，请先点击扫描并保存",
+            "meta": build_empty_pattern_meta(build_pattern_params(request.args)),
+            "rows": [],
+        }), 404
+    return jsonify(payload)
+
+
+@app.route("/api/pattern/scan")
+def api_pattern_scan():
+    started_at = time.time()
+    if not SCAN_LOCK.acquire(blocking=False):
+        return jsonify({
+            "error": "已有扫描任务进行中，请等待上一次扫描结束",
+            "meta": build_empty_pattern_meta(build_pattern_params(request.args)),
+            "rows": [],
+        }), 429
+    try:
+        params = build_pattern_params(request.args)
+        payload, status = perform_pattern_scan(params, started_at=started_at)
+        save_requested = request.args.get("save", "0") in ("1", "true", "yes")
+        if save_requested:
+            conn = get_db()
+            try:
+                run_id, saved = save_pattern_scan_result(conn, params, payload, status)
+            finally:
+                conn.close()
+            payload["run_id"] = run_id
+            payload["saved"] = saved
+        return jsonify(payload), status
+    finally:
+        SCAN_LOCK.release()
+
+
+@app.route("/api/pattern/history")
+def api_pattern_history():
+    days = to_int_arg("days", 3650, 1, 3650)
+    limit_dates = to_int_arg("limitDates", 500, 1, 1000)
+    hits_only = request.args.get("hitsOnly", "1") not in ("0", "false", "no")
+    conn = get_db()
+    try:
+        payload = load_pattern_history(
+            conn,
+            days=days,
+            hits_only=hits_only,
+            limit_dates=limit_dates,
+        )
+    finally:
+        conn.close()
+    return jsonify(payload)
+
+
+@app.route("/api/pattern/backfill")
+def api_pattern_backfill():
+    if not SCAN_LOCK.acquire(blocking=False):
+        return jsonify({"error": "已有扫描任务进行中，请等待上一次扫描结束"}), 429
+    try:
+        params = build_pattern_params(request.args)
+        days = to_int_arg("days", 3650, 1, 3650)
+        result = run_pattern_backfill(
+            params,
+            days=days,
+            end_date=params.get("trade_date"),
+        )
+        return jsonify(result)
+    finally:
+        SCAN_LOCK.release()
 
 
 @app.route("/api/momentum/profit")
@@ -3709,6 +5294,30 @@ def build_cli_momentum_params(args):
     })
 
 
+def build_cli_pattern_params(args):
+    return build_pattern_params({
+        "pool": args.pool,
+        "index_code": args.index_code,
+        "trade_date": args.trade_date,
+        "min_amount": args.pattern_min_amount,
+        "limit": args.limit,
+        "lookback_days": args.pattern_lookback_days,
+        "chart_bars": args.pattern_chart_bars,
+        "max_body_pct": args.pattern_max_body_pct,
+        "max_body_range_pct": args.pattern_max_body_range_pct,
+        "max_amp_pct": args.pattern_max_amp_pct,
+        "doji_body_pct": args.pattern_doji_body_pct,
+        "max_ma40_distance": args.pattern_max_ma40_distance,
+        "max_pair_distance": args.pattern_max_pair_distance,
+        "max_close_pair_distance": args.pattern_max_close_pair_distance,
+        "min_level_gap": args.pattern_min_level_gap,
+        "min_shadow_pct": args.pattern_min_shadow_pct,
+        "max_shadowless_count": args.pattern_max_shadowless_count,
+        "min_turnover": args.pattern_min_turnover,
+        "min_market_cap_yi": args.pattern_min_market_cap_yi,
+    })
+
+
 def print_settlement_summary(result):
     print(
         f"收益结算: buy_date={result.get('buy_date') or '-'} "
@@ -3748,6 +5357,52 @@ def print_scan_summary(payload, status_code, run_id=None, saved=None):
         )
     if len(payload.get("rows") or []) > 20:
         print(f"  ... 还有 {len(payload['rows']) - 20} 条")
+
+
+def print_pattern_summary(payload, status_code, run_id=None, saved=None):
+    meta = payload.get("meta") or {}
+    print(
+        f"形态扫描: status={status_code} run_id={run_id or '-'} "
+        f"trade_date={meta.get('trade_date')} pool={meta.get('pool')} "
+        f"scanned={meta.get('scanned', 0)} picked={len(payload.get('rows') or [])} "
+        f"saved={saved if saved is not None else '-'} elapsed={meta.get('elapsed_s', 0)}s"
+    )
+    if payload.get("error"):
+        print(f"错误: {payload['error']}")
+    for row in (payload.get("rows") or [])[:20]:
+        print(
+            f"  {row['code']} {row.get('name') or ''} "
+            f"close={row.get('close')} pct={row.get('pct')}% "
+            f"body={row.get('doji_body_pct')}% "
+            f"13gap={row.get('first_third_gap')}% "
+            f"24gap={row.get('second_fourth_gap')}% "
+            f"13close={row.get('first_third_close_gap')}% "
+            f"24close={row.get('second_fourth_close_gap')}% "
+            f"level={row.get('level_gap')}% "
+            f"mcap={row.get('market_cap_yi') or '-'}亿 "
+            f"shadowless={row.get('shadowless_count', 0)} "
+            f"score={row.get('score')}"
+        )
+    if len(payload.get("rows") or []) > 20:
+        print(f"  ... 还有 {len(payload['rows']) - 20} 条")
+
+
+def print_pattern_backfill_progress(item, index, total):
+    print(
+        f"[{index}/{total}] {item['trade_date']} "
+        f"picked={item['picked']} saved={item['saved']} "
+        f"elapsed={item.get('meta', {}).get('elapsed_s', 0)}s"
+    )
+
+
+def print_pattern_backfill_summary(result):
+    print(
+        f"形态回扫完成: {result.get('start_date')} -> {result.get('end_date')} "
+        f"交易日={result.get('days', 0)} "
+        f"命中交易日={result.get('matched_days', 0)} "
+        f"命中记录={result.get('matched_rows', 0)} "
+        f"耗时={result.get('elapsed_s', 0)}s"
+    )
 
 
 def print_recent_returns(limit=30):
@@ -3821,6 +5476,10 @@ def parse_cli_args():
                          help="查看最近收益记录")
     actions.add_argument("--momentum-backfill", action="store_true",
                          help="回填历史14:30选股并按下一交易日10:00前卖出统计收益")
+    actions.add_argument("--pattern-scan-save", action="store_true",
+                         help="扫描并保存收盘K线形态：四根小实体后接小十字星")
+    actions.add_argument("--pattern-backfill", action="store_true",
+                         help="回扫并保存最近一段时间的四针形态结果")
 
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5000)
@@ -3848,6 +5507,36 @@ def parse_cli_args():
                         help="历史分钟线不可用时不使用日线近似回退")
     parser.add_argument("--daily-fallback-only", action="store_true",
                         help="历史回填直接使用日线近似口径，不尝试分钟线")
+    parser.add_argument("--pattern-lookback-days", type=int, default=120)
+    parser.add_argument("--pattern-chart-bars", type=int, default=70)
+    parser.add_argument("--pattern-max-body-pct", type=float, default=1.05,
+                        help="四根十字针最大实体幅度，单位%")
+    parser.add_argument("--pattern-max-body-range-pct", type=float, default=35.0,
+                        help="十字针实体占振幅上限，单位%")
+    parser.add_argument("--pattern-max-amp-pct", type=float, default=6.0,
+                        help="四根K线单日最大振幅，单位%")
+    parser.add_argument("--pattern-doji-body-pct", type=float, default=1.05,
+                        help="四根十字针最大实体幅度，单位%")
+    parser.add_argument("--pattern-max-ma40-distance", type=float, default=0.0,
+                        help="收盘价距离MA40的最大幅度，0表示不限制")
+    parser.add_argument("--pattern-max-pair-distance", type=float, default=0.5,
+                        help="第1/3、第2/4同位允许偏差，单位%")
+    parser.add_argument("--pattern-max-close-pair-distance", type=float, default=1.0,
+                        help="第1/3、第2/4收盘价允许偏差，单位%")
+    parser.add_argument("--pattern-min-level-gap", type=float, default=0.8,
+                        help="第1/3高位中枢相对第2/4低位中枢的最小差，单位%")
+    parser.add_argument("--pattern-min-shadow-pct", type=float, default=1.0,
+                        help="上下影线占单根振幅的最小比例，单位%")
+    parser.add_argument("--pattern-max-shadowless-count", type=int, default=0,
+                        help="四根K线中允许缺上影或下影的最大根数")
+    parser.add_argument("--pattern-min-turnover", type=float, default=0.0,
+                        help="最低换手率，单位%")
+    parser.add_argument("--pattern-min-market-cap-yi", type=float, default=100.0,
+                        help="最低总市值，单位亿元；0表示不限制")
+    parser.add_argument("--pattern-min-amount", type=float, default=None,
+                        help="收盘形态扫描最低成交额，单位万元；不填则不限制")
+    parser.add_argument("--pattern-backfill-days", type=int, default=3650,
+                        help="四针形态历史回扫天数")
     return parser.parse_args()
 
 
@@ -3906,6 +5595,34 @@ def main():
             daily_fallback_only=args.daily_fallback_only,
         )
         print_backfill_summary(result)
+    elif args.pattern_scan_save:
+        pattern_params = build_cli_pattern_params(args)
+        payload, status_code = perform_pattern_scan(
+            pattern_params,
+            started_at=time.time(),
+        )
+        conn = get_db()
+        try:
+            run_id, saved = save_pattern_scan_result(
+                conn, pattern_params, payload, status_code
+            )
+        finally:
+            conn.close()
+        print_pattern_summary(
+            payload,
+            status_code,
+            run_id=run_id,
+            saved=saved,
+        )
+    elif args.pattern_backfill:
+        pattern_params = build_cli_pattern_params(args)
+        result = run_pattern_backfill(
+            pattern_params,
+            days=args.pattern_backfill_days,
+            end_date=args.trade_date,
+            progress=print_pattern_backfill_progress,
+        )
+        print_pattern_backfill_summary(result)
 
 
 # ─────────────────────────────────────────────────────────────────
