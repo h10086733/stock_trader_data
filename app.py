@@ -2825,8 +2825,8 @@ def load_latest_pattern_result(conn, trade_date=None, pattern_type=None, filters
     }
 
 
-def load_pattern_history(conn, days=548, hits_only=True, limit_dates=500,
-                         pattern_type=None, filters=None):
+def load_pattern_history(conn, days=None, hits_only=True, pattern_type=None,
+                         filters=None, page=1, page_size=10):
     ensure_pattern_tables(conn)
     row = conn.execute("""
         SELECT MAX(trade_date) AS end_date
@@ -2838,47 +2838,66 @@ def load_pattern_history(conn, days=548, hits_only=True, limit_dates=500,
             "start_date": None,
             "end_date": None,
             "days": days,
+            "page": page,
+            "page_size": page_size,
+            "has_next": False,
             "runs": [],
         }
-    start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)
-    start_date = start_dt.strftime("%Y-%m-%d")
-    hit_clause = "AND r.row_count > 0" if hits_only else ""
-    runs = conn.execute(f"""
-        SELECT r.*
+    start_date = None
+    conditions = ["r.trade_date <= ?"]
+    values = [end_date]
+    if days:
+        start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)
+        start_date = start_dt.strftime("%Y-%m-%d")
+        conditions.append("r.trade_date >= ?")
+        values.append(start_date)
+    if hits_only:
+        conditions.append("r.row_count > 0")
+    where_sql = " AND ".join(conditions)
+    offset = (page - 1) * page_size
+    trade_date_rows = conn.execute(f"""
+        SELECT DISTINCT r.trade_date
         FROM pattern_scan_runs r
-        WHERE r.trade_date >= ?
-          AND r.trade_date <= ?
-          {hit_clause}
-        ORDER BY r.trade_date DESC, r.id DESC
-        LIMIT ?
-    """, (start_date, end_date, limit_dates * 10)).fetchall()
+        WHERE {where_sql}
+        ORDER BY r.trade_date DESC
+        LIMIT ? OFFSET ?
+    """, values + [page_size + 1, offset]).fetchall()
+    page_trade_dates = [r["trade_date"] for r in trade_date_rows[:page_size]]
+    has_next = len(trade_date_rows) > page_size
 
     result_runs = []
-    seen_dates = set()
-    for run in runs:
-        if run["trade_date"] in seen_dates:
-            continue
-        if not pattern_run_matches_type(run, pattern_type):
-            continue
-        seen_dates.add(run["trade_date"])
-        picks = load_pattern_rows_for_run(conn, run, highlight=4, filters=filters)
-        if hits_only and not picks:
-            continue
-        params = pattern_run_params(run)
-        result_runs.append({
-            "run_id": run["id"],
-            "trade_date": run["trade_date"],
-            "pool": run["pool"],
-            "pattern_type": params.get("pattern_type", "four_pin"),
-            "index_code": run["index_code"],
-            "universe": run["universe"],
-            "scanned": run["scanned"],
-            "matched": run["row_count"],
-            "elapsed_s": run["elapsed_s"],
-            "created_at": run["created_at"],
-            "rows": picks,
-        })
-        if len(result_runs) >= limit_dates:
+    run_conditions = ["trade_date = ?"]
+    if hits_only:
+        run_conditions.append("row_count > 0")
+    run_where_sql = " AND ".join(run_conditions)
+    for trade_date in page_trade_dates:
+        runs = conn.execute(f"""
+            SELECT *
+            FROM pattern_scan_runs
+            WHERE {run_where_sql}
+            ORDER BY id DESC
+            LIMIT 100
+        """, (trade_date,)).fetchall()
+        for run in runs:
+            if not pattern_run_matches_type(run, pattern_type):
+                continue
+            picks = load_pattern_rows_for_run(conn, run, highlight=4, filters=filters)
+            if hits_only and not picks:
+                continue
+            params = pattern_run_params(run)
+            result_runs.append({
+                "run_id": run["id"],
+                "trade_date": run["trade_date"],
+                "pool": run["pool"],
+                "pattern_type": params.get("pattern_type", "four_pin"),
+                "index_code": run["index_code"],
+                "universe": run["universe"],
+                "scanned": run["scanned"],
+                "matched": run["row_count"],
+                "elapsed_s": run["elapsed_s"],
+                "created_at": run["created_at"],
+                "rows": picks,
+            })
             break
 
     return {
@@ -2886,6 +2905,11 @@ def load_pattern_history(conn, days=548, hits_only=True, limit_dates=500,
         "end_date": end_date,
         "days": days,
         "hits_only": hits_only,
+        "page": page,
+        "page_size": page_size,
+        "has_prev": page > 1,
+        "has_next": has_next,
+        "page_trade_dates": page_trade_dates,
         "runs": result_runs,
     }
 
@@ -4243,6 +4267,24 @@ PATTERN_HTML = """<!DOCTYPE html>
     flex-direction:column;
     gap:10px;
   }
+  .history-toolbar {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
+    margin-bottom:10px;
+    color:var(--text-dim);
+    font-size:11px;
+  }
+  .history-actions {
+    display:flex;
+    align-items:center;
+    gap:8px;
+  }
+  .history-actions button {
+    min-width:72px;
+    padding:0 10px;
+  }
   .history-head {
     display:flex;
     align-items:center;
@@ -4406,7 +4448,7 @@ PATTERN_HTML = """<!DOCTYPE html>
 <div id="result"><div class="loading"><span class="spinner"></span>加载最近结果…</div></div>
 <div class="section-title">
   <span>历史命中</span>
-  <button class="secondary" onclick="loadHistory()">刷新历史</button>
+  <button class="secondary" onclick="loadHistory(1)">刷新历史</button>
 </div>
 <div id="history"><div class="loading"><span class="spinner"></span>加载历史…</div></div>
 
@@ -4417,6 +4459,8 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
 const fmt = (value, digits=2) => value === null || value === undefined ? '—' : Number(value).toFixed(digits);
 const cls = value => Number(value || 0) > 0 ? 'up' : Number(value || 0) < 0 ? 'down' : '';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+let historyPage = 1;
+const historyPageSize = 10;
 
 async function loadIndices() {
   const res = await fetch('/api/indices');
@@ -4576,11 +4620,26 @@ function render(data, savedText='—') {
 
 function renderHistory(data) {
   const runs = data.runs || [];
+  const page = Number(data.page || historyPage || 1);
+  historyPage = page;
+  const dates = data.page_trade_dates || [];
+  const fromDate = dates.length ? dates[dates.length - 1] : '—';
+  const toDate = dates.length ? dates[0] : '—';
+  const rangeText = dates.length
+    ? `第 ${page} 页 · ${esc(fromDate)} 至 ${esc(toDate)} · ${dates.length} 个交易日`
+    : `第 ${page} 页 · 暂无交易日`;
+  const pager = `<div class="history-toolbar">
+    <div>${rangeText}</div>
+    <div class="history-actions">
+      <button class="secondary" onclick="changeHistoryPage(-1)" ${data.has_prev ? '' : 'disabled'}>上一页</button>
+      <button class="secondary" onclick="changeHistoryPage(1)" ${data.has_next ? '' : 'disabled'}>下一页</button>
+    </div>
+  </div>`;
   if (!runs.length) {
-    document.getElementById('history').innerHTML = '<div class="loading">最近1.5年暂无历史命中记录</div>';
+    document.getElementById('history').innerHTML = `${pager}<div class="loading">当前页暂无历史命中记录</div>`;
     return;
   }
-  document.getElementById('history').innerHTML = `<div class="history">${runs.map(run => `
+  document.getElementById('history').innerHTML = `${pager}<div class="history">${runs.map(run => `
     <section class="history-item">
       <div class="history-head" onclick="toggleHistoryRun(this)">
         <div>
@@ -4596,13 +4655,20 @@ function renderHistory(data) {
   `).join('')}</div>`;
 }
 
+function changeHistoryPage(delta) {
+  const nextPage = Math.max(1, historyPage + delta);
+  if (nextPage === historyPage && delta < 0) return;
+  loadHistory(nextPage);
+}
+
 function toggleHistoryRun(head) {
   head.closest('.history-item')?.classList.toggle('open');
 }
 
 function onPatternTypeChange() {
+  historyPage = 1;
   loadLatest(false);
-  loadHistory();
+  loadHistory(1);
 }
 
 async function loadLatest(refreshHistory=true) {
@@ -4612,20 +4678,21 @@ async function loadLatest(refreshHistory=true) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '加载失败');
     render(data, data.meta?.created_at || '已保存');
-    if (refreshHistory) loadHistory();
+    if (refreshHistory) loadHistory(1);
   } catch (err) {
     setMeta({}, '—');
     document.getElementById('result').innerHTML = `<div class="loading">${esc(err.message)}</div>`;
   }
 }
 
-async function loadHistory() {
+async function loadHistory(page=historyPage) {
+  historyPage = Math.max(1, Number(page || 1));
   document.getElementById('history').innerHTML = '<div class="loading"><span class="spinner"></span>加载历史…</div>';
   try {
     const p = new URLSearchParams(params());
-    p.set('days', '548');
     p.set('hitsOnly', '1');
-    p.set('limitDates', '500');
+    p.set('page', String(historyPage));
+    p.set('pageSize', String(historyPageSize));
     const res = await fetch('/api/pattern/history?' + p.toString());
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '历史加载失败');
@@ -4644,7 +4711,8 @@ async function scan() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '扫描失败');
     render(data, data.saved ? `run ${data.run_id}` : '未保存');
-    loadHistory();
+    historyPage = 1;
+    loadHistory(1);
   } catch (err) {
     document.getElementById('result').innerHTML = `<div class="loading">扫描失败：${esc(err.message)}</div>`;
   } finally {
@@ -4676,7 +4744,8 @@ async function backfillEighteenMonths() {
       }
       await sleep(2000);
     }
-    await loadHistory();
+    historyPage = 1;
+    await loadHistory(1);
     await loadLatest();
   } catch (err) {
     document.getElementById('history').innerHTML = `<div class="loading">回扫失败：${esc(err.message)}</div>`;
@@ -4689,7 +4758,7 @@ async function backfillEighteenMonths() {
 loadIndices();
 loadPatternProgress();
 loadLatest(false);
-loadHistory();
+loadHistory(1);
 </script>
 </body>
 </html>
@@ -4907,8 +4976,15 @@ def api_pattern_scan():
 
 @app.route("/api/pattern/history")
 def api_pattern_history():
-    days = to_int_arg("days", 548, 1, 3650)
-    limit_dates = to_int_arg("limitDates", 500, 1, 1000)
+    days_arg = request.args.get("days")
+    days = None
+    if days_arg not in (None, ""):
+        try:
+            days = clamp(int(days_arg), 1, 3650)
+        except (TypeError, ValueError):
+            days = None
+    page = to_int_arg("page", 1, 1, 10000)
+    page_size = to_int_arg("pageSize", 10, 1, 10)
     hits_only = request.args.get("hitsOnly", "1") not in ("0", "false", "no")
     params = build_pattern_params(request.args)
     pattern_type = params["pattern_type"]
@@ -4918,9 +4994,10 @@ def api_pattern_history():
             conn,
             days=days,
             hits_only=hits_only,
-            limit_dates=limit_dates,
             pattern_type=pattern_type,
             filters=params,
+            page=page,
+            page_size=page_size,
         )
     finally:
         conn.close()
