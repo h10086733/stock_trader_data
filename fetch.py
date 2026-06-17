@@ -32,6 +32,8 @@ RETRY_INTERVAL   = 10.0   # 限流后等待时间（秒）- 增加到10秒
 MAX_RETRIES      = 5      # 单次请求最大重试次数 - 增加到5次
 FAIL_ALERT_RATIO = 0.05   # 失败率超过5%时告警
 HISTORY_START    = "20100101"
+SINA_BATCH_SIZE  = 100
+SINA_FALLBACK_BATCH_SIZE = 20
 
 STOCK_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 KLINE_URL      = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -239,6 +241,45 @@ def get_price_sina_batch(codes):
     except Exception as e:
         log.warning(f"新浪接口批量获取失败: {e}")
         return {}
+
+
+def iter_chunks(items, size):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def get_price_sina_with_fallback(codes, today_dash):
+    """
+    新浪 100 只批量请求偶发超时时，拆成小批和单只重试。
+    避免一批请求失败后把整批股票都记成失败。
+    """
+    result = {}
+    pending = list(codes)
+
+    retry_plan = (
+        (SINA_BATCH_SIZE, "批量"),
+        (SINA_FALLBACK_BATCH_SIZE, "小批"),
+        (1, "单只"),
+    )
+
+    for size, label in retry_plan:
+        if not pending:
+            break
+
+        next_pending = []
+        for chunk in iter_chunks(pending, size):
+            prices = get_price_sina_batch(chunk)
+            result.update(prices)
+            for code in chunk:
+                if not is_today_quote(result.get(code), today_dash):
+                    next_pending.append(code)
+            time.sleep(0.05 if size > 1 else 0.02)
+
+        if next_pending and size != 1:
+            log.info(f"  新浪{label}仍缺 {len(next_pending)} 只，继续降级重试")
+        pending = next_pending
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -498,13 +539,12 @@ def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0, use_sina_today=Fa
     # 如果是daily模式且使用新浪接口，批量获取今日价格
     if mode == "daily" and use_sina_today:
         log.info("使用新浪接口批量获取今日价格...")
-        batch_size = 100
         all_codes = [code for code, _ in stock_rows]
         today_dash = datetime.today().strftime("%Y-%m-%d")
 
-        for batch_start in range(0, len(all_codes), batch_size):
-            batch_codes = all_codes[batch_start:batch_start + batch_size]
-            sina_prices = get_price_sina_batch(batch_codes)
+        for batch_start in range(0, len(all_codes), SINA_BATCH_SIZE):
+            batch_codes = all_codes[batch_start:batch_start + SINA_BATCH_SIZE]
+            sina_prices = get_price_sina_with_fallback(batch_codes, today_dash)
 
             for code in batch_codes:
                 row = sina_prices.get(code)

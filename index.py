@@ -30,6 +30,7 @@ import logging
 import sys
 import io
 import time
+from collections import Counter
 
 # ── 依赖 xlrd（读取老格式.xls）和 openpyxl（读取.xlsx）
 try:
@@ -49,6 +50,8 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────
 DB_PATH = "stock_data.db"
 DEFAULT_CHANNEL = "csindex"
+MIN_WEIGHT_COVERAGE = 0.98
+MIN_WEIGHT_SUM = 95.0
 
 # 中证指数官网成分股下载URL模板
 # {code} 替换为指数代码，如 000300
@@ -447,6 +450,19 @@ def merge_constituent_weights(constituents, weight_rows):
     return matched
 
 
+def dominant_value(rows, key):
+    values = [row.get(key) for row in rows if row.get(key)]
+    if not values:
+        return None
+    return Counter(values).most_common(1)[0][0]
+
+
+def clear_constituent_weights(constituents):
+    for item in constituents:
+        item.pop("weight", None)
+        item.pop("weight_date", None)
+
+
 def enrich_csindex_weights(index_code, constituents, headers):
     """中证成分文件不带权重；权重在 closeweight 独立文件。"""
     url = CSINDEX_WEIGHT_URL_TEMPLATE.format(code=index_code)
@@ -455,9 +471,22 @@ def enrich_csindex_weights(index_code, constituents, headers):
         content = download_xls(url, headers)
         weight_rows = parse_xls(content, index_code)
         matched = merge_constituent_weights(constituents, weight_rows)
+        total = len(constituents)
+        coverage = matched / total if total else 0
+        weight_sum = sum(item.get("weight") or 0 for item in constituents)
+        constituent_date = dominant_value(constituents, "as_of_date")
+        weight_date = dominant_value(weight_rows, "weight_date") or dominant_value(weight_rows, "as_of_date")
         log.info(
-            f"  权重合并完成，权重文件 {len(weight_rows)} 条，匹配当前成分 {matched} 条"
+            f"  权重合并完成，权重文件 {len(weight_rows)} 条，匹配当前成分 {matched} 条，"
+            f"覆盖率 {coverage:.1%}，权重和 {weight_sum:.3f}"
         )
+        if coverage < MIN_WEIGHT_COVERAGE or weight_sum < MIN_WEIGHT_SUM:
+            clear_constituent_weights(constituents)
+            log.warning(
+                f"  权重覆盖不足，已丢弃本次权重，避免新成分和旧权重混用: "
+                f"成分日期={constituent_date or '-'} 权重日期={weight_date or '-'} "
+                f"覆盖率={coverage:.1%} 权重和={weight_sum:.3f}"
+            )
     except requests.HTTPError as e:
         log.warning(f"  权重文件下载失败，保留无权重成分: {e}")
     except Exception as e:

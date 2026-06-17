@@ -1618,9 +1618,12 @@ async function showConstituents(code) {
     if (!res.ok) throw new Error(data.error || '加载失败');
 
     document.getElementById('weightModalTitle').textContent =
-      data.weight_count ? `${data.name} 成分股权重 Top 10` : `${data.name} 成分股前 10`;
+      data.weight_complete ? `${data.name} 成分股权重 Top 10` : `${data.name} 成分股前 10`;
     const updated = data.updated_at ? ` · 成分股更新 ${data.updated_at}` : '';
-    const modeText = data.weight_count ? '按权重排序' : '暂无权重，显示成分股前 10';
+    const coverage = data.total_count ? Math.round((data.weight_coverage || 0) * 100) : 0;
+    const modeText = data.weight_complete
+      ? '按权重排序'
+      : (data.weight_count ? `权重不完整 ${coverage}%，显示成分股前 10` : '暂无权重，显示成分股前 10');
     const weightDate = data.weight_date ? ` · 权重日期 ${data.weight_date}` : '';
     document.getElementById('weightModalMeta').textContent =
       `${data.code} · 共 ${data.total_count} 只 · 有权重 ${data.weight_count} 只 · ${modeText}${weightDate}${updated}`;
@@ -2276,6 +2279,7 @@ def api_index_constituents():
             SELECT
                 COUNT(*) AS total_count,
                 SUM(CASE WHEN weight IS NOT NULL THEN 1 ELSE 0 END) AS weight_count,
+                SUM(CASE WHEN weight IS NOT NULL THEN weight ELSE 0 END) AS weight_sum,
                 MAX(weight_date) AS weight_date,
                 MAX(updated_at) AS updated_at
             FROM index_constituents
@@ -2283,7 +2287,11 @@ def api_index_constituents():
         """, (code,)).fetchone()
 
         weight_count = summary["weight_count"] or 0
-        if weight_count:
+        total_count = summary["total_count"] or 0
+        weight_sum = summary["weight_sum"] or 0
+        weight_coverage = weight_count / total_count if total_count else 0
+        weight_complete = weight_coverage >= 0.98 and weight_sum >= 95.0
+        if weight_complete:
             rows = conn.execute("""
                 SELECT
                     ic.stock_code,
@@ -2304,8 +2312,8 @@ def api_index_constituents():
                     ic.stock_code,
                     COALESCE(s.name, ic.stock_name) AS stock_name,
                     ic.exchange,
-                    ic.weight,
-                    ic.weight_date
+                    NULL AS weight,
+                    NULL AS weight_date
                 FROM index_constituents ic
                 LEFT JOIN stocks s ON s.code = ic.stock_code
                 WHERE ic.index_code = ?
@@ -2316,8 +2324,11 @@ def api_index_constituents():
         return jsonify({
             "code": idx["code"],
             "name": idx["name"],
-            "total_count": summary["total_count"] or 0,
+            "total_count": total_count,
             "weight_count": weight_count,
+            "weight_sum": weight_sum,
+            "weight_coverage": weight_coverage,
+            "weight_complete": weight_complete,
             "weight_date": summary["weight_date"],
             "updated_at": summary["updated_at"],
             "rows": [
