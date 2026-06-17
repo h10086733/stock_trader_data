@@ -324,6 +324,20 @@ def load_pattern_progress(job_key="pattern_backfill"):
     return data
 
 
+def ensure_daily_price_indexes(conn):
+    table = conn.execute("""
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = 'daily_prices'
+    """).fetchone()
+    if not table:
+        return
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dp_date ON daily_prices(trade_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dp_code_date ON daily_prices(code, trade_date)")
+    conn.commit()
+
+
 def clamp(value, low, high):
     return max(low, min(high, value))
 
@@ -1563,11 +1577,12 @@ def load_daily_histories_for_pattern(conn, codes, trade_date, lookback_days):
 
 
 def load_daily_histories_for_pattern_range(conn, codes, start_date, end_date,
-                                           lookback_days):
+                                           lookback_days, progress=None):
     histories = {code: [] for code in codes}
     start_dt = datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=lookback_days)
     history_start = start_dt.strftime("%Y-%m-%d")
-    for batch in chunked(codes, 600):
+    batches = list(chunked(codes, 600))
+    for batch_index, batch in enumerate(batches, 1):
         placeholders = ",".join("?" for _ in batch)
         rows = conn.execute(f"""
             SELECT code, trade_date, open, close, high, low, volume, amount,
@@ -1580,6 +1595,8 @@ def load_daily_histories_for_pattern_range(conn, codes, start_date, end_date,
         """, batch + [history_start, end_date]).fetchall()
         for row in rows:
             histories[row["code"]].append(row)
+        if progress:
+            progress(batch_index, len(batches), len(rows))
     return histories
 
 
@@ -1870,7 +1887,7 @@ def perform_pattern_scan_with_histories(params, stocks, histories, market_dates,
     return {"meta": meta, "rows": rows}, 200
 
 
-def get_pattern_backfill_trade_dates(conn, end_date=None, days=3650):
+def get_pattern_backfill_trade_dates(conn, end_date=None, days=548):
     end_date = end_date or latest_daily_trade_date(conn)
     start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)
     start_date = start_dt.strftime("%Y-%m-%d")
@@ -1884,11 +1901,22 @@ def get_pattern_backfill_trade_dates(conn, end_date=None, days=3650):
     return [r["trade_date"] for r in rows]
 
 
-def run_pattern_backfill(params, days=3650, end_date=None, progress=None):
+def run_pattern_backfill(params, days=548, end_date=None, progress=None):
     started_at = time.time()
     conn = get_db()
     try:
         ensure_pattern_tables(conn)
+        if progress:
+            progress({
+                "phase": "indexes",
+                "trade_date": end_date or params.get("trade_date"),
+                "picked": 0,
+                "saved": 0,
+                "matched_rows_so_far": 0,
+                "matched_days_so_far": 0,
+                "message": "检查历史K线索引",
+            }, 0, 0)
+        ensure_daily_price_indexes(conn)
         trade_dates = get_pattern_backfill_trade_dates(
             conn,
             end_date=end_date or params.get("trade_date"),
@@ -1904,14 +1932,61 @@ def run_pattern_backfill(params, days=3650, end_date=None, progress=None):
                 "elapsed_s": 0,
                 "results": [],
             }
+        if progress:
+            progress({
+                "phase": "trade_dates",
+                "trade_date": trade_dates[0],
+                "picked": 0,
+                "saved": 0,
+                "matched_rows_so_far": 0,
+                "matched_days_so_far": 0,
+                "message": f"找到 {len(trade_dates)} 个交易日，准备加载股票池",
+            }, 0, len(trade_dates))
         stocks = load_stock_universe(conn, pool=params["pool"], index_code=params["index_code"])
+        if progress:
+            progress({
+                "phase": "stocks",
+                "trade_date": trade_dates[0],
+                "picked": 0,
+                "saved": 0,
+                "matched_rows_so_far": 0,
+                "matched_days_so_far": 0,
+                "message": f"股票池 {len(stocks)} 只，正在加载历史K线",
+            }, 0, len(trade_dates))
+
+        def history_progress(batch_index, batch_total, row_count):
+            if progress:
+                progress({
+                    "phase": "history",
+                    "trade_date": trade_dates[0],
+                    "picked": 0,
+                    "saved": 0,
+                    "matched_rows_so_far": 0,
+                    "matched_days_so_far": 0,
+                    "message": (
+                        f"正在加载历史K线 {batch_index}/{batch_total} 批，"
+                        f"本批 {row_count} 条"
+                    ),
+                }, 0, len(trade_dates))
+
         histories = load_daily_histories_for_pattern_range(
             conn,
             [s["code"] for s in stocks],
             trade_dates[0],
             trade_dates[-1],
             params["lookback_days"],
+            progress=history_progress,
         )
+        if progress:
+            progress({
+                "phase": "history_done",
+                "trade_date": trade_dates[0],
+                "picked": 0,
+                "saved": 0,
+                "matched_rows_so_far": 0,
+                "matched_days_so_far": 0,
+                "message": "历史K线加载完成，开始逐日扫描",
+            }, 0, len(trade_dates))
     finally:
         conn.close()
 
@@ -1967,7 +2042,7 @@ def run_pattern_backfill(params, days=3650, end_date=None, progress=None):
     }
 
 
-def run_pattern_backfill_job(params, days=3650, end_date=None, job_key="pattern_backfill"):
+def run_pattern_backfill_job(params, days=548, end_date=None, job_key="pattern_backfill"):
     started_at = time.time()
     save_pattern_progress(
         job_key,
@@ -1989,6 +2064,7 @@ def run_pattern_backfill_job(params, days=3650, end_date=None, job_key="pattern_
 
     def on_progress(item, index, total):
         picked = item.get("picked", 0)
+        message = item.get("message") or f"正在回扫 {item.get('trade_date')}，当天命中 {picked} 条"
         save_pattern_progress(
             job_key,
             job_type="backfill",
@@ -2000,7 +2076,7 @@ def run_pattern_backfill_job(params, days=3650, end_date=None, job_key="pattern_
             matched_rows=item.get("matched_rows_so_far", 0),
             matched_days=item.get("matched_days_so_far", 0),
             elapsed_s=round(time.time() - started_at, 1),
-            message=f"正在回扫 {item.get('trade_date')}，当天命中 {picked} 条",
+            message=message,
             error=None,
         )
 
@@ -2172,7 +2248,7 @@ def load_latest_pattern_result(conn, trade_date=None):
     }
 
 
-def load_pattern_history(conn, days=3650, hits_only=True, limit_dates=500):
+def load_pattern_history(conn, days=548, hits_only=True, limit_dates=500):
     ensure_pattern_tables(conn)
     row = conn.execute("""
         SELECT MAX(trade_date) AS end_date
@@ -3701,7 +3777,7 @@ PATTERN_HTML = """<!DOCTYPE html>
   </label>
   <button id="scanBtn" onclick="scan()">扫描并保存</button>
   <button class="secondary" onclick="loadLatest()">最近结果</button>
-  <button class="secondary" id="backfillBtn" onclick="backfillTenYears()">回扫10年</button>
+  <button class="secondary" id="backfillBtn" onclick="backfillEighteenMonths()">回扫1.5年</button>
 </div>
 
 <div class="status">
@@ -3782,7 +3858,8 @@ function progressText(job) {
     const current = Number(job.current_index || 0);
     const pct = total > 0 ? ` ${Math.floor(current * 100 / total)}%` : '';
     const hits = job.matched_rows === null || job.matched_rows === undefined ? '' : ` 命中${job.matched_rows}`;
-    return `${current}/${total || '?'}${pct}${hits}`;
+    const prefix = job.message ? `${job.message} · ` : '';
+    return `${prefix}${current}/${total || '?'}${pct}${hits}`;
   }
   if (job.status === 'done') {
     return `完成 ${job.matched_days || 0}天/${job.matched_rows || 0}条`;
@@ -3801,7 +3878,7 @@ async function loadPatternProgress(renderBox=false) {
     const detail = job.trade_date ? `当前 ${esc(job.trade_date)} · ` : '';
     const elapsed = job.elapsed_s === null || job.elapsed_s === undefined ? '' : ` · ${fmt(job.elapsed_s, 1)}s`;
     document.getElementById('history').innerHTML =
-      `<div class="loading"><span class="spinner"></span>正在回扫最近10年：${detail}${esc(text)}${elapsed}</div>`;
+      `<div class="loading"><span class="spinner"></span>正在回扫最近1.5年：${detail}${esc(text)}${elapsed}</div>`;
   }
   return job;
 }
@@ -3853,7 +3930,7 @@ function render(data, savedText='—') {
 function renderHistory(data) {
   const runs = data.runs || [];
   if (!runs.length) {
-    document.getElementById('history').innerHTML = '<div class="loading">最近10年暂无历史命中记录</div>';
+    document.getElementById('history').innerHTML = '<div class="loading">最近1.5年暂无历史命中记录</div>';
     return;
   }
   document.getElementById('history').innerHTML = `<div class="history">${runs.map(run => `
@@ -3886,7 +3963,7 @@ async function loadLatest() {
 async function loadHistory() {
   document.getElementById('history').innerHTML = '<div class="loading"><span class="spinner"></span>加载历史…</div>';
   try {
-    const res = await fetch('/api/pattern/history?days=3650&hitsOnly=1&limitDates=500');
+    const res = await fetch('/api/pattern/history?days=548&hitsOnly=1&limitDates=500');
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '历史加载失败');
     renderHistory(data);
@@ -3912,14 +3989,14 @@ async function scan() {
   }
 }
 
-async function backfillTenYears() {
+async function backfillEighteenMonths() {
   const btn = document.getElementById('backfillBtn');
   btn.disabled = true;
   btn.textContent = '回扫中…';
-  document.getElementById('history').innerHTML = '<div class="loading"><span class="spinner"></span>正在回扫最近10年…</div>';
+  document.getElementById('history').innerHTML = '<div class="loading"><span class="spinner"></span>正在回扫最近1.5年…</div>';
   try {
     const p = new URLSearchParams(params());
-    p.set('days', '3650');
+    p.set('days', '548');
     p.delete('save');
     const res = await fetch('/api/pattern/backfill?' + p.toString());
     const data = await res.json();
@@ -3928,7 +4005,7 @@ async function backfillTenYears() {
       const job = await loadPatternProgress(true);
       if (job.status === 'done') {
         document.getElementById('statSaved').textContent =
-          `10年 ${job.matched_days || 0} 天 / ${job.matched_rows || 0} 条`;
+          `1.5年 ${job.matched_days || 0} 天 / ${job.matched_rows || 0} 条`;
         break;
       }
       if (job.status === 'error') {
@@ -3942,7 +4019,7 @@ async function backfillTenYears() {
     document.getElementById('history').innerHTML = `<div class="loading">回扫失败：${esc(err.message)}</div>`;
   } finally {
     btn.disabled = false;
-    btn.textContent = '回扫10年';
+    btn.textContent = '回扫1.5年';
   }
 }
 
@@ -4165,7 +4242,7 @@ def api_pattern_scan():
 
 @app.route("/api/pattern/history")
 def api_pattern_history():
-    days = to_int_arg("days", 3650, 1, 3650)
+    days = to_int_arg("days", 548, 1, 3650)
     limit_dates = to_int_arg("limitDates", 500, 1, 1000)
     hits_only = request.args.get("hitsOnly", "1") not in ("0", "false", "no")
     conn = get_db()
@@ -4186,7 +4263,7 @@ def api_pattern_backfill():
     if not SCAN_LOCK.acquire(blocking=False):
         return jsonify({"error": "已有扫描任务进行中，请等待上一次扫描结束"}), 429
     params = build_pattern_params(request.args)
-    days = to_int_arg("days", 3650, 1, 3650)
+    days = to_int_arg("days", 548, 1, 3650)
     save_pattern_progress(
         "pattern_backfill",
         job_type="backfill",
@@ -5685,6 +5762,9 @@ def print_pattern_summary(payload, status_code, run_id=None, saved=None):
 
 
 def print_pattern_backfill_progress(item, index, total):
+    if item.get("phase"):
+        print(f"[{index}/{total}] {item.get('message', item.get('phase'))}")
+        return
     print(
         f"[{index}/{total}] {item['trade_date']} "
         f"picked={item['picked']} saved={item['saved']} "
@@ -5832,7 +5912,7 @@ def parse_cli_args():
                         help="最低总市值，单位亿元；0表示不限制")
     parser.add_argument("--pattern-min-amount", type=float, default=None,
                         help="收盘形态扫描最低成交额，单位万元；不填则不限制")
-    parser.add_argument("--pattern-backfill-days", type=int, default=3650,
+    parser.add_argument("--pattern-backfill-days", type=int, default=548,
                         help="四针形态历史回扫天数")
     return parser.parse_args()
 
