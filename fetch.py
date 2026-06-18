@@ -154,6 +154,14 @@ def safe_get_sina(symbols, timeout=10):
     raise RuntimeError(f"新浪请求失败，已重试 {MAX_RETRIES} 次: {url}")
 
 
+def get_sina_once(symbols, timeout=3):
+    """单次新浪行情请求，用于交易日探活，避免入口被重试拖慢。"""
+    url = f"{SINA_PRICE_URL}{symbols}"
+    resp = requests.get(url, headers=get_sina_headers(), timeout=timeout)
+    resp.raise_for_status()
+    return resp
+
+
 def parse_sina_quote_line(line):
     """解析单行新浪行情，返回 (code, fields)"""
     if "=" not in line or '"' not in line:
@@ -190,7 +198,7 @@ def is_trading_day():
 
     try:
         # 用上证指数判断是否有交易
-        resp = safe_get_sina("sh000001", timeout=5)
+        resp = get_sina_once("sh000001", timeout=3)
         parsed = parse_sina_quote_line(resp.text.strip())
         if not parsed:
             return True
@@ -544,6 +552,7 @@ def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0, use_sina_today=Fa
 
         for batch_start in range(0, len(all_codes), SINA_BATCH_SIZE):
             batch_codes = all_codes[batch_start:batch_start + SINA_BATCH_SIZE]
+            batch_end = min(batch_start + len(batch_codes), total)
             sina_prices = get_price_sina_with_fallback(batch_codes, today_dash)
 
             for code in batch_codes:
@@ -562,11 +571,11 @@ def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0, use_sina_today=Fa
                     fail += 1
                     fail_codes.append(code)
 
-            if (batch_start + batch_size) % 500 == 0 or (batch_start + batch_size) >= total:
+            if batch_end % 500 == 0 or batch_end >= total:
                 elapsed = (time.time() - t0) / 60
                 done = ok + fail
                 eta = (elapsed / done * (total - done)) if done > 0 else 0
-                log.info(f"  进度 {done}/{total}  成功:{ok}  失败:{fail}  "
+                log.info(f"  进度 {batch_end}/{total}  成功:{ok}  失败:{fail}  "
                         f"已用:{elapsed:.1f}min  预计剩余:{eta:.1f}min")
 
             time.sleep(0.1)  # 批量请求间隔

@@ -499,7 +499,7 @@ def build_pattern_params(source=None):
         ),
         "min_amount_wan": coerce_float(
             get_source_value(source, "minAmount", "min_amount"),
-            0, 0, 1000000,
+            8000, 0, 1000000,
         ),
         "min_turnover": coerce_float(
             get_source_value(source, "minTurnover", "min_turnover"),
@@ -555,7 +555,7 @@ def build_pattern_params(source=None):
         ),
         "max_bottom_position": coerce_float(
             get_source_value(source, "maxBottomPosition", "max_bottom_position"),
-            35, 5, 90,
+            30, 5, 90,
         ),
         "min_prior_drop_pct": coerce_float(
             get_source_value(source, "minPriorDropPct", "min_prior_drop_pct"),
@@ -567,15 +567,15 @@ def build_pattern_params(source=None):
         ),
         "min_bottom_volume_ratio": coerce_float(
             get_source_value(source, "minBottomVolumeRatio", "min_bottom_volume_ratio"),
-            1.2, 0, 10,
+            1.5, 0, 10,
         ),
         "min_bottom_rebound_pct": coerce_float(
             get_source_value(source, "minBottomReboundPct", "min_bottom_rebound_pct"),
-            2.0, 0, 30,
+            3.0, 0, 30,
         ),
         "min_bottom_pct_change": coerce_float(
             get_source_value(source, "minBottomPctChange", "min_bottom_pct_change"),
-            2.0, -20, 20,
+            2.5, -20, 20,
         ),
         "min_bottom_strong_gain_pct": coerce_float(
             get_source_value(source, "minBottomStrongGainPct", "min_bottom_strong_gain_pct"),
@@ -587,11 +587,27 @@ def build_pattern_params(source=None):
         ),
         "min_bottom_close_position": coerce_float(
             get_source_value(source, "minBottomClosePosition", "min_bottom_close_position"),
-            55.0, 0, 100,
+            65.0, 0, 100,
         ),
         "require_bottom_close_above_prev": coerce_int(
             get_source_value(source, "requireBottomCloseAbovePrev", "require_bottom_close_above_prev"),
             1, 0, 1,
+        ),
+        "require_bottom_above_ma5": coerce_int(
+            get_source_value(source, "requireBottomAboveMa5", "require_bottom_above_ma5"),
+            1, 0, 1,
+        ),
+        "min_bottom_ma5_slope_pct": coerce_float(
+            get_source_value(source, "minBottomMa5SlopePct", "min_bottom_ma5_slope_pct"),
+            -1.0, -10, 10,
+        ),
+        "require_bottom_not_close_new_low": coerce_int(
+            get_source_value(source, "requireBottomNotCloseNewLow", "require_bottom_not_close_new_low"),
+            1, 0, 1,
+        ),
+        "bottom_new_low_lookback_days": coerce_int(
+            get_source_value(source, "bottomNewLowLookbackDays", "bottom_new_low_lookback_days"),
+            20, 5, 80,
         ),
         "limit": coerce_int(source.get("limit"), 10 if pattern_type == "bottom_reversal" else 80, 1, 300),
     }
@@ -1424,19 +1440,43 @@ def build_sparkline(bars, width=132, height=34):
     )
 
 
+MIN_DAILY_COVERAGE_RATIO = 0.8
+
+
+def daily_price_coverage_threshold(conn):
+    row = conn.execute("""
+        SELECT COUNT(*) AS count
+        FROM stocks
+        WHERE COALESCE(is_delisted, 0) = 0
+    """).fetchone()
+    total = row["count"] if row and row["count"] else 0
+    return max(1, math.floor(total * MIN_DAILY_COVERAGE_RATIO))
+
+
 def latest_daily_trade_date(conn):
-    row = conn.execute("SELECT MAX(trade_date) AS trade_date FROM daily_prices").fetchone()
+    min_count = daily_price_coverage_threshold(conn)
+    row = conn.execute("""
+        SELECT trade_date
+        FROM daily_prices
+        GROUP BY trade_date
+        HAVING COUNT(DISTINCT code) >= ?
+        ORDER BY trade_date DESC
+        LIMIT 1
+    """, (min_count,)).fetchone()
     return row["trade_date"] if row and row["trade_date"] else default_scan_trade_date()
 
 
 def recent_market_trade_dates(conn, trade_date, count):
+    min_count = daily_price_coverage_threshold(conn)
     rows = conn.execute("""
-        SELECT DISTINCT trade_date
+        SELECT trade_date
         FROM daily_prices
         WHERE trade_date <= ?
+        GROUP BY trade_date
+        HAVING COUNT(DISTINCT code) >= ?
         ORDER BY trade_date DESC
         LIMIT ?
-    """, (trade_date, count)).fetchall()
+    """, (trade_date, min_count, count)).fetchall()
     return list(reversed([r["trade_date"] for r in rows]))
 
 
@@ -1983,7 +2023,7 @@ def detect_bottom_reversal(series, params):
 
 
 def bottom_reversal_confirmation(series, pattern, context, low_pattern,
-                                 volume_ratio, ma20, params):
+                                 volume_ratio, ma5, ma5_slope_pct, ma20, params):
     last = series[-1]
     prev = series[-2] if len(series) >= 2 else None
     pct_change = last["pct_change"] if last["pct_change"] is not None else 0
@@ -2008,6 +2048,14 @@ def bottom_reversal_confirmation(series, pattern, context, low_pattern,
     min_volume_ratio = params.get("min_bottom_volume_ratio") or 0
     if min_volume_ratio and (volume_ratio is None or volume_ratio < min_volume_ratio):
         return None
+
+    above_ma5 = ma5 is not None and close_price >= ma5
+    if params.get("require_bottom_above_ma5") and not above_ma5:
+        return None
+    min_ma5_slope = params.get("min_bottom_ma5_slope_pct")
+    if min_ma5_slope is not None and ma5_slope_pct is not None:
+        if ma5_slope_pct < min_ma5_slope:
+            return None
 
     above_ma20 = ma20 is not None and close_price >= ma20
     strong_patterns = ("看涨吞没", "曙光初现", "早晨之星")
@@ -2037,6 +2085,10 @@ def bottom_reversal_confirmation(series, pattern, context, low_pattern,
         confirm_reasons.append("高于前收")
     if volume_ratio is not None:
         confirm_reasons.append(f"量比{volume_ratio:.2f}")
+    if above_ma5:
+        confirm_reasons.append("收回MA5")
+    if ma5_slope_pct is not None:
+        confirm_reasons.append(f"MA5斜率{ma5_slope_pct:.1f}%")
 
     if params.get("require_bottom_confirm"):
         bullish_pattern = pattern["name"] in strong_patterns
@@ -2054,7 +2106,36 @@ def bottom_reversal_confirmation(series, pattern, context, low_pattern,
         "rebound_pct": rebound_pct,
         "close_position_pct": close_position_pct,
         "close_above_prev": close_above_prev,
+        "above_ma5": above_ma5,
+        "ma5_slope_pct": ma5_slope_pct,
         "reasons": confirm_reasons,
+    }
+
+
+def bottom_reversal_weak_filter(series, pattern_len, params):
+    last = series[-1]
+    close_price = last["close"]
+    if close_price is None:
+        return None
+
+    lookback = min(params.get("bottom_new_low_lookback_days") or 20,
+                   max(0, len(series) - pattern_len))
+    prior_rows = series[max(0, len(series) - pattern_len - lookback):len(series) - pattern_len]
+    prior_closes = [r["close"] for r in prior_rows if r["close"] is not None]
+    prior_close_low = min(prior_closes) if prior_closes else None
+    close_new_low = bool(prior_close_low is not None and close_price <= prior_close_low)
+
+    if params.get("require_bottom_not_close_new_low") and close_new_low:
+        return None
+
+    close_lift_pct = (
+        (close_price - prior_close_low) / prior_close_low * 100.0
+        if prior_close_low else None
+    )
+    return {
+        "close_new_low": close_new_low,
+        "prior_close_low": prior_close_low,
+        "close_lift_pct": close_lift_pct,
     }
 
 
@@ -2080,6 +2161,9 @@ def evaluate_bottom_reversal_candidate(stock, series, params):
     volumes = [r["volume"] for r in series[-20:] if r["volume"] is not None]
     if len(closes) < 40:
         return None
+    ma5 = sum(closes[-5:]) / 5
+    prev_ma5 = sum(closes[-6:-1]) / 5 if len(closes) >= 6 else None
+    ma5_slope_pct = ((ma5 - prev_ma5) / prev_ma5 * 100.0) if prev_ma5 else None
     ma20 = sum(closes[-20:]) / 20
     ma40 = sum(closes[-40:]) / 40
     ma40_distance = abs(last["close"] - ma40) / ma40 * 100.0 if ma40 else None
@@ -2099,8 +2183,11 @@ def evaluate_bottom_reversal_candidate(stock, series, params):
     low_pattern = min(r["low"] for r in pattern_rows if r["low"] is not None)
     high_pattern = max(r["high"] for r in pattern_rows if r["high"] is not None)
     range_pct = (high_pattern - low_pattern) / last["close"] * 100.0 if last["close"] else None
+    weak_meta = bottom_reversal_weak_filter(series, pattern["days"], params)
+    if not weak_meta:
+        return None
     confirmation = bottom_reversal_confirmation(
-        series, pattern, context, low_pattern, volume_ratio, ma20, params
+        series, pattern, context, low_pattern, volume_ratio, ma5, ma5_slope_pct, ma20, params
     )
     if not confirmation:
         return None
@@ -2112,8 +2199,10 @@ def evaluate_bottom_reversal_candidate(stock, series, params):
     )
     drop_bonus = clamp((context["prior_drop_pct"] - params["min_prior_drop_pct"]) / 15 * 10, 0, 10)
     volume_bonus = clamp(((volume_ratio or 1.0) - 1.0) / 1.0 * 8, 0, 8)
+    ma5_bonus = 4 if confirmation.get("above_ma5") else 0
+    ma5_slope_bonus = clamp(((ma5_slope_pct or -1.0) + 1.0) / 3.0 * 4, 0, 4)
     ma_bonus = 5 if last["close"] >= ma20 else 0
-    score = pattern["score"] + bottom_bonus + drop_bonus + volume_bonus + ma_bonus
+    score = pattern["score"] + bottom_bonus + drop_bonus + volume_bonus + ma5_bonus + ma5_slope_bonus + ma_bonus
 
     reasons = list(pattern["reasons"])
     reasons.append(f"近{params['bottom_lookback_days']}日低位{context['bottom_position_pct']:.0f}%")
@@ -2123,6 +2212,8 @@ def evaluate_bottom_reversal_candidate(stock, series, params):
         reasons.append("收在MA20上方")
     if ma40_distance is not None:
         reasons.append(f"MA40距离{ma40_distance:.1f}%")
+    if weak_meta.get("close_lift_pct") is not None:
+        reasons.append(f"脱离前低{weak_meta['close_lift_pct']:.1f}%")
 
     chart_series = series[-params["chart_bars"]:]
     return {
@@ -2152,6 +2243,12 @@ def evaluate_bottom_reversal_candidate(stock, series, params):
         "rebound_pct": round(confirmation["rebound_pct"], 2),
         "close_position_pct": round(confirmation["close_position_pct"], 1),
         "close_above_prev": confirmation["close_above_prev"],
+        "above_ma5": confirmation["above_ma5"],
+        "ma5": round(ma5, 3),
+        "ma5_slope_pct": round(ma5_slope_pct, 2) if ma5_slope_pct is not None else None,
+        "close_new_low": weak_meta["close_new_low"],
+        "prior_close_low": round(weak_meta["prior_close_low"], 3) if weak_meta["prior_close_low"] is not None else None,
+        "close_lift_pct": round(weak_meta["close_lift_pct"], 2) if weak_meta["close_lift_pct"] is not None else None,
         "ma20": round(ma20, 3),
         "ma40": round(ma40, 3),
         "ma40_distance": round(ma40_distance, 2) if ma40_distance is not None else None,
@@ -2286,6 +2383,10 @@ def perform_pattern_scan(params, started_at=None):
             "require_bottom_confirm": params["require_bottom_confirm"],
             "min_bottom_close_position": params["min_bottom_close_position"],
             "require_bottom_close_above_prev": params["require_bottom_close_above_prev"],
+            "require_bottom_above_ma5": params["require_bottom_above_ma5"],
+            "min_bottom_ma5_slope_pct": params["min_bottom_ma5_slope_pct"],
+            "require_bottom_not_close_new_low": params["require_bottom_not_close_new_low"],
+            "bottom_new_low_lookback_days": params["bottom_new_low_lookback_days"],
             "min_amount_wan": params["min_amount_wan"],
             "min_turnover": params["min_turnover"],
             "min_market_cap_yi": params["min_market_cap_yi"],
@@ -2362,6 +2463,10 @@ def perform_pattern_scan_with_histories(params, stocks, histories, market_dates,
             "require_bottom_confirm": params["require_bottom_confirm"],
             "min_bottom_close_position": params["min_bottom_close_position"],
             "require_bottom_close_above_prev": params["require_bottom_close_above_prev"],
+            "require_bottom_above_ma5": params["require_bottom_above_ma5"],
+            "min_bottom_ma5_slope_pct": params["min_bottom_ma5_slope_pct"],
+            "require_bottom_not_close_new_low": params["require_bottom_not_close_new_low"],
+            "bottom_new_low_lookback_days": params["bottom_new_low_lookback_days"],
             "min_amount_wan": params["min_amount_wan"],
             "min_turnover": params["min_turnover"],
             "min_market_cap_yi": params["min_market_cap_yi"],
@@ -2378,13 +2483,16 @@ def get_pattern_backfill_trade_dates(conn, end_date=None, days=30):
     end_date = end_date or latest_daily_trade_date(conn)
     start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)
     start_date = start_dt.strftime("%Y-%m-%d")
+    min_count = daily_price_coverage_threshold(conn)
     rows = conn.execute("""
-        SELECT DISTINCT trade_date
+        SELECT trade_date
         FROM daily_prices
         WHERE trade_date >= ?
           AND trade_date <= ?
+        GROUP BY trade_date
+        HAVING COUNT(DISTINCT code) >= ?
         ORDER BY trade_date
-    """, (start_date, end_date)).fetchall()
+    """, (start_date, end_date, min_count)).fetchall()
     return [r["trade_date"] for r in rows]
 
 
@@ -2827,9 +2935,28 @@ def saved_pattern_row_passes_filters(row, run_params, filters=None):
             "require_bottom_close_above_prev",
             (run_params or {}).get("require_bottom_close_above_prev", 0),
         )
+        require_above_ma5 = filters.get(
+            "require_bottom_above_ma5",
+            (run_params or {}).get("require_bottom_above_ma5", 0),
+        )
+        min_ma5_slope = filters.get(
+            "min_bottom_ma5_slope_pct",
+            (run_params or {}).get("min_bottom_ma5_slope_pct"),
+        )
+        require_not_close_new_low = filters.get(
+            "require_bottom_not_close_new_low",
+            (run_params or {}).get("require_bottom_not_close_new_low", 0),
+        )
         if row.get("close_position_pct") is None or row.get("close_position_pct") < min_close_position:
             return False
         if require_close_above_prev and not row.get("close_above_prev"):
+            return False
+        if require_above_ma5 and not row.get("above_ma5"):
+            return False
+        if min_ma5_slope is not None and row.get("ma5_slope_pct") is not None:
+            if row.get("ma5_slope_pct") < min_ma5_slope:
+                return False
+        if require_not_close_new_low and row.get("close_new_low") is True:
             return False
         if row.get("pct") is None or row.get("pct") < min_pct_change:
             return False
@@ -2969,6 +3096,10 @@ def load_latest_pattern_result(conn, trade_date=None, pattern_type=None, filters
                 "require_bottom_confirm": params.get("require_bottom_confirm"),
                 "min_bottom_close_position": params.get("min_bottom_close_position"),
                 "require_bottom_close_above_prev": params.get("require_bottom_close_above_prev"),
+                "require_bottom_above_ma5": params.get("require_bottom_above_ma5"),
+                "min_bottom_ma5_slope_pct": params.get("min_bottom_ma5_slope_pct"),
+                "require_bottom_not_close_new_low": params.get("require_bottom_not_close_new_low"),
+                "bottom_new_low_lookback_days": params.get("bottom_new_low_lookback_days"),
             },
             "source_params": params,
         },
@@ -4625,7 +4756,7 @@ PATTERN_HTML = """<!DOCTYPE html>
     <input id="bottomLookbackDays" type="number" value="60" step="5">
   </label>
   <label>低位位置%
-    <input id="maxBottomPosition" type="number" value="35" step="5">
+    <input id="maxBottomPosition" type="number" value="30" step="5">
   </label>
   <label>前期跌幅%
     <input id="minPriorDropPct" type="number" value="10" step="0.5">
@@ -4634,16 +4765,16 @@ PATTERN_HTML = """<!DOCTYPE html>
     <input id="bottomMaxBodyPct" type="number" value="3.0" step="0.1">
   </label>
   <label>收盘位置%
-    <input id="minBottomClosePosition" type="number" value="55" step="5">
+    <input id="minBottomClosePosition" type="number" value="65" step="5">
   </label>
   <label>反转量比
-    <input id="minBottomVolumeRatio" type="number" value="1.2" step="0.1">
+    <input id="minBottomVolumeRatio" type="number" value="1.5" step="0.1">
   </label>
   <label>低点反弹%
-    <input id="minBottomReboundPct" type="number" value="2.0" step="0.5">
+    <input id="minBottomReboundPct" type="number" value="3.0" step="0.5">
   </label>
   <label>日涨幅≥%
-    <input id="minBottomPctChange" type="number" value="2.0" step="0.5">
+    <input id="minBottomPctChange" type="number" value="2.5" step="0.5">
   </label>
   <label>强形涨幅≥%
     <input id="minBottomStrongGainPct" type="number" value="3.0" step="0.5">
@@ -4654,8 +4785,26 @@ PATTERN_HTML = """<!DOCTYPE html>
       <option value="0">不要求</option>
     </select>
   </label>
+  <label>收回MA5
+    <select id="requireBottomAboveMa5">
+      <option value="1">要求</option>
+      <option value="0">不要求</option>
+    </select>
+  </label>
+  <label>MA5斜率≥%
+    <input id="minBottomMa5SlopePct" type="number" value="-1.0" step="0.5">
+  </label>
+  <label>非收盘新低
+    <select id="requireBottomNotCloseNewLow">
+      <option value="1">要求</option>
+      <option value="0">不要求</option>
+    </select>
+  </label>
+  <label>新低回看
+    <input id="bottomNewLowLookbackDays" type="number" value="20" step="5">
+  </label>
   <label>成交额万元
-    <input id="minAmount" type="number" value="0" step="1000">
+    <input id="minAmount" type="number" value="8000" step="1000">
   </label>
   <label>总市值亿
     <input id="minMarketCapYi" type="number" value="100" step="50">
@@ -4725,6 +4874,8 @@ function params() {
    'minPriorDropPct','bottomMaxBodyPct','minBottomClosePosition',
    'minBottomVolumeRatio','minBottomReboundPct','minBottomPctChange',
    'minBottomStrongGainPct','requireBottomCloseAbovePrev',
+   'requireBottomAboveMa5','minBottomMa5SlopePct',
+   'requireBottomNotCloseNewLow','bottomNewLowLookbackDays',
    'minAmount','minMarketCapYi','minTurnover'].forEach(id => {
     const value = document.getElementById(id).value;
     if (value !== '') p.set(id, value);
@@ -4826,6 +4977,9 @@ function rowCard(row) {
       ${metric('收盘位置', row.close_position_pct === null || row.close_position_pct === undefined ? '—' : `${fmt(row.close_position_pct, 1)}%`)}
       ${metric('形态天数', `${row.pattern_days ?? '—'}天`)}
       ${metric('量比', row.volume_ratio === null || row.volume_ratio === undefined ? '—' : fmt(row.volume_ratio, 2))}
+      ${metric('MA5', row.ma5 === null || row.ma5 === undefined ? '—' : fmt(row.ma5, 2))}
+      ${metric('MA5斜率', row.ma5_slope_pct === null || row.ma5_slope_pct === undefined ? '—' : `${fmt(row.ma5_slope_pct, 2)}%`)}
+      ${metric('脱离前低', row.close_lift_pct === null || row.close_lift_pct === undefined ? '—' : `${fmt(row.close_lift_pct, 2)}%`)}
       ${metric('最大实体', `${fmt(row.doji_body_pct, 2)}%`)}
       ${metric('形态振幅', `${fmt(row.range5_pct, 2)}%`)}
       ${metric('MA40距', row.ma40_distance === null || row.ma40_distance === undefined ? '—' : `${fmt(row.ma40_distance, 2)}%`)}
@@ -6782,6 +6936,10 @@ def build_cli_pattern_params(args):
         "require_bottom_confirm": args.pattern_require_bottom_confirm,
         "min_bottom_close_position": args.pattern_min_bottom_close_position,
         "require_bottom_close_above_prev": args.pattern_require_bottom_close_above_prev,
+        "require_bottom_above_ma5": args.pattern_require_bottom_above_ma5,
+        "min_bottom_ma5_slope_pct": args.pattern_min_bottom_ma5_slope_pct,
+        "require_bottom_not_close_new_low": args.pattern_require_bottom_not_close_new_low,
+        "bottom_new_low_lookback_days": args.pattern_bottom_new_low_lookback_days,
         "min_turnover": args.pattern_min_turnover,
         "min_market_cap_yi": args.pattern_min_market_cap_yi,
     })
@@ -7009,26 +7167,34 @@ def parse_cli_args():
                         help="四根K线中允许缺上影或下影的最大根数")
     parser.add_argument("--pattern-bottom-lookback-days", type=int, default=60,
                         help="底部反转低位判定回看天数")
-    parser.add_argument("--pattern-max-bottom-position", type=float, default=35.0,
+    parser.add_argument("--pattern-max-bottom-position", type=float, default=30.0,
                         help="底部反转收盘价在回看区间中的最高位置，单位%")
     parser.add_argument("--pattern-min-prior-drop-pct", type=float, default=10.0,
                         help="底部反转前期最小回撤幅度，单位%")
     parser.add_argument("--pattern-bottom-max-body-pct", type=float, default=3.0,
                         help="底部反转单根/星线最大实体幅度，单位%")
-    parser.add_argument("--pattern-min-bottom-volume-ratio", type=float, default=1.2,
+    parser.add_argument("--pattern-min-bottom-volume-ratio", type=float, default=1.5,
                         help="底部反转最低形态量比")
-    parser.add_argument("--pattern-min-bottom-rebound-pct", type=float, default=2.0,
+    parser.add_argument("--pattern-min-bottom-rebound-pct", type=float, default=3.0,
                         help="底部反转低点反弹下限，单位%")
-    parser.add_argument("--pattern-min-bottom-pct-change", type=float, default=2.0,
+    parser.add_argument("--pattern-min-bottom-pct-change", type=float, default=2.5,
                         help="底部反转当日涨幅下限，单位%")
     parser.add_argument("--pattern-min-bottom-strong-gain-pct", type=float, default=3.0,
                         help="组合反转形态最低当日涨幅，单位%")
     parser.add_argument("--pattern-require-bottom-confirm", type=int, default=1,
                         help="底部反转是否要求MA20/组合形态/高位收盘确认，1=要求，0=不要求")
-    parser.add_argument("--pattern-min-bottom-close-position", type=float, default=55.0,
+    parser.add_argument("--pattern-min-bottom-close-position", type=float, default=65.0,
                         help="底部反转当日收盘价在日内振幅中的最低位置，单位%")
     parser.add_argument("--pattern-require-bottom-close-above-prev", type=int, default=1,
                         help="底部反转是否要求收盘价高于前一日，1=要求，0=不要求")
+    parser.add_argument("--pattern-require-bottom-above-ma5", type=int, default=1,
+                        help="底部反转是否要求收盘价收回MA5，1=要求，0=不要求")
+    parser.add_argument("--pattern-min-bottom-ma5-slope-pct", type=float, default=-1.0,
+                        help="底部反转MA5斜率下限，单位%")
+    parser.add_argument("--pattern-require-bottom-not-close-new-low", type=int, default=1,
+                        help="底部反转是否要求收盘价不是近期收盘新低，1=要求，0=不要求")
+    parser.add_argument("--pattern-bottom-new-low-lookback-days", type=int, default=20,
+                        help="底部反转收盘新低过滤回看天数")
     parser.add_argument("--pattern-min-turnover", type=float, default=0.0,
                         help="最低换手率，单位%")
     parser.add_argument("--pattern-min-market-cap-yi", type=float, default=100.0,
