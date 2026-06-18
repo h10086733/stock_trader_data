@@ -39,6 +39,10 @@ STOCK_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 KLINE_URL      = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 SINA_PRICE_URL = "https://hq.sinajs.cn/list="  # 新浪实时行情接口
 SINA_REFERER   = "https://finance.sina.com.cn/"
+EASTMONEY_QUOTE_URLS = (
+    "https://push2delay.eastmoney.com/api/qt/ulist.np/get",
+    "https://push2.eastmoney.com/api/qt/ulist.np/get",
+)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -251,6 +255,73 @@ def get_price_sina_batch(codes):
         return {}
 
 
+def safe_float(value, default=None):
+    try:
+        if value in (None, "", "-"):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def get_price_eastmoney_batch(codes, market_by_code, today_dash):
+    """用东方财富实时接口补齐新浪失败的当日价格。"""
+    result = {}
+    fields = "f12,f2,f3,f5,f6,f15,f16,f17,f18"
+
+    for chunk in iter_chunks(list(codes), 50):
+        params = {
+            "fltt": 2,
+            "invt": 2,
+            "fields": fields,
+            "secids": ",".join(f"{market_by_code.get(code, '0')}.{code}" for code in chunk),
+        }
+        diff = []
+        for url in EASTMONEY_QUOTE_URLS:
+            for attempt in range(2):
+                try:
+                    resp = SESSION.get(
+                        url,
+                        params=params,
+                        headers=get_headers(),
+                        timeout=8,
+                    )
+                    resp.raise_for_status()
+                    diff = (resp.json().get("data") or {}).get("diff") or []
+                    if diff:
+                        break
+                except Exception as e:
+                    log.warning(f"  东方财富实时行情请求失败: {e} attempt={attempt+1}")
+                    time.sleep(0.25 * (attempt + 1))
+            if diff:
+                break
+
+        for item in diff:
+            code = str(item.get("f12") or "")
+            close = safe_float(item.get("f2"))
+            prev_close = safe_float(item.get("f18"))
+            if not code or not close or close <= 0:
+                continue
+            pct_change = safe_float(item.get("f3"))
+            if pct_change is None and prev_close:
+                pct_change = (close - prev_close) / prev_close * 100.0
+            result[code] = {
+                "trade_date": today_dash,
+                "open": safe_float(item.get("f17")),
+                "close": close,
+                "high": safe_float(item.get("f15")),
+                "low": safe_float(item.get("f16")),
+                # 东方财富 f5 对 A 股是手，和 daily_prices.volume 口径一致。
+                "volume": safe_float(item.get("f5"), 0) or 0,
+                "amount": safe_float(item.get("f6"), 0) or 0,
+                "pct_change": pct_change,
+                "turnover": None,
+            }
+        time.sleep(0.05)
+
+    return result
+
+
 def iter_chunks(items, size):
     for start in range(0, len(items), size):
         yield items[start:start + size]
@@ -288,6 +359,21 @@ def get_price_sina_with_fallback(codes, today_dash):
         pending = next_pending
 
     return result
+
+
+def get_price_today_with_fallback(codes, market_by_code, today_dash):
+    """先用新浪，新浪缺失的代码再用东方财富补齐。"""
+    result = get_price_sina_with_fallback(codes, today_dash)
+    missing = [code for code in codes if not is_today_quote(result.get(code), today_dash)]
+    if missing:
+        log.info(f"  新浪仍缺 {len(missing)} 只，改用东方财富补齐")
+        eastmoney_prices = get_price_eastmoney_batch(missing, market_by_code, today_dash)
+        result.update({
+            code: row for code, row in eastmoney_prices.items()
+            if is_today_quote(row, today_dash)
+        })
+    return result
+
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -546,17 +632,22 @@ def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0, use_sina_today=Fa
 
     # 如果是daily模式且使用新浪接口，批量获取今日价格
     if mode == "daily" and use_sina_today:
-        log.info("使用新浪接口批量获取今日价格...")
+        log.info("使用新浪接口批量获取今日价格，失败时用东方财富补齐...")
         all_codes = [code for code, _ in stock_rows]
+        market_by_code = {code: market for code, market in stock_rows}
         today_dash = datetime.today().strftime("%Y-%m-%d")
 
         for batch_start in range(0, len(all_codes), SINA_BATCH_SIZE):
             batch_codes = all_codes[batch_start:batch_start + SINA_BATCH_SIZE]
             batch_end = min(batch_start + len(batch_codes), total)
-            sina_prices = get_price_sina_with_fallback(batch_codes, today_dash)
+            realtime_prices = get_price_today_with_fallback(
+                batch_codes,
+                market_by_code,
+                today_dash,
+            )
 
             for code in batch_codes:
-                row = sina_prices.get(code)
+                row = realtime_prices.get(code)
                 if is_today_quote(row, today_dash):
                     try:
                         rows = [row]

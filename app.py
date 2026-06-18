@@ -507,7 +507,7 @@ def build_pattern_params(source=None):
         ),
         "min_market_cap_yi": coerce_float(
             get_source_value(source, "minMarketCapYi", "min_market_cap_yi"),
-            100, 0, 100000,
+            0, 0, 100000,
         ),
         "max_body_pct": coerce_float(
             get_source_value(source, "maxBodyPct", "max_body_pct"),
@@ -555,7 +555,7 @@ def build_pattern_params(source=None):
         ),
         "max_bottom_position": coerce_float(
             get_source_value(source, "maxBottomPosition", "max_bottom_position"),
-            30, 5, 90,
+            25, 5, 90,
         ),
         "min_prior_drop_pct": coerce_float(
             get_source_value(source, "minPriorDropPct", "min_prior_drop_pct"),
@@ -565,9 +565,23 @@ def build_pattern_params(source=None):
             get_source_value(source, "bottomMaxBodyPct", "bottom_max_body_pct"),
             3.0, 0.2, 12,
         ),
+        "bottom_only_bullish_engulfing": coerce_int(
+            get_source_value(source, "bottomOnlyBullishEngulfing", "bottom_only_bullish_engulfing"),
+            1, 0, 1,
+        ),
+        "bottom_pattern_group": (
+            get_source_value(source, "bottomPatternGroup", "bottom_pattern_group")
+            if get_source_value(source, "bottomPatternGroup", "bottom_pattern_group")
+               in ("engulfing", "strong", "single", "all")
+            else "engulfing"
+        ),
         "min_bottom_volume_ratio": coerce_float(
             get_source_value(source, "minBottomVolumeRatio", "min_bottom_volume_ratio"),
-            1.5, 0, 10,
+            2.0, 0, 10,
+        ),
+        "max_bottom_volume_ratio": coerce_float(
+            get_source_value(source, "maxBottomVolumeRatio", "max_bottom_volume_ratio"),
+            3.0, 0, 20,
         ),
         "min_bottom_rebound_pct": coerce_float(
             get_source_value(source, "minBottomReboundPct", "min_bottom_rebound_pct"),
@@ -579,7 +593,7 @@ def build_pattern_params(source=None):
         ),
         "min_bottom_strong_gain_pct": coerce_float(
             get_source_value(source, "minBottomStrongGainPct", "min_bottom_strong_gain_pct"),
-            3.0, 0, 20,
+            4.0, 0, 20,
         ),
         "require_bottom_confirm": coerce_int(
             get_source_value(source, "requireBottomConfirm", "require_bottom_confirm"),
@@ -587,7 +601,7 @@ def build_pattern_params(source=None):
         ),
         "min_bottom_close_position": coerce_float(
             get_source_value(source, "minBottomClosePosition", "min_bottom_close_position"),
-            65.0, 0, 100,
+            75.0, 0, 100,
         ),
         "require_bottom_close_above_prev": coerce_int(
             get_source_value(source, "requireBottomCloseAbovePrev", "require_bottom_close_above_prev"),
@@ -608,6 +622,18 @@ def build_pattern_params(source=None):
         "bottom_new_low_lookback_days": coerce_int(
             get_source_value(source, "bottomNewLowLookbackDays", "bottom_new_low_lookback_days"),
             20, 5, 80,
+        ),
+        "pattern_win_lookback_days": coerce_int(
+            get_source_value(source, "patternWinLookbackDays", "pattern_win_lookback_days"),
+            720, 120, 2000,
+        ),
+        "pattern_win_hold_days": coerce_int(
+            get_source_value(source, "patternWinHoldDays", "pattern_win_hold_days"),
+            1, 1, 30,
+        ),
+        "pattern_win_target_pct": coerce_float(
+            get_source_value(source, "patternWinTargetPct", "pattern_win_target_pct"),
+            3.0, 0, 30,
         ),
         "limit": coerce_int(source.get("limit"), 10 if pattern_type == "bottom_reversal" else 80, 1, 300),
     }
@@ -1920,6 +1946,27 @@ def bottom_reversal_context(series, pattern_len, params):
     }
 
 
+BOTTOM_PATTERN_GROUP_NAMES = {
+    "engulfing": ("看涨吞没",),
+    "strong": ("看涨吞没", "曙光初现", "早晨之星"),
+    "single": ("锤头线", "倒锤头线"),
+    "all": ("看涨吞没", "曙光初现", "早晨之星", "锤头线", "倒锤头线"),
+}
+BOTTOM_STRONG_PATTERNS = ("看涨吞没", "曙光初现", "早晨之星")
+BOTTOM_SINGLE_PIN_PATTERNS = ("锤头线", "倒锤头线")
+
+
+def bottom_pattern_group(params):
+    group = (params or {}).get("bottom_pattern_group")
+    if group in BOTTOM_PATTERN_GROUP_NAMES:
+        return group
+    return "engulfing" if (params or {}).get("bottom_only_bullish_engulfing", 1) else "all"
+
+
+def bottom_pattern_allowed_names(params):
+    return BOTTOM_PATTERN_GROUP_NAMES[bottom_pattern_group(params)]
+
+
 def detect_bottom_reversal(series, params):
     if len(series) < 3:
         return None
@@ -1932,12 +1979,20 @@ def detect_bottom_reversal(series, params):
     body_limit = params["bottom_max_body_pct"]
     patterns = []
 
+    close_position = position_in_range(s1["close"], s1["low"], s1["high"])
+    close_position_pct = close_position * 100.0 if close_position is not None else 0
+
     if s1["span"] > 0 and s1["body_pct"] <= body_limit:
         body_ref = max(s1["body"], s1["close"] * 0.002)
         lower_ratio = s1["lower"] / body_ref if body_ref else 0
         upper_share = s1["upper"] / s1["span"] * 100.0
         lower_share = s1["lower"] / s1["span"] * 100.0
-        if lower_ratio >= 2.0 and lower_share >= 45 and upper_share <= 25:
+        if (
+            lower_ratio >= 3.0
+            and lower_share >= 60
+            and upper_share <= 12
+            and close_position_pct >= 65
+        ):
             patterns.append({
                 "name": "锤头线",
                 "days": 1,
@@ -1945,12 +2000,18 @@ def detect_bottom_reversal(series, params):
                 "reasons": [
                     "底部锤头线",
                     f"下影占比{lower_share:.0f}%",
+                    f"下影/实体{lower_ratio:.1f}倍",
                     f"实体{s1['body_pct']:.2f}%",
                 ],
             })
 
         upper_ratio = s1["upper"] / body_ref if body_ref else 0
-        if upper_ratio >= 2.0 and upper_share >= 45 and lower_share <= 25:
+        if (
+            upper_ratio >= 3.0
+            and upper_share >= 60
+            and lower_share <= 12
+            and close_position_pct >= 45
+        ):
             patterns.append({
                 "name": "倒锤头线",
                 "days": 1,
@@ -1958,6 +2019,7 @@ def detect_bottom_reversal(series, params):
                 "reasons": [
                     "底部倒锤头线",
                     f"上影占比{upper_share:.0f}%",
+                    f"上影/实体{upper_ratio:.1f}倍",
                     f"实体{s1['body_pct']:.2f}%",
                 ],
             })
@@ -1966,9 +2028,9 @@ def detect_bottom_reversal(series, params):
         if (
             is_long_body(s2)
             and s1["body_pct"] >= 0.8
-            and s1["open"] <= s2["close"] * 1.006
-            and s1["close"] >= s2["open"] * 0.994
-            and s1["body"] >= s2["body"] * 0.95
+            and s1["open"] <= s2["close"] * 1.002
+            and s1["close"] >= s2["open"] * 0.998
+            and s1["body"] >= s2["body"] * 1.05
         ):
             patterns.append({
                 "name": "看涨吞没",
@@ -1983,8 +2045,10 @@ def detect_bottom_reversal(series, params):
         if (
             is_long_body(s2)
             and s1["close"] > s2["mid"]
-            and s1["close"] < s2["open"] * 1.01
-            and s1["open"] <= s2["close"] * 1.015
+            and s1["close"] <= s2["open"] * 0.998
+            and s1["open"] <= s2["close"] * 1.002
+            and s1["body"] >= s2["body"] * 0.5
+            and close_position_pct >= 65
         ):
             patterns.append({
                 "name": "曙光初现",
@@ -2003,8 +2067,11 @@ def detect_bottom_reversal(series, params):
             and s2["body_pct"] <= body_limit
             and s2["body_range_pct"] <= 45
             and s1["close"] >= s3["mid"]
-            and s1["body_pct"] >= 0.8
-            and s2["low"] <= min(s3["close"], s1["open"]) * 1.02
+            and s1["close"] > s2["close"]
+            and s1["body_pct"] >= 1.0
+            and s1["body"] >= s3["body"] * 0.45
+            and s2["low"] <= min(s3["close"], s1["open"]) * 1.01
+            and close_position_pct >= 65
         ):
             patterns.append({
                 "name": "早晨之星",
@@ -2017,6 +2084,10 @@ def detect_bottom_reversal(series, params):
                 ],
             })
 
+    if not patterns:
+        return None
+    allowed_names = bottom_pattern_allowed_names(params)
+    patterns = [item for item in patterns if item["name"] in allowed_names]
     if not patterns:
         return None
     return max(patterns, key=lambda item: item["score"])
@@ -2036,31 +2107,38 @@ def bottom_reversal_confirmation(series, pattern, context, low_pattern,
     if close_position_pct is None:
         return None
     close_position_pct *= 100.0
-    if close_position_pct < params["min_bottom_close_position"]:
+    is_single_pin = pattern["name"] in BOTTOM_SINGLE_PIN_PATTERNS
+    if not is_single_pin and close_position_pct < params["min_bottom_close_position"]:
         return None
     close_above_prev = bool(prev and prev["close"] is not None and close_price > prev["close"])
-    if params.get("require_bottom_close_above_prev") and not close_above_prev:
+    if not is_single_pin and params.get("require_bottom_close_above_prev") and not close_above_prev:
         return None
-    if pct_change < params.get("min_bottom_pct_change", -20.0):
+    if not is_single_pin and pct_change < params.get("min_bottom_pct_change", -20.0):
         return None
-    if rebound_pct < params.get("min_bottom_rebound_pct", 0.0):
+    if not is_single_pin and rebound_pct < params.get("min_bottom_rebound_pct", 0.0):
         return None
     min_volume_ratio = params.get("min_bottom_volume_ratio") or 0
     if min_volume_ratio and (volume_ratio is None or volume_ratio < min_volume_ratio):
         return None
+    max_volume_ratio = params.get("max_bottom_volume_ratio") or 0
+    if (
+        not is_single_pin
+        and max_volume_ratio
+        and volume_ratio is not None
+        and volume_ratio > max_volume_ratio
+    ):
+        return None
 
     above_ma5 = ma5 is not None and close_price >= ma5
-    if params.get("require_bottom_above_ma5") and not above_ma5:
+    if not is_single_pin and params.get("require_bottom_above_ma5") and not above_ma5:
         return None
     min_ma5_slope = params.get("min_bottom_ma5_slope_pct")
-    if min_ma5_slope is not None and ma5_slope_pct is not None:
+    if not is_single_pin and min_ma5_slope is not None and ma5_slope_pct is not None:
         if ma5_slope_pct < min_ma5_slope:
             return None
 
     above_ma20 = ma20 is not None and close_price >= ma20
-    strong_patterns = ("看涨吞没", "曙光初现", "早晨之星")
-    single_pin_patterns = ("锤头线", "倒锤头线")
-    if pattern["name"] in strong_patterns:
+    if pattern["name"] in BOTTOM_STRONG_PATTERNS:
         if pct_change < params.get("min_bottom_strong_gain_pct", 0.0):
             return None
         if pattern["name"] == "早晨之星":
@@ -2072,8 +2150,15 @@ def bottom_reversal_confirmation(series, pattern, context, low_pattern,
         elif pattern["name"] == "曙光初现":
             if close_position_pct < 65:
                 return None
-    elif pattern["name"] in single_pin_patterns:
-        if not (close_position_pct >= 70 and above_ma20):
+    elif is_single_pin:
+        prior5 = series[-6:-1]
+        prior5_lows = [r["low"] for r in prior5 if r["low"] is not None]
+        low_break_5 = bool(prior5_lows and last["low"] < min(prior5_lows))
+        if pct_change < 0:
+            return None
+        if low_break_5:
+            return None
+        if volume_ratio is not None and volume_ratio > 5.0:
             return None
 
     confirm_reasons = [
@@ -2091,7 +2176,23 @@ def bottom_reversal_confirmation(series, pattern, context, low_pattern,
         confirm_reasons.append(f"MA5斜率{ma5_slope_pct:.1f}%")
 
     if params.get("require_bottom_confirm"):
-        bullish_pattern = pattern["name"] in strong_patterns
+        if is_single_pin:
+            confirm_reasons.append("收盘不跌")
+            confirm_reasons.append("未破5日低点")
+            if volume_ratio is not None and volume_ratio <= 5.0:
+                confirm_reasons.append("量能不过热")
+            confirm_reasons.append("长影线放量")
+            return {
+                "rebound_pct": rebound_pct,
+                "close_position_pct": close_position_pct,
+                "close_above_prev": close_above_prev,
+                "above_ma5": above_ma5,
+                "ma5_slope_pct": ma5_slope_pct,
+                "pin_low_break_5": False,
+                "pin_volume_overheat": False,
+                "reasons": confirm_reasons,
+            }
+        bullish_pattern = pattern["name"] in BOTTOM_STRONG_PATTERNS
         high_close = close_position_pct >= 70
         if not (above_ma20 or bullish_pattern or high_close):
             return None
@@ -2108,11 +2209,13 @@ def bottom_reversal_confirmation(series, pattern, context, low_pattern,
         "close_above_prev": close_above_prev,
         "above_ma5": above_ma5,
         "ma5_slope_pct": ma5_slope_pct,
+        "pin_low_break_5": None,
+        "pin_volume_overheat": None,
         "reasons": confirm_reasons,
     }
 
 
-def bottom_reversal_weak_filter(series, pattern_len, params):
+def bottom_reversal_weak_filter(series, pattern_len, params, pattern_name=None):
     last = series[-1]
     close_price = last["close"]
     if close_price is None:
@@ -2125,7 +2228,11 @@ def bottom_reversal_weak_filter(series, pattern_len, params):
     prior_close_low = min(prior_closes) if prior_closes else None
     close_new_low = bool(prior_close_low is not None and close_price <= prior_close_low)
 
-    if params.get("require_bottom_not_close_new_low") and close_new_low:
+    if (
+        pattern_name not in BOTTOM_SINGLE_PIN_PATTERNS
+        and params.get("require_bottom_not_close_new_low")
+        and close_new_low
+    ):
         return None
 
     close_lift_pct = (
@@ -2137,6 +2244,139 @@ def bottom_reversal_weak_filter(series, pattern_len, params):
         "prior_close_low": prior_close_low,
         "close_lift_pct": close_lift_pct,
     }
+
+
+def bottom_reversal_signal_at(series, params):
+    if len(series) < max(45, params["chart_bars"] // 2):
+        return None
+    last = series[-1]
+    pattern = detect_bottom_reversal(series, params)
+    if not pattern:
+        return None
+    context = bottom_reversal_context(series, pattern["days"], params)
+    if not context:
+        return None
+
+    closes = [r["close"] for r in series if r["close"] is not None]
+    prior_volume_rows = series[-21:-1]
+    volumes = [r["volume"] for r in prior_volume_rows if r["volume"] is not None]
+    if len(closes) < 40:
+        return None
+    ma5 = sum(closes[-5:]) / 5
+    prev_ma5 = sum(closes[-6:-1]) / 5 if len(closes) >= 6 else None
+    ma5_slope_pct = ((ma5 - prev_ma5) / prev_ma5 * 100.0) if prev_ma5 else None
+    ma20 = sum(closes[-20:]) / 20
+    ma40 = sum(closes[-40:]) / 40
+    ma40_distance = abs(last["close"] - ma40) / ma40 * 100.0 if ma40 else None
+    if params["max_ma40_distance"] and ma40_distance is not None:
+        if ma40_distance > params["max_ma40_distance"]:
+            return None
+
+    pattern_rows = series[-pattern["days"]:]
+    avg_volume20 = sum(volumes) / len(volumes) if volumes else None
+    volume_ratio = (last["volume"] or 0) / avg_volume20 if avg_volume20 else None
+    low_pattern = min(r["low"] for r in pattern_rows if r["low"] is not None)
+    weak_meta = bottom_reversal_weak_filter(series, pattern["days"], params, pattern["name"])
+    if not weak_meta:
+        return None
+    confirmation = bottom_reversal_confirmation(
+        series, pattern, context, low_pattern, volume_ratio, ma5, ma5_slope_pct, ma20, params
+    )
+    if not confirmation:
+        return None
+    return {
+        "pattern_name": pattern["name"],
+        "pattern_days": pattern["days"],
+        "volume_ratio": volume_ratio,
+    }
+
+
+def bottom_pattern_history_stats(series, params, pattern_name):
+    hold_days = params.get("pattern_win_hold_days") or 1
+    lookback_days = params.get("pattern_win_lookback_days") or 720
+    target_pct = params.get("pattern_win_target_pct") or 3.0
+    if len(series) < hold_days + 46:
+        return {
+            "sample_count": 0,
+            "hold_days": hold_days,
+            "target_pct": target_pct,
+        }
+
+    try:
+        cutoff_date = (
+            datetime.strptime(series[-1]["trade_date"], "%Y-%m-%d")
+            - timedelta(days=lookback_days)
+        ).strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        cutoff_date = None
+
+    returns = []
+    max_gains = []
+    max_drawdowns = []
+    wins = 0
+    target_hits = 0
+    # Exclude the current signal because its future return is not known yet.
+    end_limit = len(series) - hold_days - 1
+    for idx in range(44, end_limit + 1):
+        row = series[idx]
+        if cutoff_date and row["trade_date"] < cutoff_date:
+            continue
+        signal = bottom_reversal_signal_at(series[:idx + 1], params)
+        if not signal or signal["pattern_name"] != pattern_name:
+            continue
+        buy_price = row["close"]
+        sell_price = series[idx + hold_days]["close"]
+        if not buy_price or not sell_price:
+            continue
+        forward_rows = series[idx + 1:idx + hold_days + 1]
+        highs = [r["high"] for r in forward_rows if r["high"] is not None]
+        lows = [r["low"] for r in forward_rows if r["low"] is not None]
+        return_pct = (sell_price - buy_price) / buy_price * 100.0
+        max_gain_pct = (max(highs) - buy_price) / buy_price * 100.0 if highs else return_pct
+        max_drawdown_pct = (min(lows) - buy_price) / buy_price * 100.0 if lows else return_pct
+        returns.append(return_pct)
+        max_gains.append(max_gain_pct)
+        max_drawdowns.append(max_drawdown_pct)
+        if return_pct > 0:
+            wins += 1
+        if max_gain_pct >= target_pct:
+            target_hits += 1
+
+    sample_count = len(returns)
+    if not sample_count:
+        return {
+            "sample_count": 0,
+            "hold_days": hold_days,
+            "target_pct": target_pct,
+        }
+
+    return {
+        "sample_count": sample_count,
+        "hold_days": hold_days,
+        "target_pct": target_pct,
+        "win_rate_pct": round(wins / sample_count * 100.0, 1),
+        "target_rate_pct": round(target_hits / sample_count * 100.0, 1),
+        "avg_return_pct": round(sum(returns) / sample_count, 2),
+        "avg_max_gain_pct": round(sum(max_gains) / sample_count, 2),
+        "avg_max_drawdown_pct": round(sum(max_drawdowns) / sample_count, 2),
+    }
+
+
+def bottom_pattern_history_bonus(stats):
+    sample_count = stats.get("sample_count") or 0
+    if sample_count < 3:
+        return 0
+    win_rate = stats.get("win_rate_pct")
+    avg_return = stats.get("avg_return_pct")
+    target_rate = stats.get("target_rate_pct")
+    bonus = 0
+    if win_rate is not None:
+        bonus += clamp((win_rate - 50.0) / 50.0 * 8.0, -6.0, 8.0)
+    if avg_return is not None:
+        bonus += clamp(avg_return / 5.0 * 5.0, -5.0, 5.0)
+    if target_rate is not None:
+        bonus += clamp((target_rate - 35.0) / 65.0 * 4.0, -3.0, 4.0)
+    return bonus
 
 
 def evaluate_bottom_reversal_candidate(stock, series, params):
@@ -2158,7 +2398,8 @@ def evaluate_bottom_reversal_candidate(stock, series, params):
         return None
 
     closes = [r["close"] for r in series if r["close"] is not None]
-    volumes = [r["volume"] for r in series[-20:] if r["volume"] is not None]
+    prior_volume_rows = series[-21:-1]
+    volumes = [r["volume"] for r in prior_volume_rows if r["volume"] is not None]
     if len(closes) < 40:
         return None
     ma5 = sum(closes[-5:]) / 5
@@ -2179,11 +2420,12 @@ def evaluate_bottom_reversal_candidate(stock, series, params):
     avg_amp = sum(m["amp_pct"] for m in metrics) / len(metrics)
     avg_volume20 = sum(volumes) / len(volumes) if volumes else None
     pattern_volume = sum((r["volume"] or 0) for r in pattern_rows) / len(pattern_rows)
-    volume_ratio = pattern_volume / avg_volume20 if avg_volume20 else None
+    pattern_volume_ratio = pattern_volume / avg_volume20 if avg_volume20 else None
+    volume_ratio = (last["volume"] or 0) / avg_volume20 if avg_volume20 else None
     low_pattern = min(r["low"] for r in pattern_rows if r["low"] is not None)
     high_pattern = max(r["high"] for r in pattern_rows if r["high"] is not None)
     range_pct = (high_pattern - low_pattern) / last["close"] * 100.0 if last["close"] else None
-    weak_meta = bottom_reversal_weak_filter(series, pattern["days"], params)
+    weak_meta = bottom_reversal_weak_filter(series, pattern["days"], params, pattern["name"])
     if not weak_meta:
         return None
     confirmation = bottom_reversal_confirmation(
@@ -2202,7 +2444,12 @@ def evaluate_bottom_reversal_candidate(stock, series, params):
     ma5_bonus = 4 if confirmation.get("above_ma5") else 0
     ma5_slope_bonus = clamp(((ma5_slope_pct or -1.0) + 1.0) / 3.0 * 4, 0, 4)
     ma_bonus = 5 if last["close"] >= ma20 else 0
-    score = pattern["score"] + bottom_bonus + drop_bonus + volume_bonus + ma5_bonus + ma5_slope_bonus + ma_bonus
+    history_stats = bottom_pattern_history_stats(series, params, pattern["name"])
+    history_bonus = bottom_pattern_history_bonus(history_stats)
+    score = (
+        pattern["score"] + bottom_bonus + drop_bonus + volume_bonus
+        + ma5_bonus + ma5_slope_bonus + ma_bonus + history_bonus
+    )
 
     reasons = list(pattern["reasons"])
     reasons.append(f"近{params['bottom_lookback_days']}日低位{context['bottom_position_pct']:.0f}%")
@@ -2214,6 +2461,13 @@ def evaluate_bottom_reversal_candidate(stock, series, params):
         reasons.append(f"MA40距离{ma40_distance:.1f}%")
     if weak_meta.get("close_lift_pct") is not None:
         reasons.append(f"脱离前低{weak_meta['close_lift_pct']:.1f}%")
+    if history_stats.get("sample_count"):
+        reasons.append(
+            f"{history_stats['hold_days']}日胜率{history_stats.get('win_rate_pct', 0):.1f}%"
+            f"/样本{history_stats['sample_count']}"
+        )
+    else:
+        reasons.append(f"{history_stats['hold_days']}日历史样本不足")
 
     chart_series = series[-params["chart_bars"]:]
     return {
@@ -2232,6 +2486,15 @@ def evaluate_bottom_reversal_candidate(stock, series, params):
         "avg_amp_pct": round(avg_amp, 2),
         "range5_pct": round(range_pct, 2) if range_pct is not None else None,
         "volume_ratio": round(volume_ratio, 2) if volume_ratio is not None else None,
+        "pattern_volume_ratio": round(pattern_volume_ratio, 2) if pattern_volume_ratio is not None else None,
+        "pattern_win_sample_count": history_stats.get("sample_count", 0),
+        "pattern_win_hold_days": history_stats.get("hold_days"),
+        "pattern_win_rate_pct": history_stats.get("win_rate_pct"),
+        "pattern_target_rate_pct": history_stats.get("target_rate_pct"),
+        "pattern_avg_return_pct": history_stats.get("avg_return_pct"),
+        "pattern_avg_max_gain_pct": history_stats.get("avg_max_gain_pct"),
+        "pattern_avg_max_drawdown_pct": history_stats.get("avg_max_drawdown_pct"),
+        "pattern_history_score_bonus": round(history_bonus, 1),
         "first_third_gap": None,
         "second_fourth_gap": None,
         "first_third_close_gap": None,
@@ -2247,6 +2510,8 @@ def evaluate_bottom_reversal_candidate(stock, series, params):
         "ma5": round(ma5, 3),
         "ma5_slope_pct": round(ma5_slope_pct, 2) if ma5_slope_pct is not None else None,
         "close_new_low": weak_meta["close_new_low"],
+        "pin_low_break_5": confirmation.get("pin_low_break_5"),
+        "pin_volume_overheat": confirmation.get("pin_volume_overheat"),
         "prior_close_low": round(weak_meta["prior_close_low"], 3) if weak_meta["prior_close_low"] is not None else None,
         "close_lift_pct": round(weak_meta["close_lift_pct"], 2) if weak_meta["close_lift_pct"] is not None else None,
         "ma20": round(ma20, 3),
@@ -2331,7 +2596,7 @@ def perform_pattern_scan(params, started_at=None):
             return {"error": "股票池为空", "meta": build_empty_pattern_meta(params)}, 400
         codes = [s["code"] for s in stocks]
         histories = load_daily_histories_for_pattern(
-            conn, codes, params["trade_date"], params["lookback_days"]
+            conn, codes, params["trade_date"], pattern_history_load_days(params)
         )
     finally:
         conn.close()
@@ -2376,7 +2641,10 @@ def perform_pattern_scan(params, started_at=None):
             "max_bottom_position": params["max_bottom_position"],
             "min_prior_drop_pct": params["min_prior_drop_pct"],
             "bottom_max_body_pct": params["bottom_max_body_pct"],
+            "bottom_only_bullish_engulfing": params["bottom_only_bullish_engulfing"],
+            "bottom_pattern_group": params["bottom_pattern_group"],
             "min_bottom_volume_ratio": params["min_bottom_volume_ratio"],
+            "max_bottom_volume_ratio": params["max_bottom_volume_ratio"],
             "min_bottom_rebound_pct": params["min_bottom_rebound_pct"],
             "min_bottom_pct_change": params["min_bottom_pct_change"],
             "min_bottom_strong_gain_pct": params["min_bottom_strong_gain_pct"],
@@ -2387,6 +2655,9 @@ def perform_pattern_scan(params, started_at=None):
             "min_bottom_ma5_slope_pct": params["min_bottom_ma5_slope_pct"],
             "require_bottom_not_close_new_low": params["require_bottom_not_close_new_low"],
             "bottom_new_low_lookback_days": params["bottom_new_low_lookback_days"],
+            "pattern_win_lookback_days": params["pattern_win_lookback_days"],
+            "pattern_win_hold_days": params["pattern_win_hold_days"],
+            "pattern_win_target_pct": params["pattern_win_target_pct"],
             "min_amount_wan": params["min_amount_wan"],
             "min_turnover": params["min_turnover"],
             "min_market_cap_yi": params["min_market_cap_yi"],
@@ -2422,7 +2693,11 @@ def perform_pattern_scan_with_histories(params, stocks, histories, market_dates,
         if idx is None:
             continue
         scanned += 1
-        window = series[max(0, idx - params["lookback_days"]):idx + 1]
+        if params.get("pattern_type") == "bottom_reversal":
+            window_start = idx - pattern_history_load_days(params)
+        else:
+            window_start = idx - params["lookback_days"]
+        window = series[max(0, window_start):idx + 1]
         row = evaluate_pattern_candidate(stock, window, params)
         if row:
             rows.append(row)
@@ -2456,7 +2731,10 @@ def perform_pattern_scan_with_histories(params, stocks, histories, market_dates,
             "max_bottom_position": params["max_bottom_position"],
             "min_prior_drop_pct": params["min_prior_drop_pct"],
             "bottom_max_body_pct": params["bottom_max_body_pct"],
+            "bottom_only_bullish_engulfing": params["bottom_only_bullish_engulfing"],
+            "bottom_pattern_group": params["bottom_pattern_group"],
             "min_bottom_volume_ratio": params["min_bottom_volume_ratio"],
+            "max_bottom_volume_ratio": params["max_bottom_volume_ratio"],
             "min_bottom_rebound_pct": params["min_bottom_rebound_pct"],
             "min_bottom_pct_change": params["min_bottom_pct_change"],
             "min_bottom_strong_gain_pct": params["min_bottom_strong_gain_pct"],
@@ -2467,6 +2745,9 @@ def perform_pattern_scan_with_histories(params, stocks, histories, market_dates,
             "min_bottom_ma5_slope_pct": params["min_bottom_ma5_slope_pct"],
             "require_bottom_not_close_new_low": params["require_bottom_not_close_new_low"],
             "bottom_new_low_lookback_days": params["bottom_new_low_lookback_days"],
+            "pattern_win_lookback_days": params["pattern_win_lookback_days"],
+            "pattern_win_hold_days": params["pattern_win_hold_days"],
+            "pattern_win_target_pct": params["pattern_win_target_pct"],
             "min_amount_wan": params["min_amount_wan"],
             "min_turnover": params["min_turnover"],
             "min_market_cap_yi": params["min_market_cap_yi"],
@@ -2477,6 +2758,25 @@ def perform_pattern_scan_with_histories(params, stocks, histories, market_dates,
 
 def default_pattern_backfill_days(params):
     return 365 if (params or {}).get("pattern_type") == "four_pin" else 30
+
+
+def normalize_pattern_backfill_params(params):
+    params = dict(params)
+    if params.get("pattern_type") == "bottom_reversal":
+        params["bottom_pattern_group"] = "all"
+        params["bottom_only_bullish_engulfing"] = 0
+    return params
+
+
+def pattern_history_load_days(params):
+    if (params or {}).get("pattern_type") != "bottom_reversal":
+        return params["lookback_days"]
+    return max(
+        params["lookback_days"],
+        (params.get("pattern_win_lookback_days") or 720)
+        + (params.get("pattern_win_hold_days") or 1)
+        + 90,
+    )
 
 
 def get_pattern_backfill_trade_dates(conn, end_date=None, days=30):
@@ -2595,7 +2895,7 @@ def run_pattern_backfill(params, days=None, end_date=None, progress=None):
             [s["code"] for s in stocks],
             trade_dates[0],
             trade_dates[-1],
-            params["lookback_days"],
+            pattern_history_load_days(params),
             progress=history_progress,
         )
         if progress:
@@ -2907,6 +3207,10 @@ def saved_pattern_row_passes_filters(row, run_params, filters=None):
         if first_close_gap > max_close_gap or second_close_gap > max_close_gap:
             return False
     elif pattern_type == "bottom_reversal":
+        pattern_name = row.get("pattern_name")
+        is_single_pin = pattern_name in BOTTOM_SINGLE_PIN_PATTERNS
+        if pattern_name not in bottom_pattern_allowed_names(filters or run_params):
+            return False
         min_close_position = filters.get(
             "min_bottom_close_position",
             (run_params or {}).get("min_bottom_close_position", 55.0),
@@ -2918,6 +3222,10 @@ def saved_pattern_row_passes_filters(row, run_params, filters=None):
         min_volume_ratio = filters.get(
             "min_bottom_volume_ratio",
             (run_params or {}).get("min_bottom_volume_ratio", 0.0),
+        )
+        max_volume_ratio = filters.get(
+            "max_bottom_volume_ratio",
+            (run_params or {}).get("max_bottom_volume_ratio", 0.0),
         )
         min_rebound_pct = filters.get(
             "min_bottom_rebound_pct",
@@ -2947,24 +3255,42 @@ def saved_pattern_row_passes_filters(row, run_params, filters=None):
             "require_bottom_not_close_new_low",
             (run_params or {}).get("require_bottom_not_close_new_low", 0),
         )
-        if row.get("close_position_pct") is None or row.get("close_position_pct") < min_close_position:
+        if (
+            not is_single_pin
+            and (row.get("close_position_pct") is None or row.get("close_position_pct") < min_close_position)
+        ):
             return False
-        if require_close_above_prev and not row.get("close_above_prev"):
+        if not is_single_pin and require_close_above_prev and not row.get("close_above_prev"):
             return False
-        if require_above_ma5 and not row.get("above_ma5"):
+        if not is_single_pin and require_above_ma5 and not row.get("above_ma5"):
             return False
-        if min_ma5_slope is not None and row.get("ma5_slope_pct") is not None:
+        if not is_single_pin and min_ma5_slope is not None and row.get("ma5_slope_pct") is not None:
             if row.get("ma5_slope_pct") < min_ma5_slope:
                 return False
-        if require_not_close_new_low and row.get("close_new_low") is True:
+        if not is_single_pin and require_not_close_new_low and row.get("close_new_low") is True:
             return False
-        if row.get("pct") is None or row.get("pct") < min_pct_change:
+        if not is_single_pin and (row.get("pct") is None or row.get("pct") < min_pct_change):
             return False
-        if row.get("rebound_pct") is None or row.get("rebound_pct") < min_rebound_pct:
+        if not is_single_pin and (row.get("rebound_pct") is None or row.get("rebound_pct") < min_rebound_pct):
             return False
         if min_volume_ratio and (row.get("volume_ratio") is None or row.get("volume_ratio") < min_volume_ratio):
             return False
-        pattern_name = row.get("pattern_name")
+        if (
+            not is_single_pin
+            and max_volume_ratio
+            and row.get("volume_ratio") is not None
+            and row.get("volume_ratio") > max_volume_ratio
+        ):
+            return False
+        if is_single_pin:
+            if row.get("pct") is None or row.get("pct") < 0:
+                return False
+            if row.get("volume_ratio") is not None and row.get("volume_ratio") > 5.0:
+                return False
+            if row.get("pin_low_break_5") is True:
+                return False
+            if row.get("pin_volume_overheat") is True:
+                return False
         above_ma20 = (
             row.get("close") is not None
             and row.get("ma20") is not None
@@ -2985,14 +3311,13 @@ def saved_pattern_row_passes_filters(row, run_params, filters=None):
                 return False
             if row.get("close_position_pct") < 65:
                 return False
-        elif pattern_name in ("锤头线", "倒锤头线"):
-            if not (row.get("close_position_pct") >= 70 and above_ma20):
-                return False
         if require_confirm:
+            if is_single_pin:
+                return True
             close_price = row.get("close")
             ma20 = row.get("ma20")
             above_ma20 = close_price is not None and ma20 is not None and close_price >= ma20
-            bullish_pattern = row.get("pattern_name") in ("看涨吞没", "曙光初现", "早晨之星")
+            bullish_pattern = row.get("pattern_name") in BOTTOM_STRONG_PATTERNS
             high_close = row.get("close_position_pct") is not None and row.get("close_position_pct") >= 70
             if not (above_ma20 or bullish_pattern or high_close):
                 return False
@@ -3089,7 +3414,10 @@ def load_latest_pattern_result(conn, trade_date=None, pattern_type=None, filters
                 "max_bottom_position": params.get("max_bottom_position"),
                 "min_prior_drop_pct": params.get("min_prior_drop_pct"),
                 "bottom_max_body_pct": params.get("bottom_max_body_pct"),
+                "bottom_only_bullish_engulfing": params.get("bottom_only_bullish_engulfing", 1),
+                "bottom_pattern_group": bottom_pattern_group(params),
                 "min_bottom_volume_ratio": params.get("min_bottom_volume_ratio"),
+                "max_bottom_volume_ratio": params.get("max_bottom_volume_ratio"),
                 "min_bottom_rebound_pct": params.get("min_bottom_rebound_pct"),
                 "min_bottom_pct_change": params.get("min_bottom_pct_change"),
                 "min_bottom_strong_gain_pct": params.get("min_bottom_strong_gain_pct"),
@@ -3100,6 +3428,9 @@ def load_latest_pattern_result(conn, trade_date=None, pattern_type=None, filters
                 "min_bottom_ma5_slope_pct": params.get("min_bottom_ma5_slope_pct"),
                 "require_bottom_not_close_new_low": params.get("require_bottom_not_close_new_low"),
                 "bottom_new_low_lookback_days": params.get("bottom_new_low_lookback_days"),
+                "pattern_win_lookback_days": params.get("pattern_win_lookback_days"),
+                "pattern_win_hold_days": params.get("pattern_win_hold_days"),
+                "pattern_win_target_pct": params.get("pattern_win_target_pct"),
             },
             "source_params": params,
         },
@@ -3565,6 +3896,12 @@ HTML = """<!DOCTYPE html>
     font-size: 15px;
     font-weight: 500;
   }
+  .val-sub {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
   .positive .val-number { color: var(--red); }
   .negative .val-number { color: var(--green); }
   .zero     .val-number { color: var(--text-dim); }
@@ -3763,16 +4100,23 @@ function buildTable(data) {
     </td>`;
     displayDates.forEach(d => {
       const v = idx.ma3[d];
+      const dayValue = (idx.net_value && idx.net_value[d] !== undefined)
+        ? idx.net_value[d]
+        : idx.details?.[d]?.net_value;
       if (v === undefined || v === null) {
         html += '<td class="val-cell"><span class="empty-cell">—</span></td>';
         return;
       }
       const pct = (v * 100).toFixed(2);
+      const dayPct = (dayValue === undefined || dayValue === null)
+        ? '—'
+        : (dayValue * 100).toFixed(2);
       const cls = v >  0.001 ? 'positive' : v < -0.001 ? 'negative' : 'zero';
       const barW = Math.min(Math.abs(v) * 100, 50);
       html += `<td class="val-cell">
         <div class="val-inner metric-btn ${cls}">
           <span class="val-number">${pct}</span>
+          <span class="val-sub">日 ${dayPct}</span>
           <div class="val-bar"><div class="val-bar-fill" style="width:${barW}%"></div></div>
         </div></td>`;
     });
@@ -4716,6 +5060,14 @@ PATTERN_HTML = """<!DOCTYPE html>
       <option value="bottom_reversal" selected>底部反转</option>
     </select>
   </label>
+  <label>底部形态
+    <select id="bottomPatternGroup">
+      <option value="engulfing" selected>只看涨吞没</option>
+      <option value="strong">强反转组合</option>
+      <option value="single">单针确认</option>
+      <option value="all">全部底部形态</option>
+    </select>
+  </label>
   <label>指数
     <select id="indexCode" onchange="syncPoolWithIndex()"></select>
   </label>
@@ -4756,7 +5108,7 @@ PATTERN_HTML = """<!DOCTYPE html>
     <input id="bottomLookbackDays" type="number" value="60" step="5">
   </label>
   <label>低位位置%
-    <input id="maxBottomPosition" type="number" value="30" step="5">
+    <input id="maxBottomPosition" type="number" value="25" step="5">
   </label>
   <label>前期跌幅%
     <input id="minPriorDropPct" type="number" value="10" step="0.5">
@@ -4765,10 +5117,13 @@ PATTERN_HTML = """<!DOCTYPE html>
     <input id="bottomMaxBodyPct" type="number" value="3.0" step="0.1">
   </label>
   <label>收盘位置%
-    <input id="minBottomClosePosition" type="number" value="65" step="5">
+    <input id="minBottomClosePosition" type="number" value="75" step="5">
   </label>
-  <label>反转量比
-    <input id="minBottomVolumeRatio" type="number" value="1.5" step="0.1">
+  <label>量比≥
+    <input id="minBottomVolumeRatio" type="number" value="2.0" step="0.1">
+  </label>
+  <label>量比≤
+    <input id="maxBottomVolumeRatio" type="number" value="3.0" step="0.1">
   </label>
   <label>低点反弹%
     <input id="minBottomReboundPct" type="number" value="3.0" step="0.5">
@@ -4777,7 +5132,7 @@ PATTERN_HTML = """<!DOCTYPE html>
     <input id="minBottomPctChange" type="number" value="2.5" step="0.5">
   </label>
   <label>强形涨幅≥%
-    <input id="minBottomStrongGainPct" type="number" value="3.0" step="0.5">
+    <input id="minBottomStrongGainPct" type="number" value="4.0" step="0.5">
   </label>
   <label>高于前收
     <select id="requireBottomCloseAbovePrev">
@@ -4803,11 +5158,20 @@ PATTERN_HTML = """<!DOCTYPE html>
   <label>新低回看
     <input id="bottomNewLowLookbackDays" type="number" value="20" step="5">
   </label>
+  <label>胜率回看
+    <input id="patternWinLookbackDays" type="number" value="720" step="60">
+  </label>
+  <label>持有天数
+    <input id="patternWinHoldDays" type="number" value="1" step="1">
+  </label>
+  <label>目标涨幅%
+    <input id="patternWinTargetPct" type="number" value="3.0" step="0.5">
+  </label>
   <label>成交额万元
     <input id="minAmount" type="number" value="8000" step="1000">
   </label>
   <label>总市值亿
-    <input id="minMarketCapYi" type="number" value="100" step="50">
+    <input id="minMarketCapYi" type="number" value="0" step="50">
   </label>
   <label>换手%
     <input id="minTurnover" type="number" value="0" step="0.1">
@@ -4868,20 +5232,22 @@ function syncIndexWithPool() {
 
 function params() {
   const p = new URLSearchParams();
-  ['patternType','pool','indexCode','tradeDate','maxBodyPct','dojiBodyPct','maxAmpPct',
+  ['patternType','bottomPatternGroup','pool','indexCode','tradeDate','maxBodyPct','dojiBodyPct','maxAmpPct',
    'maxBodyRangePct','maxMa40Distance','maxPairDistance','maxClosePairDistance','minLevelGap',
    'minShadowPct','maxShadowlessCount','bottomLookbackDays','maxBottomPosition',
    'minPriorDropPct','bottomMaxBodyPct','minBottomClosePosition',
-   'minBottomVolumeRatio','minBottomReboundPct','minBottomPctChange',
+   'minBottomVolumeRatio','maxBottomVolumeRatio','minBottomReboundPct','minBottomPctChange',
    'minBottomStrongGainPct','requireBottomCloseAbovePrev',
    'requireBottomAboveMa5','minBottomMa5SlopePct',
    'requireBottomNotCloseNewLow','bottomNewLowLookbackDays',
+   'patternWinLookbackDays','patternWinHoldDays','patternWinTargetPct',
    'minAmount','minMarketCapYi','minTurnover'].forEach(id => {
     const value = document.getElementById(id).value;
     if (value !== '') p.set(id, value);
   });
   p.set('limit', document.getElementById('patternType').value === 'bottom_reversal' ? '10' : '80');
   p.set('chartBars', '70');
+  p.set('filterSaved', '1');
   p.set('save', '1');
   return p.toString();
 }
@@ -4969,6 +5335,7 @@ function xueqiuUrl(code) {
 function rowCard(row) {
   const isBottom = row.pattern_type === 'bottom_reversal';
   const stockUrl = xueqiuUrl(row.code);
+  const winHold = row.pattern_win_hold_days ?? 1;
   const patternMetrics = isBottom ? `
       ${metric('形态', esc(row.pattern_name || '底部反转'))}
       ${metric('低位位置', row.bottom_position_pct === null || row.bottom_position_pct === undefined ? '—' : `${fmt(row.bottom_position_pct, 1)}%`)}
@@ -4976,7 +5343,12 @@ function rowCard(row) {
       ${metric('低点反弹', row.rebound_pct === null || row.rebound_pct === undefined ? '—' : `${fmt(row.rebound_pct, 2)}%`)}
       ${metric('收盘位置', row.close_position_pct === null || row.close_position_pct === undefined ? '—' : `${fmt(row.close_position_pct, 1)}%`)}
       ${metric('形态天数', `${row.pattern_days ?? '—'}天`)}
-      ${metric('量比', row.volume_ratio === null || row.volume_ratio === undefined ? '—' : fmt(row.volume_ratio, 2))}
+      ${metric('当日量比', row.volume_ratio === null || row.volume_ratio === undefined ? '—' : fmt(row.volume_ratio, 2))}
+      ${metric('形态均量', row.pattern_volume_ratio === null || row.pattern_volume_ratio === undefined ? '—' : fmt(row.pattern_volume_ratio, 2))}
+      ${metric(`${winHold}日胜率`, row.pattern_win_rate_pct === null || row.pattern_win_rate_pct === undefined ? '样本不足' : `${fmt(row.pattern_win_rate_pct, 1)}%`)}
+      ${metric('历史样本', row.pattern_win_sample_count === null || row.pattern_win_sample_count === undefined ? '—' : `${row.pattern_win_sample_count}次`)}
+      ${metric(`${winHold}日均收`, row.pattern_avg_return_pct === null || row.pattern_avg_return_pct === undefined ? '—' : `${fmt(row.pattern_avg_return_pct, 2)}%`, cls(row.pattern_avg_return_pct))}
+      ${metric('达标率', row.pattern_target_rate_pct === null || row.pattern_target_rate_pct === undefined ? '—' : `${fmt(row.pattern_target_rate_pct, 1)}%`)}
       ${metric('MA5', row.ma5 === null || row.ma5 === undefined ? '—' : fmt(row.ma5, 2))}
       ${metric('MA5斜率', row.ma5_slope_pct === null || row.ma5_slope_pct === undefined ? '—' : `${fmt(row.ma5_slope_pct, 2)}%`)}
       ${metric('脱离前低', row.close_lift_pct === null || row.close_lift_pct === undefined ? '—' : `${fmt(row.close_lift_pct, 2)}%`)}
@@ -5150,6 +5522,10 @@ async function backfillPattern() {
   try {
     const p = new URLSearchParams(params());
     p.set('days', String(days));
+    if (document.getElementById('patternType').value === 'bottom_reversal') {
+      p.set('bottomPatternGroup', 'all');
+      p.set('bottomOnlyBullishEngulfing', '0');
+    }
     p.delete('save');
     const res = await fetch('/api/pattern/backfill?' + p.toString());
     const data = await res.json();
@@ -5496,7 +5872,7 @@ def api_pattern_clear():
 def api_pattern_backfill():
     if not SCAN_LOCK.acquire(blocking=False):
         return jsonify({"error": "已有扫描任务进行中，请等待上一次扫描结束"}), 429
-    params = build_pattern_params(request.args)
+    params = normalize_pattern_backfill_params(build_pattern_params(request.args))
     if request.args.get("days") in (None, ""):
         days = default_pattern_backfill_days(params)
     else:
@@ -6833,18 +7209,12 @@ def api_stats():
             FROM index_daily_stats
             WHERE index_code = ?
               AND trade_date <= ?
-              AND trade_date >= (
-                  SELECT trade_date FROM index_daily_stats
-                  WHERE index_code = ?
-                    AND trade_date <= ?
-                  ORDER BY trade_date ASC
-                  LIMIT 1 OFFSET 0
-              )
-            ORDER BY trade_date ASC
-        """, (code, dates_asc[-1], code, dates_asc[0]))
+            ORDER BY trade_date DESC
+            LIMIT ?
+        """, (code, dates_asc[-1], days + 2))
 
         # 用 Python 算滑动均值，不依赖窗口函数
-        all_rows = cur.fetchall()
+        all_rows = list(reversed(cur.fetchall()))
 
         # 先建完整的 net_value 时间序列
         nv_series = {r["trade_date"]: r["net_value"] for r in all_rows}
@@ -6862,13 +7232,15 @@ def api_stats():
             ma3_map[td] = round(sum(window) / len(window), 6) if window else None
 
         # 只输出用户要看的日期
-        ma3    = {}
-        details= {}
+        ma3       = {}
+        net_value = {}
+        details   = {}
         for td in dates_asc:
             if td in ma3_map:
                 ma3[td] = ma3_map[td]
             if td in detail_map:
                 r = detail_map[td]
+                net_value[td] = r["net_value"]
                 details[td] = {
                     "net_value":   r["net_value"],
                     "ma3":         ma3_map.get(td),
@@ -6882,6 +7254,7 @@ def api_stats():
             "code":    code,
             "name":    idx["name"],
             "ma3":     ma3,
+            "net_value": net_value,
             "details": details,
         })
 
@@ -6929,7 +7302,10 @@ def build_cli_pattern_params(args):
         "max_bottom_position": args.pattern_max_bottom_position,
         "min_prior_drop_pct": args.pattern_min_prior_drop_pct,
         "bottom_max_body_pct": args.pattern_bottom_max_body_pct,
+        "bottom_only_bullish_engulfing": args.pattern_bottom_only_bullish_engulfing,
+        "bottom_pattern_group": args.pattern_bottom_group,
         "min_bottom_volume_ratio": args.pattern_min_bottom_volume_ratio,
+        "max_bottom_volume_ratio": args.pattern_max_bottom_volume_ratio,
         "min_bottom_rebound_pct": args.pattern_min_bottom_rebound_pct,
         "min_bottom_pct_change": args.pattern_min_bottom_pct_change,
         "min_bottom_strong_gain_pct": args.pattern_min_bottom_strong_gain_pct,
@@ -6940,6 +7316,9 @@ def build_cli_pattern_params(args):
         "min_bottom_ma5_slope_pct": args.pattern_min_bottom_ma5_slope_pct,
         "require_bottom_not_close_new_low": args.pattern_require_bottom_not_close_new_low,
         "bottom_new_low_lookback_days": args.pattern_bottom_new_low_lookback_days,
+        "pattern_win_lookback_days": args.pattern_win_lookback_days,
+        "pattern_win_hold_days": args.pattern_win_hold_days,
+        "pattern_win_target_pct": args.pattern_win_target_pct,
         "min_turnover": args.pattern_min_turnover,
         "min_market_cap_yi": args.pattern_min_market_cap_yi,
     })
@@ -7167,23 +7546,30 @@ def parse_cli_args():
                         help="四根K线中允许缺上影或下影的最大根数")
     parser.add_argument("--pattern-bottom-lookback-days", type=int, default=60,
                         help="底部反转低位判定回看天数")
-    parser.add_argument("--pattern-max-bottom-position", type=float, default=30.0,
+    parser.add_argument("--pattern-max-bottom-position", type=float, default=25.0,
                         help="底部反转收盘价在回看区间中的最高位置，单位%")
     parser.add_argument("--pattern-min-prior-drop-pct", type=float, default=10.0,
                         help="底部反转前期最小回撤幅度，单位%")
     parser.add_argument("--pattern-bottom-max-body-pct", type=float, default=3.0,
                         help="底部反转单根/星线最大实体幅度，单位%")
-    parser.add_argument("--pattern-min-bottom-volume-ratio", type=float, default=1.5,
-                        help="底部反转最低形态量比")
+    parser.add_argument("--pattern-bottom-only-bullish-engulfing", type=int, default=1,
+                        help="底部反转是否只保留看涨吞没，1=只保留，0=保留全部反转形态")
+    parser.add_argument("--pattern-bottom-group", default="engulfing",
+                        choices=["engulfing", "strong", "single", "all"],
+                        help="底部反转形态组：engulfing=只看涨吞没，strong=吞没/曙光/早晨之星，single=锤头/倒锤头，all=全部")
+    parser.add_argument("--pattern-min-bottom-volume-ratio", type=float, default=2.0,
+                        help="底部反转最低反转当日量比")
+    parser.add_argument("--pattern-max-bottom-volume-ratio", type=float, default=3.0,
+                        help="底部反转最高反转当日量比，0表示不限制；单针形态仍使用单针专属过热过滤")
     parser.add_argument("--pattern-min-bottom-rebound-pct", type=float, default=3.0,
                         help="底部反转低点反弹下限，单位%")
     parser.add_argument("--pattern-min-bottom-pct-change", type=float, default=2.5,
                         help="底部反转当日涨幅下限，单位%")
-    parser.add_argument("--pattern-min-bottom-strong-gain-pct", type=float, default=3.0,
+    parser.add_argument("--pattern-min-bottom-strong-gain-pct", type=float, default=4.0,
                         help="组合反转形态最低当日涨幅，单位%")
     parser.add_argument("--pattern-require-bottom-confirm", type=int, default=1,
                         help="底部反转是否要求MA20/组合形态/高位收盘确认，1=要求，0=不要求")
-    parser.add_argument("--pattern-min-bottom-close-position", type=float, default=65.0,
+    parser.add_argument("--pattern-min-bottom-close-position", type=float, default=75.0,
                         help="底部反转当日收盘价在日内振幅中的最低位置，单位%")
     parser.add_argument("--pattern-require-bottom-close-above-prev", type=int, default=1,
                         help="底部反转是否要求收盘价高于前一日，1=要求，0=不要求")
@@ -7195,9 +7581,15 @@ def parse_cli_args():
                         help="底部反转是否要求收盘价不是近期收盘新低，1=要求，0=不要求")
     parser.add_argument("--pattern-bottom-new-low-lookback-days", type=int, default=20,
                         help="底部反转收盘新低过滤回看天数")
+    parser.add_argument("--pattern-win-lookback-days", type=int, default=720,
+                        help="同股同形态胜率统计回看自然日")
+    parser.add_argument("--pattern-win-hold-days", type=int, default=1,
+                        help="同股同形态胜率统计持有交易日数")
+    parser.add_argument("--pattern-win-target-pct", type=float, default=3.0,
+                        help="同股同形态达标率目标涨幅，单位%")
     parser.add_argument("--pattern-min-turnover", type=float, default=0.0,
                         help="最低换手率，单位%")
-    parser.add_argument("--pattern-min-market-cap-yi", type=float, default=100.0,
+    parser.add_argument("--pattern-min-market-cap-yi", type=float, default=0.0,
                         help="最低总市值，单位亿元；0表示不限制")
     parser.add_argument("--pattern-min-amount", type=float, default=None,
                         help="收盘形态扫描最低成交额，单位万元；不填则不限制")
@@ -7281,7 +7673,7 @@ def main():
             saved=saved,
         )
     elif args.pattern_backfill:
-        pattern_params = build_cli_pattern_params(args)
+        pattern_params = normalize_pattern_backfill_params(build_cli_pattern_params(args))
         result = run_pattern_backfill(
             pattern_params,
             days=args.pattern_backfill_days or default_pattern_backfill_days(pattern_params),
