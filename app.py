@@ -5371,12 +5371,12 @@ async function showConstituents(code) {
     if (!res.ok) throw new Error(data.error || '加载失败');
 
     document.getElementById('weightModalTitle').textContent =
-      data.weight_complete ? `${data.name} 成分股权重 Top 10` : `${data.name} 成分股前 10`;
+      data.weight_count ? `${data.name} 成分股权重 Top 10` : `${data.name} 成分股前 10`;
     const updated = data.updated_at ? ` · 成分股更新 ${data.updated_at}` : '';
     const coverage = data.total_count ? Math.round((data.weight_coverage || 0) * 100) : 0;
     const modeText = data.weight_complete
       ? '按权重排序'
-      : (data.weight_count ? `权重不完整 ${coverage}%，显示成分股前 10` : '暂无权重，显示成分股前 10');
+      : (data.weight_count ? `权重不完整 ${coverage}%，仅显示有权重前 10` : '暂无权重，显示成分股前 10');
     const weightDate = data.weight_date ? ` · 权重日期 ${data.weight_date}` : '';
     document.getElementById('weightModalMeta').textContent =
       `${data.code} · 共 ${data.total_count} 只 · 有权重 ${data.weight_count} 只 · ${modeText}${weightDate}${updated}`;
@@ -7202,7 +7202,7 @@ def api_index_constituents():
         weight_sum = summary["weight_sum"] or 0
         weight_coverage = weight_count / total_count if total_count else 0
         weight_complete = weight_coverage >= 0.98 and weight_sum >= 95.0
-        if weight_complete:
+        if weight_count > 0:
             rows = conn.execute("""
                 SELECT
                     ic.stock_code,
