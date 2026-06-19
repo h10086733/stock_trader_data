@@ -18,7 +18,7 @@
   python index.py --add 000016 "上证50"          # 新增指数
   python index.py --channel cnindex --add 980092 "国证行业指数"  # 通过国证渠道新增指数
   python index.py --update 000300                 # 更新指定指数成分股
-  python index.py --update-all                    # 更新所有指数成分股
+  python index.py --update-all                    # 更新所有指数成分股及权重
   python index.py --init-all                      # 一次性导入所有预置指数
   python index.py --constituents 000300           # 查看指数成分股列表
 """
@@ -52,6 +52,9 @@ DB_PATH = "stock_data.db"
 DEFAULT_CHANNEL = "csindex"
 MIN_WEIGHT_COVERAGE = 0.98
 MIN_WEIGHT_SUM = 95.0
+MIN_PARTIAL_WEIGHT_COVERAGE = 0.50
+MIN_PARTIAL_WEIGHT_SUM = 50.0
+USE_COMPLETE_WEIGHT_FILE_AS_CONSTITUENTS = True
 
 # 中证指数官网成分股下载URL模板
 # {code} 替换为指数代码，如 000300
@@ -463,6 +466,14 @@ def clear_constituent_weights(constituents):
         item.pop("weight_date", None)
 
 
+def weight_summary(rows):
+    total = len(rows)
+    weight_count = sum(1 for row in rows if row.get("weight") is not None)
+    weight_sum = sum(row.get("weight") or 0 for row in rows)
+    coverage = weight_count / total if total else 0
+    return total, weight_count, coverage, weight_sum
+
+
 def enrich_csindex_weights(index_code, constituents, headers):
     """中证成分文件不带权重；权重在 closeweight 独立文件。"""
     url = CSINDEX_WEIGHT_URL_TEMPLATE.format(code=index_code)
@@ -470,20 +481,43 @@ def enrich_csindex_weights(index_code, constituents, headers):
         log.info(f"  下载权重文件: {url}")
         content = download_xls(url, headers)
         weight_rows = parse_xls(content, index_code)
+        weight_total, weight_count, weight_coverage, official_weight_sum = weight_summary(weight_rows)
+        constituent_date = dominant_value(constituents, "as_of_date")
+        weight_date = dominant_value(weight_rows, "weight_date") or dominant_value(weight_rows, "as_of_date")
+
+        if (
+            USE_COMPLETE_WEIGHT_FILE_AS_CONSTITUENTS
+            and weight_rows
+            and weight_coverage >= MIN_WEIGHT_COVERAGE
+            and official_weight_sum >= MIN_WEIGHT_SUM
+        ):
+            constituents[:] = weight_rows
+            log.warning(
+                f"  已使用官方权重文件作为入库成分，确保每只成分都有权重: "
+                f"成分日期={constituent_date or '-'} 权重日期={weight_date or '-'} "
+                f"权重覆盖={weight_count}/{weight_total} ({weight_coverage:.1%}) "
+                f"权重和={official_weight_sum:.3f}"
+            )
+            return
+
         matched = merge_constituent_weights(constituents, weight_rows)
         total = len(constituents)
         coverage = matched / total if total else 0
         weight_sum = sum(item.get("weight") or 0 for item in constituents)
-        constituent_date = dominant_value(constituents, "as_of_date")
-        weight_date = dominant_value(weight_rows, "weight_date") or dominant_value(weight_rows, "as_of_date")
         log.info(
             f"  权重合并完成，权重文件 {len(weight_rows)} 条，匹配当前成分 {matched} 条，"
             f"覆盖率 {coverage:.1%}，权重和 {weight_sum:.3f}"
         )
-        if coverage < MIN_WEIGHT_COVERAGE or weight_sum < MIN_WEIGHT_SUM:
+        if coverage < MIN_PARTIAL_WEIGHT_COVERAGE or weight_sum < MIN_PARTIAL_WEIGHT_SUM:
             clear_constituent_weights(constituents)
             log.warning(
                 f"  权重覆盖不足，已丢弃本次权重，避免新成分和旧权重混用: "
+                f"成分日期={constituent_date or '-'} 权重日期={weight_date or '-'} "
+                f"覆盖率={coverage:.1%} 权重和={weight_sum:.3f}"
+            )
+        elif coverage < MIN_WEIGHT_COVERAGE or weight_sum < MIN_WEIGHT_SUM:
+            log.warning(
+                f"  权重不完整，保留可匹配的官方权重并由展示层标记为不完整: "
                 f"成分日期={constituent_date or '-'} 权重日期={weight_date or '-'} "
                 f"覆盖率={coverage:.1%} 权重和={weight_sum:.3f}"
             )
@@ -682,20 +716,43 @@ def cmd_update(conn, code, channel=None):
     import_index(conn, code, channel=channel)
 
 
+def log_weight_summary(conn, index_code):
+    row = conn.execute("""
+        SELECT
+            COUNT(*) AS total_count,
+            SUM(CASE WHEN weight IS NOT NULL THEN 1 ELSE 0 END) AS weight_count,
+            SUM(CASE WHEN weight IS NOT NULL THEN weight ELSE 0 END) AS weight_sum,
+            MAX(weight_date) AS weight_date
+        FROM index_constituents
+        WHERE index_code = ?
+    """, (index_code,)).fetchone()
+    if not row:
+        return
+    total_count = row[0] or 0
+    weight_count = row[1] or 0
+    weight_sum = row[2] or 0
+    coverage = weight_count / total_count if total_count else 0
+    log.info(
+        f"  [{index_code}] 权重覆盖 {weight_count}/{total_count} "
+        f"({coverage:.1%})，权重和 {weight_sum:.3f}，权重日期 {row[3] or '-'}"
+    )
+
+
 def cmd_update_all(conn):
-    """更新所有指数的成分股"""
+    """更新所有指数的成分股及权重"""
     cur = conn.cursor()
-    cur.execute("SELECT code, name FROM indices ORDER BY code")
+    cur.execute("SELECT code, name, channel FROM indices ORDER BY code")
     indices = cur.fetchall()
     if not indices:
         log.warning("没有维护的指数，使用 --init-all 先导入预置指数")
         return
-    log.info(f"更新所有指数，共 {len(indices)} 个")
+    log.info(f"更新所有指数成分股及权重，共 {len(indices)} 个")
     ok, fail = 0, 0
-    for code, name in indices:
-        success = import_index(conn, code, name)
+    for code, name, channel in indices:
+        success = import_index(conn, code, name, channel)
         if success:
             ok += 1
+            log_weight_summary(conn, code)
         else:
             fail += 1
         time.sleep(1)   # 礼貌性间隔
@@ -778,7 +835,7 @@ def main():
     parser.add_argument("--add",           nargs=2,
                         metavar=("CODE", "NAME"),                  help="新增指数并导入成分股，如: --add 000016 上证50")
     parser.add_argument("--update",        metavar="CODE",         help="更新指定指数成分股")
-    parser.add_argument("--update-all",    action="store_true",    help="更新所有指数成分股")
+    parser.add_argument("--update-all",    action="store_true",    help="更新所有指数成分股及权重")
     parser.add_argument("--init-all",      action="store_true",    help="导入所有预置指数")
     parser.add_argument("--constituents",  metavar="CODE",         help="查看指数成分股列表")
     parser.add_argument("--channel",       choices=sorted(DOWNLOAD_CHANNELS),

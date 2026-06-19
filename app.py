@@ -7223,8 +7223,8 @@ def api_index_constituents():
                     ic.stock_code,
                     COALESCE(s.name, ic.stock_name) AS stock_name,
                     ic.exchange,
-                    NULL AS weight,
-                    NULL AS weight_date
+                    ic.weight,
+                    ic.weight_date
                 FROM index_constituents ic
                 LEFT JOIN stocks s ON s.code = ic.stock_code
                 WHERE ic.index_code = ?
