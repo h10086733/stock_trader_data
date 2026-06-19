@@ -15,6 +15,7 @@ import sqlite3
 import requests
 import time
 import argparse
+import json
 import logging
 import sys
 import random
@@ -34,6 +35,7 @@ FAIL_ALERT_RATIO = 0.05   # 失败率超过5%时告警
 HISTORY_START    = "20100101"
 SINA_BATCH_SIZE  = 100
 SINA_FALLBACK_BATCH_SIZE = 20
+MARKET_CAP_BATCH_SIZE = 80
 
 STOCK_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 KLINE_URL      = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -267,7 +269,7 @@ def safe_float(value, default=None):
 def get_price_eastmoney_batch(codes, market_by_code, today_dash):
     """用东方财富实时接口补齐新浪失败的当日价格。"""
     result = {}
-    fields = "f12,f2,f3,f5,f6,f15,f16,f17,f18"
+    fields = "f12,f2,f3,f5,f6,f15,f16,f17,f18,f20,f21"
 
     for chunk in iter_chunks(list(codes), 50):
         params = {
@@ -316,6 +318,66 @@ def get_price_eastmoney_batch(codes, market_by_code, today_dash):
                 "amount": safe_float(item.get("f6"), 0) or 0,
                 "pct_change": pct_change,
                 "turnover": None,
+                "market_cap_yi": (
+                    safe_float(item.get("f20")) / 100000000.0
+                    if safe_float(item.get("f20")) else None
+                ),
+                "float_market_cap_yi": (
+                    safe_float(item.get("f21")) / 100000000.0
+                    if safe_float(item.get("f21")) else None
+                ),
+            }
+        time.sleep(0.05)
+
+    return result
+
+
+def fetch_market_caps(codes, market_by_code=None):
+    """批量获取东方财富总市值/流通市值，单位统一为亿元。"""
+    result = {}
+    if not codes:
+        return result
+    market_by_code = market_by_code or {}
+    fields = "f12,f2,f20,f21"
+
+    for chunk in iter_chunks(list(dict.fromkeys(codes)), MARKET_CAP_BATCH_SIZE):
+        params = {
+            "fltt": 2,
+            "invt": 2,
+            "fields": fields,
+            "secids": ",".join(f"{market_by_code.get(code, '0')}.{code}" for code in chunk),
+        }
+        diff = []
+        for url in EASTMONEY_QUOTE_URLS:
+            for attempt in range(2):
+                try:
+                    resp = SESSION.get(
+                        url,
+                        params=params,
+                        headers=get_headers(),
+                        timeout=8,
+                    )
+                    resp.raise_for_status()
+                    diff = (resp.json().get("data") or {}).get("diff") or []
+                    if diff:
+                        break
+                except Exception as e:
+                    log.warning(f"  东方财富市值请求失败: {e} attempt={attempt+1}")
+                    time.sleep(0.25 * (attempt + 1))
+            if diff:
+                break
+
+        for item in diff:
+            code = str(item.get("f12") or "")
+            price = safe_float(item.get("f2"))
+            total_cap = safe_float(item.get("f20"))
+            float_cap = safe_float(item.get("f21"))
+            if not code:
+                continue
+            result[code] = {
+                "price": price,
+                "market_cap_yi": total_cap / 100000000.0 if total_cap else None,
+                "float_market_cap_yi": float_cap / 100000000.0 if float_cap else None,
             }
         time.sleep(0.05)
 
@@ -412,6 +474,20 @@ def init_db(conn):
             PRIMARY KEY (code, trade_date)
         )
     """)
+    ensure_daily_price_market_cap_columns(conn)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS high_confidence_market_caps (
+            trade_date           DATE NOT NULL,
+            code                 TEXT NOT NULL,
+            market_cap_yi        REAL,
+            float_market_cap_yi  REAL,
+            source               TEXT,
+            created_at           DATETIME DEFAULT (datetime('now','localtime')),
+            updated_at           DATETIME DEFAULT (datetime('now','localtime')),
+            PRIMARY KEY (trade_date, code)
+        )
+    """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sync_log (
@@ -430,9 +506,21 @@ def init_db(conn):
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_dp_code_date ON daily_prices(code, trade_date)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_dp_date      ON daily_prices(trade_date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_hc_market_caps_date ON high_confidence_market_caps(trade_date)")
 
     conn.commit()
     log.info("数据库表结构就绪")
+
+
+def ensure_daily_price_market_cap_columns(conn):
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(daily_prices)").fetchall()
+    }
+    if "market_cap_yi" not in columns:
+        conn.execute("ALTER TABLE daily_prices ADD COLUMN market_cap_yi REAL")
+    if "float_market_cap_yi" not in columns:
+        conn.execute("ALTER TABLE daily_prices ADD COLUMN float_market_cap_yi REAL")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -537,8 +625,11 @@ def insert_daily_prices(conn, code, rows):
         return 0
     conn.executemany("""
         INSERT INTO daily_prices
-            (code, trade_date, open, close, high, low, volume, amount, pct_change, turnover)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+            (
+                code, trade_date, open, close, high, low, volume, amount,
+                pct_change, turnover, market_cap_yi, float_market_cap_yi
+            )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(code, trade_date) DO UPDATE SET
             open       = excluded.open,
             close      = excluded.close,
@@ -547,12 +638,183 @@ def insert_daily_prices(conn, code, rows):
             volume     = excluded.volume,
             amount     = excluded.amount,
             pct_change = excluded.pct_change,
-            turnover   = excluded.turnover
+            turnover   = excluded.turnover,
+            market_cap_yi = COALESCE(excluded.market_cap_yi, daily_prices.market_cap_yi),
+            float_market_cap_yi = COALESCE(excluded.float_market_cap_yi, daily_prices.float_market_cap_yi)
     """, [(code, r.get("trade_date"), r.get("open"), r.get("close"), r.get("high"),
-           r.get("low"), r.get("volume"), r.get("amount"), r.get("pct_change"), r.get("turnover"))
+           r.get("low"), r.get("volume"), r.get("amount"), r.get("pct_change"), r.get("turnover"),
+           r.get("market_cap_yi"), r.get("float_market_cap_yi"))
           for r in rows])
     conn.commit()
     return len(rows)
+
+
+def estimate_market_cap_for_trade_date(price_row, realtime_cap):
+    market_cap = realtime_cap.get("market_cap_yi")
+    float_cap = realtime_cap.get("float_market_cap_yi")
+    realtime_price = realtime_cap.get("price")
+    close = price_row.get("close") if price_row else None
+    if market_cap and realtime_price and close:
+        ratio = close / realtime_price
+        return {
+            "market_cap_yi": market_cap * ratio,
+            "float_market_cap_yi": float_cap * ratio if float_cap else None,
+            "source": "eastmoney_estimated",
+        }
+    return {
+        "market_cap_yi": market_cap,
+        "float_market_cap_yi": float_cap,
+        "source": "eastmoney",
+    }
+
+
+def save_market_caps(conn, trade_date, caps):
+    if not caps:
+        return 0
+    rows = [
+        (
+            trade_date,
+            code,
+            cap.get("market_cap_yi"),
+            cap.get("float_market_cap_yi"),
+            cap.get("source") or "eastmoney",
+        )
+        for code, cap in caps.items()
+        if cap.get("market_cap_yi") is not None
+    ]
+    if not rows:
+        return 0
+    conn.executemany("""
+        INSERT INTO high_confidence_market_caps (
+            trade_date, code, market_cap_yi, float_market_cap_yi, source,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, datetime('now','localtime'), datetime('now','localtime'))
+        ON CONFLICT(trade_date, code) DO UPDATE SET
+            market_cap_yi = excluded.market_cap_yi,
+            float_market_cap_yi = excluded.float_market_cap_yi,
+            source = excluded.source,
+            updated_at = datetime('now','localtime')
+    """, rows)
+    conn.executemany("""
+        UPDATE daily_prices
+        SET market_cap_yi = ?,
+            float_market_cap_yi = ?
+        WHERE trade_date = ?
+          AND code = ?
+    """, [
+        (
+            cap.get("market_cap_yi"),
+            cap.get("float_market_cap_yi"),
+            trade_date,
+            code,
+        )
+        for code, cap in caps.items()
+        if cap.get("market_cap_yi") is not None
+    ])
+    conn.commit()
+    return len(rows)
+
+
+def sync_market_caps_for_trade_date(conn, trade_date, stock_rows=None):
+    if stock_rows is None:
+        stock_rows = conn.execute("SELECT code, market FROM stocks ORDER BY code").fetchall()
+    stock_rows = [(row[0], row[1]) for row in stock_rows]
+    codes = [code for code, _market in stock_rows]
+    market_by_code = {code: market for code, market in stock_rows}
+    if not codes:
+        return 0
+
+    log.info(f"同步 {trade_date} 市值快照，股票 {len(codes)} 只")
+    realtime_caps = fetch_market_caps(codes, market_by_code)
+    price_rows = conn.execute("""
+        SELECT code, close
+        FROM daily_prices
+        WHERE trade_date = ?
+    """, (trade_date,)).fetchall()
+    price_by_code = {
+        str(row[0]).zfill(6): {"close": row[1]}
+        for row in price_rows
+    }
+    estimated_caps = {
+        code: estimate_market_cap_for_trade_date(price_by_code.get(code), cap)
+        for code, cap in realtime_caps.items()
+        if cap.get("market_cap_yi") is not None
+    }
+    saved = save_market_caps(conn, trade_date, estimated_caps)
+    log.info(f"市值快照完成  获取:{len(realtime_caps)}  写入:{saved}")
+    return saved
+
+
+def load_high_confidence_candidate_rows(conn, trade_date):
+    rows = conn.execute("""
+        SELECT rule_version, payload_json, updated_at
+        FROM high_confidence_scans
+        WHERE trade_date = ?
+          AND status = 'ok'
+          AND payload_json IS NOT NULL
+          AND rule_version LIKE '%_capoff'
+        ORDER BY updated_at DESC
+        LIMIT 1
+    """, (trade_date,)).fetchall()
+    if not rows:
+        rows = conn.execute("""
+            SELECT rule_version, payload_json, updated_at
+            FROM high_confidence_scans
+            WHERE trade_date = ?
+              AND status = 'ok'
+              AND payload_json IS NOT NULL
+            ORDER BY row_count DESC, updated_at DESC
+            LIMIT 1
+        """, (trade_date,)).fetchall()
+    if not rows:
+        return [], None
+
+    rule_version, payload_json, _updated_at = rows[0]
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return [], rule_version
+
+    candidates = []
+    seen = set()
+    for group in payload.get("groups") or []:
+        for row in group.get("rows") or []:
+            code = str(row.get("code") or "").zfill(6)
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            candidates.append(row)
+    return candidates, rule_version
+
+
+def sync_market_caps_for_high_confidence_candidates(conn, trade_date):
+    candidates, rule_version = load_high_confidence_candidate_rows(conn, trade_date)
+    if not candidates:
+        log.warning(f"{trade_date} 没有可用的高置信候选缓存，跳过市值补全")
+        return 0
+
+    codes = [str(row.get("code") or "").zfill(6) for row in candidates]
+    market_by_code = {}
+    for row in candidates:
+        code = str(row.get("code") or "").zfill(6)
+        secucode = str(row.get("secucode") or "").upper()
+        market_by_code[code] = "1" if secucode.endswith(".SH") or code.startswith(("5", "6", "9")) else "0"
+
+    log.info(f"同步 {trade_date} 高置信候选市值，候选 {len(codes)} 只，来源规则 {rule_version}")
+    realtime_caps = fetch_market_caps(codes, market_by_code)
+    row_by_code = {
+        str(row.get("code") or "").zfill(6): row
+        for row in candidates
+    }
+    estimated_caps = {
+        code: estimate_market_cap_for_trade_date(row_by_code.get(code), cap)
+        for code, cap in realtime_caps.items()
+        if cap.get("market_cap_yi") is not None
+    }
+    saved = save_market_caps(conn, trade_date, estimated_caps)
+    log.info(f"候选市值补全完成  获取:{len(realtime_caps)}  写入:{saved}")
+    return saved
 
 
 def update_stock_price_range(conn, code, rows):
@@ -776,6 +1038,7 @@ def run_daily_sync(conn):
     cur.execute("SELECT code, market FROM stocks ORDER BY code")
     rows = cur.fetchall()
     run_batch(conn, rows, mode="daily", sync_type="daily", new_stocks=len(new_codes), use_sina_today=True)
+    sync_market_caps_for_trade_date(conn, datetime.today().strftime("%Y-%m-%d"), rows)
 
 
 def run_status(conn):
@@ -789,6 +1052,8 @@ def run_status(conn):
         ("已同步价格",    "SELECT COUNT(*) FROM stocks WHERE history_end IS NOT NULL"),
         ("未同步价格",    "SELECT COUNT(*) FROM stocks WHERE history_end IS NULL"),
         ("价格记录总数",  "SELECT COUNT(*) FROM daily_prices"),
+        ("价格市值记录",  "SELECT COUNT(*) FROM daily_prices WHERE market_cap_yi IS NOT NULL"),
+        ("市值快照记录",  "SELECT COUNT(*) FROM high_confidence_market_caps WHERE market_cap_yi IS NOT NULL"),
     ]:
         cur.execute(sql)
         print(f"  {label:<14}: {cur.fetchone()[0]:>10,}")
@@ -835,6 +1100,7 @@ def main():
     parser.add_argument("--test",      action="store_true", help="测试模式（10只股票）")
     parser.add_argument("--init",      action="store_true", help="全量初始化（支持断点续传）")
     parser.add_argument("--sync",      action="store_true", help="每日增量同步")
+    parser.add_argument("--sync-caps", metavar="YYYY-MM-DD", help="为指定交易日的高置信候选票补市值快照")
     parser.add_argument("--status",    action="store_true", help="查看数据库状态")
     parser.add_argument("--no-resume", action="store_true", help="init 时不断点续传，重新全量")
     parser.add_argument("--db",        default=DB_PATH,     help="数据库文件路径")
@@ -852,6 +1118,8 @@ def main():
         run_init(conn, resume=not args.no_resume)
     elif args.sync:
         run_daily_sync(conn)
+    elif args.sync_caps:
+        sync_market_caps_for_high_confidence_candidates(conn, args.sync_caps)
     else:
         run_status(conn)
 

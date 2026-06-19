@@ -10,16 +10,25 @@
 from flask import Flask, jsonify, render_template_string, request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, time as dt_time
+from pathlib import Path
+from types import SimpleNamespace
 import argparse
 import json
 import math
 import os
+import pickle
 import sys
 import threading
 import time
 import sqlite3
 import requests
 from werkzeug.exceptions import HTTPException
+from hc_strategy_scanner import (
+    PANEL_CACHE_VERSION as HC_SCAN_PANEL_CACHE_VERSION,
+    build_signals as build_hc_scan_signals,
+    prepare_scan_frame as prepare_hc_scan_frame,
+)
+from evaluate_historical_quality import load_or_build_quality as build_hc_signal_quality
 
 try:
     import baostock as bs
@@ -33,6 +42,39 @@ DB_PATH = (
     or os.environ.get("STOCK_DB_PATH")
     or os.path.join(BASE_DIR, "stock_data.db")
 )
+HC_DEFAULT_MAX_PER_DATE = 0
+HC_DEFAULT_HISTORY_DAYS = 30
+HC_DEFAULT_PATTERNS = ["长蜡烛", "母子线", "光头光脚缺影线", "黄包车夫", "风高浪大线"]
+HC_DEFAULT_MIN_MARKET_CAP_YI = 100
+HC_ENABLE_MARKET_CAP_FILTER = True
+HC_ENABLE_REALTIME_MARKET_CAP = True
+HC_ENABLE_QUALITY_CACHE_FALLBACK = True
+HC_QUALITY_LOOKBACK_DAYS = 4200
+HC_QUALITY_FORWARD_DAYS = 5
+HC_QUALITY_OUTCOME = "max_high"
+HC_QUALITY_WIN_RETURN_THRESHOLD = 0.02
+HC_QUALITY_MIN_SAMPLES = 31
+HC_QUALITY_MIN_WIN_RATE = 0.88
+HC_SCAN_LOOKBACK_DAYS = 400
+HC_SCAN_MIN_HISTORY = 120
+HC_SCAN_MODE = "loose"
+HC_SCAN_PATTERN_ENGINE = "recall"
+HC_MIN_FULL_MARKET_ROWS = 4500
+HC_RULE_VERSION = (
+    f"hc_{HC_SCAN_MODE}_{HC_SCAN_PATTERN_ENGINE}"
+    f"_q{int(HC_QUALITY_MIN_WIN_RATE * 100)}"
+    f"_s{HC_QUALITY_MIN_SAMPLES}"
+    f"_fwd{HC_QUALITY_FORWARD_DAYS}_{HC_QUALITY_OUTCOME}"
+    f"_wr{int(HC_QUALITY_WIN_RETURN_THRESHOLD * 100)}"
+    f"_max{HC_DEFAULT_MAX_PER_DATE}"
+    f"_cap{'on' if HC_ENABLE_MARKET_CAP_FILTER else 'off'}"
+)
+HC_SCAN_CACHE = {}
+HC_SCAN_CACHE_LOCK = threading.Lock()
+HC_PROGRESS = {}
+HC_PROGRESS_LOCK = threading.Lock()
+HC_SYNC_THREADS = {}
+HC_SYNC_THREADS_LOCK = threading.Lock()
 EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 EASTMONEY_TRENDS_URLS = [
     "https://push2delay.eastmoney.com/api/qt/stock/trends2/get",
@@ -111,6 +153,65 @@ def ensure_kline_cache_table(conn):
     """)
     conn.commit()
     KLINE_CACHE_DB_READY = True
+
+
+def ensure_high_confidence_tables(conn):
+    ensure_daily_price_market_cap_columns(conn)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS high_confidence_scans (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date     DATE NOT NULL,
+            rule_version   TEXT NOT NULL,
+            row_count      INTEGER,
+            status         TEXT,
+            payload_json   TEXT,
+            error          TEXT,
+            created_at     DATETIME DEFAULT (datetime('now','localtime')),
+            updated_at     DATETIME DEFAULT (datetime('now','localtime')),
+            UNIQUE(trade_date, rule_version)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_hc_scans_date
+        ON high_confidence_scans(trade_date)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS high_confidence_market_caps (
+            trade_date           DATE NOT NULL,
+            code                 TEXT NOT NULL,
+            market_cap_yi        REAL,
+            float_market_cap_yi  REAL,
+            source               TEXT,
+            created_at           DATETIME DEFAULT (datetime('now','localtime')),
+            updated_at           DATETIME DEFAULT (datetime('now','localtime')),
+            PRIMARY KEY (trade_date, code)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_hc_market_caps_date
+        ON high_confidence_market_caps(trade_date)
+    """)
+    conn.commit()
+
+
+def ensure_daily_price_market_cap_columns(conn):
+    table = conn.execute("""
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = 'daily_prices'
+    """).fetchone()
+    if not table:
+        return
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(daily_prices)").fetchall()
+    }
+    if "market_cap_yi" not in columns:
+        conn.execute("ALTER TABLE daily_prices ADD COLUMN market_cap_yi REAL")
+    if "float_market_cap_yi" not in columns:
+        conn.execute("ALTER TABLE daily_prices ADD COLUMN float_market_cap_yi REAL")
+    conn.commit()
 
 
 def ensure_momentum_tables(conn):
@@ -399,6 +500,1123 @@ def coerce_float(value, default, min_value=None, max_value=None):
     if max_value is not None:
         value = min(max_value, value)
     return value
+
+
+def build_hc_params(args):
+    date = normalize_trade_date(args.get("date") or args.get("tradeDate"), None)
+    explicit_days = args.get("days")
+    days = coerce_int(explicit_days, HC_DEFAULT_HISTORY_DAYS, 1, 250)
+    if date and explicit_days in (None, ""):
+        days = 1
+    return {
+        "max_per_date": HC_DEFAULT_MAX_PER_DATE,
+        "patterns": list(HC_DEFAULT_PATTERNS),
+        "date": date,
+        "days": days,
+        "refresh": str(args.get("refresh") or "").lower() in ("1", "true", "yes", "on"),
+    }
+
+
+def get_hc_available_dates(conn, limit=120):
+    rows = conn.execute(
+        """
+        SELECT trade_date, COUNT(DISTINCT code) AS daily_rows
+        FROM daily_prices
+        GROUP BY trade_date
+        ORDER BY trade_date DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [
+        {"date": row["trade_date"], "daily_rows": row["daily_rows"]}
+        for row in rows
+    ]
+
+
+def get_hc_recent_complete_dates(conn, days=HC_DEFAULT_HISTORY_DAYS, end_date=None):
+    rows = get_hc_available_dates(conn, limit=max(days * 8, 240))
+    dates = []
+    for row in rows:
+        trade_date = row["date"]
+        if end_date and trade_date > end_date:
+            continue
+        if int(row["daily_rows"] or 0) < HC_MIN_FULL_MARKET_ROWS:
+            continue
+        dates.append(row)
+        if len(dates) >= days:
+            break
+    return dates
+
+
+def clean_number(value, default=0.0):
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(num):
+        return default
+    return num
+
+
+def set_hc_progress(trade_date, phase, message, percent=None, **extra):
+    if not trade_date:
+        trade_date = "_latest"
+    payload = {
+        "trade_date": trade_date,
+        "phase": phase,
+        "message": message,
+        "percent": percent,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_ts": time.time(),
+        **extra,
+    }
+    with HC_PROGRESS_LOCK:
+        HC_PROGRESS[trade_date] = payload
+    return payload
+
+
+def get_hc_progress(trade_date=None):
+    with HC_PROGRESS_LOCK:
+        if trade_date:
+            return dict(HC_PROGRESS.get(trade_date) or {})
+        if not HC_PROGRESS:
+            return {}
+        latest = max(HC_PROGRESS.values(), key=lambda item: item.get("updated_ts", 0))
+        return dict(latest)
+
+
+def hc_limit_pct(code, name):
+    code = str(code or "").zfill(6)
+    name = str(name or "").upper()
+    if "ST" in name:
+        return 4.8
+    if code.startswith(("300", "301", "688", "689")):
+        return 19.5
+    return 9.8
+
+
+def load_hc_scan_panel(conn, trade_date, use_cache=True):
+    cache_key = (
+        trade_date,
+        HC_SCAN_LOOKBACK_DAYS,
+        HC_SCAN_MIN_HISTORY,
+        False,
+    )
+    if use_cache:
+        with HC_SCAN_CACHE_LOCK:
+            cached = HC_SCAN_CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy(), True
+
+    cache_dir = os.path.join(BASE_DIR, "outputs", "cache")
+    cache_path = os.path.join(
+        cache_dir,
+        f"hc_scan_panel_{HC_SCAN_PANEL_CACHE_VERSION}_{trade_date.replace('-', '')}"
+        f"_lb{HC_SCAN_LOOKBACK_DAYS}_min{HC_SCAN_MIN_HISTORY}_nonbj.pkl",
+    )
+    if use_cache and os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            panel = pickle.load(f)
+        with HC_SCAN_CACHE_LOCK:
+            HC_SCAN_CACHE[cache_key] = panel.copy()
+        return panel.copy(), True
+
+    panel = prepare_hc_scan_frame(
+        conn,
+        trade_date,
+        HC_SCAN_LOOKBACK_DAYS,
+        HC_SCAN_MIN_HISTORY,
+        include_bj=False,
+    )
+    if use_cache:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(panel, f, protocol=pickle.HIGHEST_PROTOCOL)
+        with HC_SCAN_CACHE_LOCK:
+            HC_SCAN_CACHE[cache_key] = panel.copy()
+    return panel, False
+
+
+def load_hc_signal_quality(trade_date, use_cache=True, allow_fallback=True):
+    if not use_cache:
+        return None, False, None
+    cache_dir = os.path.join(BASE_DIR, "outputs", "cache")
+    base_name = (
+        f"hc_signal_quality_{trade_date.replace('-', '')}_{HC_SCAN_MODE}"
+        f"_lb{HC_QUALITY_LOOKBACK_DAYS}_fwd{HC_QUALITY_FORWARD_DAYS}"
+    )
+    if HC_QUALITY_OUTCOME != "close":
+        base_name = f"{base_name}_{HC_QUALITY_OUTCOME}"
+    candidates = [
+        os.path.join(cache_dir, f"{base_name}_wr{HC_QUALITY_WIN_RETURN_THRESHOLD:g}.pkl"),
+        os.path.join(cache_dir, f"{base_name}.pkl"),
+    ]
+    cache_path = next((path for path in candidates if os.path.exists(path)), None)
+    if cache_path:
+        with open(cache_path, "rb") as f:
+            return pickle.load(f), True, trade_date
+    if not allow_fallback or not HC_ENABLE_QUALITY_CACHE_FALLBACK:
+        return None, False, None
+
+    prefix = "hc_signal_quality_"
+    suffix = (
+        f"_{HC_SCAN_MODE}_lb{HC_QUALITY_LOOKBACK_DAYS}"
+        f"_fwd{HC_QUALITY_FORWARD_DAYS}"
+    )
+    if HC_QUALITY_OUTCOME != "close":
+        suffix = f"{suffix}_{HC_QUALITY_OUTCOME}"
+    suffix = f"{suffix}_wr{HC_QUALITY_WIN_RETURN_THRESHOLD:g}.pkl"
+    target_dt = datetime.strptime(trade_date, "%Y-%m-%d")
+    fallback = None
+    for name in os.listdir(cache_dir) if os.path.isdir(cache_dir) else []:
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        date_part = name[len(prefix):len(prefix) + 8]
+        try:
+            cache_dt = datetime.strptime(date_part, "%Y%m%d")
+        except ValueError:
+            continue
+        if cache_dt > target_dt:
+            continue
+        if fallback is None or cache_dt > fallback[0]:
+            fallback = (cache_dt, os.path.join(cache_dir, name))
+    if not fallback:
+        return None, False, None
+    with open(fallback[1], "rb") as f:
+        return pickle.load(f), True, fallback[0].strftime("%Y-%m-%d")
+
+
+def build_hc_quality_args(use_cache=True):
+    return SimpleNamespace(
+        mode=HC_SCAN_MODE,
+        quality_lookback_days=HC_QUALITY_LOOKBACK_DAYS,
+        forward_days=HC_QUALITY_FORWARD_DAYS,
+        outcome=HC_QUALITY_OUTCOME,
+        win_return_threshold=HC_QUALITY_WIN_RETURN_THRESHOLD,
+        quality_chunk_size=200,
+        cache=use_cache,
+    )
+
+
+def apply_hc_quality_filter(signal_rows, trade_date, conn=None, use_cache=True, allow_fallback=True):
+    if signal_rows.empty:
+        return signal_rows, {"quality_rows": 0, "quality_cache_hit": False}
+    quality, cache_hit, quality_source_date = load_hc_signal_quality(
+        trade_date,
+        use_cache=use_cache,
+        allow_fallback=allow_fallback,
+    )
+    if quality is not None and quality_source_date and quality_source_date != trade_date:
+        set_hc_progress(
+            trade_date,
+            "quality_cache",
+            f"未找到当天质量缓存，复用 {quality_source_date} 历史质量缓存",
+            68,
+            quality_source_date=quality_source_date,
+        )
+    if quality is None and conn is not None:
+        set_hc_progress(
+            trade_date,
+            "quality_build",
+            "未找到历史质量缓存，正在计算历史胜率/样本数",
+            60,
+            raw_signal_rows=int(len(signal_rows)),
+        )
+        quality = build_hc_signal_quality(
+            conn,
+            trade_date,
+            signal_rows,
+            build_hc_quality_args(use_cache=use_cache),
+            Path(BASE_DIR) / "outputs" / "cache",
+        )
+        cache_hit = False
+        quality_source_date = trade_date
+    if quality is None or quality.empty:
+        filtered = signal_rows.iloc[0:0].copy()
+        return filtered, {"quality_rows": 0, "quality_cache_hit": False}
+    signal_rows = signal_rows.copy()
+    quality = quality.copy()
+    signal_rows["code"] = signal_rows["code"].astype(str).str.zfill(6)
+    quality["code"] = quality["code"].astype(str).str.zfill(6)
+    enriched = signal_rows.merge(
+        quality,
+        on=["code", "形态名称", "coupling_family"],
+        how="left",
+    )
+    filtered = enriched[
+        (enriched["hist_samples"] >= HC_QUALITY_MIN_SAMPLES)
+        & (enriched["hist_win_rate"] >= HC_QUALITY_MIN_WIN_RATE)
+    ].copy()
+    return filtered, {
+        "quality_rows": int(len(quality)),
+        "quality_cache_hit": cache_hit,
+        "quality_source_date": quality_source_date,
+    }
+
+
+def load_hc_market_caps_from_db(conn, trade_date, codes):
+    if not codes:
+        return {}
+    placeholders = ",".join("?" for _ in codes)
+    rows = conn.execute(
+        f"""
+        SELECT code, market_cap_yi, float_market_cap_yi, source
+        FROM high_confidence_market_caps
+        WHERE trade_date = ? AND code IN ({placeholders})
+        """,
+        [trade_date, *codes],
+    ).fetchall()
+    caps = {
+        str(row["code"]).zfill(6): {
+            "market_cap_yi": row["market_cap_yi"],
+            "float_market_cap_yi": row["float_market_cap_yi"],
+            "source": row["source"] or "db",
+        }
+        for row in rows
+    }
+    missing_codes = [code for code in codes if code not in caps]
+    if not missing_codes:
+        return caps
+    daily_placeholders = ",".join("?" for _ in missing_codes)
+    daily_rows = conn.execute(
+        f"""
+        SELECT code, market_cap_yi, float_market_cap_yi
+        FROM daily_prices
+        WHERE trade_date = ?
+          AND code IN ({daily_placeholders})
+          AND market_cap_yi IS NOT NULL
+        """,
+        [trade_date, *missing_codes],
+    ).fetchall()
+    from_daily_prices = {
+        str(row["code"]).zfill(6): {
+            "market_cap_yi": row["market_cap_yi"],
+            "float_market_cap_yi": row["float_market_cap_yi"],
+            "source": "daily_prices",
+        }
+        for row in daily_rows
+    }
+    if from_daily_prices:
+        save_hc_market_caps(conn, trade_date, from_daily_prices)
+        caps.update(from_daily_prices)
+    return caps
+
+
+def save_hc_market_caps(conn, trade_date, caps):
+    if not caps:
+        return
+    rows = [
+        (
+            trade_date,
+            code,
+            cap.get("market_cap_yi"),
+            cap.get("float_market_cap_yi"),
+            cap.get("source") or "eastmoney",
+        )
+        for code, cap in caps.items()
+    ]
+    conn.executemany(
+        """
+        INSERT INTO high_confidence_market_caps (
+            trade_date, code, market_cap_yi, float_market_cap_yi, source,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, datetime('now','localtime'), datetime('now','localtime'))
+        ON CONFLICT(trade_date, code) DO UPDATE SET
+            market_cap_yi = excluded.market_cap_yi,
+            float_market_cap_yi = excluded.float_market_cap_yi,
+            source = excluded.source,
+            updated_at = datetime('now','localtime')
+        """,
+        [
+            row
+            for row in rows
+        ],
+    )
+    conn.executemany(
+        """
+        UPDATE daily_prices
+        SET market_cap_yi = ?,
+            float_market_cap_yi = ?
+        WHERE trade_date = ?
+          AND code = ?
+        """,
+        [
+            (
+                cap.get("market_cap_yi"),
+                cap.get("float_market_cap_yi"),
+                trade_date,
+                code,
+            )
+            for code, cap in caps.items()
+            if cap.get("market_cap_yi") is not None
+        ],
+    )
+    conn.commit()
+
+
+def estimate_historical_cap(row, realtime_cap):
+    market_cap = realtime_cap.get("market_cap_yi")
+    float_cap = realtime_cap.get("float_market_cap_yi")
+    price = realtime_cap.get("price")
+    close = row.get("close")
+    if market_cap and price and close:
+        ratio = close / price
+        market_cap = market_cap * ratio
+        float_cap = float_cap * ratio if float_cap else None
+        source = "eastmoney_estimated"
+    else:
+        source = "eastmoney"
+    return {
+        "market_cap_yi": market_cap,
+        "float_market_cap_yi": float_cap,
+        "source": source,
+    }
+
+
+def load_or_fetch_hc_market_caps(conn, trade_date, rows, use_cache=True):
+    codes = [str(row["code"]).zfill(6) for row in rows]
+    caps = load_hc_market_caps_from_db(conn, trade_date, codes) if use_cache else {}
+    missing_codes = [code for code in codes if code not in caps]
+    fetched = {}
+    if missing_codes and HC_ENABLE_REALTIME_MARKET_CAP:
+        realtime = fetch_eastmoney_market_caps(missing_codes)
+        row_by_code = {str(row["code"]).zfill(6): row for row in rows}
+        for code, cap in realtime.items():
+            if cap.get("market_cap_yi") is None:
+                continue
+            fetched[code] = estimate_historical_cap(row_by_code.get(code, {}), cap)
+        if fetched:
+            if use_cache:
+                save_hc_market_caps(conn, trade_date, fetched)
+            caps.update(fetched)
+    return caps, len(missing_codes), len(fetched)
+
+
+def apply_hc_market_cap_filter(conn, trade_date, rows, use_cache=True):
+    if not HC_ENABLE_MARKET_CAP_FILTER:
+        return rows, {
+            "market_cap_checked": len(rows),
+            "market_cap_missing": 0,
+            "market_cap_fetched": 0,
+            "market_cap_filtered": 0,
+            "market_cap_source": "disabled",
+            "market_cap_unavailable": False,
+        }
+    caps, initially_missing, fetched_count = load_or_fetch_hc_market_caps(
+        conn,
+        trade_date,
+        rows,
+        use_cache=use_cache,
+    )
+    kept = []
+    missing = 0
+    filtered = 0
+    for row in rows:
+        code = str(row["code"]).zfill(6)
+        cap = caps.get(code) or {}
+        market_cap = cap.get("market_cap_yi")
+        float_cap = cap.get("float_market_cap_yi")
+        if market_cap is None:
+            missing += 1
+            filtered += 1
+            continue
+        row["market_cap_yi"] = round(market_cap, 2)
+        row["float_market_cap_yi"] = round(float_cap, 2) if float_cap is not None else None
+        if market_cap < HC_DEFAULT_MIN_MARKET_CAP_YI:
+            filtered += 1
+            continue
+        kept.append(row)
+    return kept, {
+        "market_cap_checked": len(rows),
+        "market_cap_missing": missing,
+        "market_cap_initially_missing": initially_missing,
+        "market_cap_fetched": fetched_count,
+        "market_cap_filtered": filtered,
+        "market_cap_source": "db+eastmoney" if use_cache else "eastmoney_nocache",
+        "market_cap_unavailable": missing == len(rows) and bool(rows),
+    }
+
+
+def build_hc_payload_from_candidate_rows(conn, trade_date, base_payload, candidate_rows):
+    candidate_rows = [dict(row) for row in candidate_rows]
+    filtered_rows, cap_meta = apply_hc_market_cap_filter(conn, trade_date, candidate_rows)
+    output_rows = filtered_rows
+    pattern_counts = {}
+    coupling_counts = {}
+    close_limit_count = 0
+    touch_limit_count = 0
+    for row in output_rows:
+        for pattern in row.get("patterns") or []:
+            pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
+        for coupling in row.get("couplings") or []:
+            coupling_counts[coupling] = coupling_counts.get(coupling, 0) + 1
+        if row.get("close_limit"):
+            close_limit_count += 1
+        if row.get("touch_limit"):
+            touch_limit_count += 1
+
+    payload = json.loads(json.dumps(base_payload, ensure_ascii=False))
+    payload["groups"] = [{
+        "date": trade_date,
+        "raw_count": len(filtered_rows),
+        "count": len(output_rows),
+        "rows": output_rows,
+    }]
+    meta = payload.setdefault("meta", {})
+    meta.update({
+        "trade_date": trade_date,
+        "raw_filtered_rows": len(filtered_rows),
+        "output_rows": len(output_rows),
+        "min_market_cap_yi": HC_DEFAULT_MIN_MARKET_CAP_YI,
+        "close_limit_rows": close_limit_count,
+        "touch_limit_rows": touch_limit_count,
+        "result_source": "auto_cap_fill",
+        "rule_version": HC_RULE_VERSION,
+        "pattern_counts": sorted(pattern_counts.items(), key=lambda x: (-x[1], x[0])),
+        "coupling_counts": sorted(coupling_counts.items(), key=lambda x: (-x[1], x[0])),
+        **cap_meta,
+    })
+    payload.setdefault("params", {})
+    payload["params"]["date"] = trade_date
+    payload["params"]["refresh"] = False
+    return payload
+
+
+def rank_hc_scan_stocks(scan):
+    if scan.empty:
+        return []
+    ordered = scan.sort_values(
+        ["scan_score", "pct_change"],
+        ascending=[False, False],
+    ).copy()
+    rows = []
+    for (code, secucode, name, trade_date), group in ordered.groupby(
+        ["code", "secucode", "name", "trade_date"], sort=False
+    ):
+        best = group.iloc[0]
+        patterns = sorted({str(v) for v in group["形态名称"].dropna()})
+        couplings = sorted({str(v) for v in group["coupling_family"].dropna()})
+        pct_change = clean_number(best.get("pct_change"))
+        prev_close = clean_number(best.get("prev_close"))
+        high = clean_number(best.get("high"))
+        limit_pct = hc_limit_pct(code, name)
+        high_pct = (high / prev_close - 1) * 100 if prev_close > 0 else pct_change
+        hist_win_rate = clean_number(group["hist_win_rate"].max()) if "hist_win_rate" in group else 0
+        hist_samples = int(clean_number(group["hist_samples"].max())) if "hist_samples" in group else 0
+        hist_pl_ratio = clean_number(group["hist_pl_ratio"].max()) if "hist_pl_ratio" in group else 0
+        rank_score = (
+            clean_number(group["scan_score"].max())
+            + math.log1p(len(group)) * 2.5
+            + math.log1p(len(patterns)) * 2.0
+            + math.log1p(len(couplings)) * 1.5
+            + max(min(pct_change, 10), -5) * 0.15
+            + hist_win_rate * 12
+            + math.log1p(hist_samples) * 0.6
+            + min(hist_pl_ratio, 5) * 0.4
+        )
+        rows.append({
+            "date": trade_date,
+            "code": code,
+            "secucode": secucode,
+            "name": name,
+            "pattern": str(best.get("形态名称") or ""),
+            "coupling": str(best.get("coupling_family") or ""),
+            "patterns": patterns,
+            "couplings": couplings,
+            "signal_count": int(len(group)),
+            "pattern_count": int(len(patterns)),
+            "coupling_count": int(len(couplings)),
+            "hist_win_rate": hist_win_rate,
+            "hist_samples": hist_samples,
+            "hist_pl_ratio": hist_pl_ratio,
+            "rank_score": rank_score,
+            "scan_score": clean_number(group["scan_score"].max()),
+            "close": clean_number(best.get("close")),
+            "pct_change": pct_change,
+            "turnover": clean_number(best.get("turnover")),
+            "amount_yi": clean_number(best.get("amount")) / 100000000,
+            "touch_limit": high_pct >= limit_pct,
+            "close_limit": pct_change >= limit_pct,
+        })
+    return sorted(
+        rows,
+        key=lambda r: (
+            -r["rank_score"],
+            -r["scan_score"],
+            -r["pct_change"],
+            -r["signal_count"],
+        ),
+    )
+
+
+def build_high_confidence_payload_realtime(params):
+    use_cache = not params.get("no_cache")
+    allow_quality_fallback = not params.get("no_quality_fallback")
+    conn = get_db()
+    try:
+        ensure_high_confidence_tables(conn)
+        available_date_rows = get_hc_available_dates(conn)
+        available_dates = [row["date"] for row in available_date_rows]
+        default_date = next(
+            (
+                row["date"]
+                for row in available_date_rows
+                if row["daily_rows"] >= HC_MIN_FULL_MARKET_ROWS
+            ),
+            available_dates[0] if available_dates else "",
+        )
+        trade_date = params.get("date") or default_date
+        if not trade_date:
+            return {"error": "没有可用日 K 数据", "meta": {}, "groups": []}, 400
+        set_hc_progress(trade_date, "date", f"已确认交易日 {trade_date}", 5)
+        daily_rows = next(
+            (row["daily_rows"] for row in available_date_rows if row["date"] == trade_date),
+            conn.execute(
+                "SELECT COUNT(DISTINCT code) FROM daily_prices WHERE trade_date = ?",
+                (trade_date,),
+            ).fetchone()[0],
+        )
+        if not daily_rows:
+            return {
+                "params": {**params, "date": trade_date},
+                "meta": {
+                    "trade_date": trade_date,
+                    "available_dates": available_dates,
+                    "daily_rows": 0,
+                    "scanned_stocks": 0,
+                    "raw_signal_rows": 0,
+                    "raw_filtered_rows": 0,
+                    "output_rows": 0,
+                    "close_limit_rows": 0,
+                    "touch_limit_rows": 0,
+                    "pattern_counts": [],
+                    "coupling_counts": [],
+                    "cache_hit": False,
+                },
+                "groups": [],
+            }
+
+        set_hc_progress(
+            trade_date,
+            "panel",
+            f"正在加载 {trade_date} 全市场日K指标面板",
+            15,
+            daily_rows=int(daily_rows),
+        )
+        panel, cache_hit = load_hc_scan_panel(conn, trade_date, use_cache=use_cache)
+        set_hc_progress(
+            trade_date,
+            "signals",
+            f"正在从 {len(panel)} 只股票中识别K线形态和耦合信号",
+            45,
+            scanned_stocks=int(len(panel)),
+            panel_cache_hit=cache_hit,
+        )
+        signal_rows = build_hc_scan_signals(
+            panel,
+            HC_SCAN_MODE,
+            top=0,
+            patterns_filter=set(params["patterns"]),
+            couplings_filter=None,
+            exclude_proxy=False,
+            pattern_engine=HC_SCAN_PATTERN_ENGINE,
+        )
+        set_hc_progress(
+            trade_date,
+            "quality",
+            f"正在进行历史胜率/样本数过滤，原始信号 {len(signal_rows)} 条",
+            70,
+            raw_signal_rows=int(len(signal_rows)),
+        )
+        quality_signal_rows, quality_meta = apply_hc_quality_filter(
+            signal_rows,
+            trade_date,
+            conn,
+            use_cache=use_cache,
+            allow_fallback=allow_quality_fallback,
+        )
+        set_hc_progress(
+            trade_date,
+            "quality_done",
+            f"历史质量过滤完成，保留信号 {len(quality_signal_rows)} 条",
+            82,
+            quality_signal_rows=int(len(quality_signal_rows)),
+            quality_cache_hit=quality_meta.get("quality_cache_hit"),
+        )
+        set_hc_progress(trade_date, "rank", "正在聚合股票并排序", 88)
+        ranked_rows = rank_hc_scan_stocks(quality_signal_rows)
+        set_hc_progress(
+            trade_date,
+            "market_cap",
+            f"正在应用市值过滤，候选股票 {len(ranked_rows)} 只",
+            92,
+            candidate_stocks=len(ranked_rows),
+        )
+        ranked_rows, cap_meta = apply_hc_market_cap_filter(
+            conn,
+            trade_date,
+            ranked_rows,
+            use_cache=use_cache,
+        )
+    finally:
+        conn.close()
+
+    output_rows = ranked_rows[:params["max_per_date"]] if params["max_per_date"] else ranked_rows
+
+    pattern_counts = {}
+    coupling_counts = {}
+    close_limit_count = 0
+    touch_limit_count = 0
+    for row in output_rows:
+        for pattern in row["patterns"]:
+            pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
+        for coupling in row["couplings"]:
+            coupling_counts[coupling] = coupling_counts.get(coupling, 0) + 1
+        if row["close_limit"]:
+            close_limit_count += 1
+        if row["touch_limit"]:
+            touch_limit_count += 1
+
+    groups = [{
+        "date": trade_date,
+        "raw_count": len(ranked_rows),
+        "count": len(output_rows),
+        "rows": output_rows,
+    }]
+
+    return {
+        "params": {**params, "date": trade_date},
+        "meta": {
+            "trade_date": trade_date,
+            "available_dates": available_dates,
+            "daily_rows": int(daily_rows),
+            "scanned_stocks": int(len(panel)),
+            "raw_signal_rows": int(len(signal_rows)),
+            "quality_signal_rows": int(len(quality_signal_rows)),
+            "quality_rows": quality_meta["quality_rows"],
+            "quality_cache_hit": quality_meta["quality_cache_hit"],
+            "quality_source_date": quality_meta.get("quality_source_date"),
+            "quality_min_win_rate": HC_QUALITY_MIN_WIN_RATE,
+            "quality_min_samples": HC_QUALITY_MIN_SAMPLES,
+            "raw_filtered_rows": len(ranked_rows),
+            "output_rows": len(output_rows),
+            "min_market_cap_yi": HC_DEFAULT_MIN_MARKET_CAP_YI,
+            **cap_meta,
+            "close_limit_rows": close_limit_count,
+            "touch_limit_rows": touch_limit_count,
+            "cache_hit": cache_hit,
+            "no_cache": bool(params.get("no_cache")),
+            "result_source": "realtime",
+            "rule_version": HC_RULE_VERSION,
+            "pattern_counts": sorted(pattern_counts.items(), key=lambda x: (-x[1], x[0])),
+            "coupling_counts": sorted(coupling_counts.items(), key=lambda x: (-x[1], x[0])),
+        },
+        "groups": groups,
+    }
+
+
+def resolve_hc_trade_date(conn, params):
+    available_date_rows = get_hc_available_dates(conn)
+    available_dates = [row["date"] for row in available_date_rows]
+    default_date = next(
+        (
+            row["date"]
+            for row in available_date_rows
+            if row["daily_rows"] >= HC_MIN_FULL_MARKET_ROWS
+        ),
+        available_dates[0] if available_dates else "",
+    )
+    return params.get("date") or default_date, available_dates
+
+
+def load_high_confidence_cached_payload(conn, trade_date):
+    row = conn.execute(
+        """
+        SELECT payload_json, updated_at
+        FROM high_confidence_scans
+        WHERE trade_date = ? AND rule_version = ? AND status = 'ok'
+        """,
+        (trade_date, HC_RULE_VERSION),
+    ).fetchone()
+    if not row or not row["payload_json"]:
+        return None
+    payload = json.loads(row["payload_json"])
+    payload.setdefault("meta", {})
+    payload["meta"]["result_source"] = "cache"
+    payload["meta"]["rule_version"] = HC_RULE_VERSION
+    payload["meta"]["cache_updated_at"] = row["updated_at"]
+    return payload
+
+
+def load_high_confidence_cached_payloads(conn, trade_dates):
+    if not trade_dates:
+        return {}
+    placeholders = ",".join("?" for _ in trade_dates)
+    rows = conn.execute(
+        f"""
+        SELECT trade_date, payload_json, updated_at
+        FROM high_confidence_scans
+        WHERE trade_date IN ({placeholders})
+          AND rule_version = ?
+          AND status = 'ok'
+          AND payload_json IS NOT NULL
+        """,
+        [*trade_dates, HC_RULE_VERSION],
+    ).fetchall()
+    payloads = {}
+    for row in rows:
+        payload = json.loads(row["payload_json"])
+        payload.setdefault("meta", {})
+        payload["meta"]["result_source"] = "cache"
+        payload["meta"]["rule_version"] = HC_RULE_VERSION
+        payload["meta"]["cache_updated_at"] = row["updated_at"]
+        payloads[row["trade_date"]] = payload
+    return payloads
+
+
+def extract_hc_candidate_rows(payload):
+    rows = []
+    seen = set()
+    for group in payload.get("groups") or []:
+        for row in group.get("rows") or []:
+            code = str(row.get("code") or "").zfill(6)
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            rows.append(row)
+    return rows
+
+
+def load_hc_capoff_candidate_payload(conn, trade_date):
+    row = conn.execute(
+        """
+        SELECT payload_json, updated_at, rule_version
+        FROM high_confidence_scans
+        WHERE trade_date = ?
+          AND rule_version LIKE '%_capoff'
+          AND status = 'ok'
+          AND payload_json IS NOT NULL
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        (trade_date,),
+    ).fetchone()
+    if not row:
+        return None
+    payload = json.loads(row["payload_json"])
+    payload.setdefault("meta", {})
+    payload["meta"]["candidate_source_rule_version"] = row["rule_version"]
+    payload["meta"]["candidate_cache_updated_at"] = row["updated_at"]
+    return payload
+
+
+def maybe_autofill_cached_market_caps(conn, trade_date, cached_payload):
+    meta = cached_payload.get("meta") or {}
+    if not meta.get("market_cap_unavailable") and not meta.get("market_cap_missing"):
+        return cached_payload
+
+    candidate_payload = load_hc_capoff_candidate_payload(conn, trade_date)
+    if not candidate_payload:
+        return cached_payload
+    candidate_rows = extract_hc_candidate_rows(candidate_payload)
+    if not candidate_rows:
+        return cached_payload
+
+    set_hc_progress(
+        trade_date,
+        "market_cap_autofill",
+        f"正在补齐候选票市值，候选 {len(candidate_rows)} 只",
+        92,
+        candidate_stocks=len(candidate_rows),
+    )
+    payload = build_hc_payload_from_candidate_rows(
+        conn,
+        trade_date,
+        candidate_payload,
+        candidate_rows,
+    )
+    save_high_confidence_payload(conn, trade_date, payload)
+    set_hc_progress(
+        trade_date,
+        "done",
+        f"市值补齐完成，候选 {payload.get('meta', {}).get('output_rows', 0)} 只",
+        100,
+        output_rows=payload.get("meta", {}).get("output_rows", 0),
+    )
+    return payload
+
+
+def save_high_confidence_payload(conn, trade_date, payload):
+    row_count = payload.get("meta", {}).get("output_rows", 0)
+    conn.execute(
+        """
+        INSERT INTO high_confidence_scans (
+            trade_date, rule_version, row_count, status, payload_json, error,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, 'ok', ?, NULL, datetime('now','localtime'), datetime('now','localtime'))
+        ON CONFLICT(trade_date, rule_version) DO UPDATE SET
+            row_count = excluded.row_count,
+            status = excluded.status,
+            payload_json = excluded.payload_json,
+            error = NULL,
+            updated_at = datetime('now','localtime')
+        """,
+        (
+            trade_date,
+            HC_RULE_VERSION,
+            row_count,
+            json.dumps(payload, ensure_ascii=False),
+        ),
+    )
+    conn.commit()
+
+
+def merge_hc_count_pairs(items):
+    counts = {}
+    for pairs in items:
+        for key, value in pairs or []:
+            counts[key] = counts.get(key, 0) + int(value or 0)
+    return sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+
+
+def sum_hc_meta(payloads, key):
+    total = 0
+    for payload in payloads:
+        value = (payload.get("meta") or {}).get(key)
+        if isinstance(value, (int, float)):
+            total += value
+    return total
+
+
+def high_confidence_history_payload(params):
+    days = coerce_int(params.get("days"), HC_DEFAULT_HISTORY_DAYS, 1, 250)
+    end_date = params.get("date")
+    conn = get_db()
+    try:
+        ensure_high_confidence_tables(conn)
+        date_rows = get_hc_recent_complete_dates(conn, days=days, end_date=end_date)
+        _trade_date, available_dates = resolve_hc_trade_date(conn, params)
+        cached_by_date = {}
+        if not params.get("refresh") and not params.get("no_cache"):
+            cached_by_date = load_high_confidence_cached_payloads(
+                conn,
+                [row["date"] for row in date_rows],
+            )
+    finally:
+        conn.close()
+
+    if not date_rows:
+        return {"error": "没有可用的完整日 K 数据", "meta": {}, "groups": []}
+
+    dates = [row["date"] for row in date_rows]
+    payloads = []
+    missing_cache_dates = []
+    total = len(dates)
+    batch_key = f"_latest_{total}"
+    for index, trade_date in enumerate(dates, start=1):
+        set_hc_progress(
+            batch_key,
+            "batch",
+            f"正在同步最近{total}个交易日：{trade_date} ({index}/{total})",
+            5 + int((index - 1) / total * 90),
+            current_date=trade_date,
+            current_index=index,
+            total=total,
+        )
+        payload = cached_by_date.get(trade_date)
+        if payload is not None:
+            payload.setdefault("params", {})
+            payload["params"]["date"] = trade_date
+            payload["params"]["refresh"] = False
+            payload["meta"]["available_dates"] = available_dates
+        else:
+            if not params.get("refresh") and not params.get("no_cache"):
+                missing_cache_dates.append(trade_date)
+                continue
+            payload = high_confidence_payload({
+                **params,
+                "date": trade_date,
+                "days": 1,
+            })
+        payloads.append(payload)
+        set_hc_progress(
+            batch_key,
+            "batch",
+            f"已完成 {trade_date} ({index}/{total})",
+            5 + int(index / total * 90),
+            current_date=trade_date,
+            current_index=index,
+            total=total,
+        )
+
+    groups = []
+    for payload in payloads:
+        groups.extend(payload.get("groups") or [])
+
+    sources = {
+        (payload.get("meta") or {}).get("result_source")
+        for payload in payloads
+        if (payload.get("meta") or {}).get("result_source")
+    }
+    result_source = next(iter(sources)) if len(sources) == 1 else "mixed"
+    latest_meta = payloads[0].get("meta") if payloads else {}
+    meta = {
+        "trade_date": dates[0],
+        "date_start": dates[-1],
+        "date_end": dates[0],
+        "days": len(payloads),
+        "requested_days": days,
+        "cache_missing_days": len(missing_cache_dates),
+        "cache_missing_dates": missing_cache_dates,
+        "available_dates": available_dates,
+        "daily_rows": latest_meta.get("daily_rows"),
+        "scanned_stocks": sum_hc_meta(payloads, "scanned_stocks"),
+        "raw_signal_rows": sum_hc_meta(payloads, "raw_signal_rows"),
+        "quality_signal_rows": sum_hc_meta(payloads, "quality_signal_rows"),
+        "raw_filtered_rows": sum_hc_meta(payloads, "raw_filtered_rows"),
+        "output_rows": sum_hc_meta(payloads, "output_rows"),
+        "min_market_cap_yi": HC_DEFAULT_MIN_MARKET_CAP_YI,
+        "market_cap_fetched": sum_hc_meta(payloads, "market_cap_fetched"),
+        "market_cap_missing": sum_hc_meta(payloads, "market_cap_missing"),
+        "market_cap_filtered": sum_hc_meta(payloads, "market_cap_filtered"),
+        "close_limit_rows": sum_hc_meta(payloads, "close_limit_rows"),
+        "touch_limit_rows": sum_hc_meta(payloads, "touch_limit_rows"),
+        "result_source": result_source,
+        "rule_version": HC_RULE_VERSION,
+        "pattern_counts": merge_hc_count_pairs(
+            (payload.get("meta") or {}).get("pattern_counts") for payload in payloads
+        ),
+        "coupling_counts": merge_hc_count_pairs(
+            (payload.get("meta") or {}).get("coupling_counts") for payload in payloads
+        ),
+    }
+    set_hc_progress(
+        batch_key,
+        "done",
+        f"最近{len(payloads)}个已缓存交易日加载完成，输出 {meta['output_rows']} 只次",
+        100,
+        output_rows=meta["output_rows"],
+        total=len(payloads),
+    )
+    return {
+        "params": {**params, "date": end_date, "days": days},
+        "meta": meta,
+        "groups": groups,
+    }
+
+
+def high_confidence_payload(params):
+    if coerce_int(params.get("days"), 1, 1, 250) > 1:
+        return high_confidence_history_payload(params)
+
+    conn = get_db()
+    try:
+        ensure_high_confidence_tables(conn)
+        trade_date, available_dates = resolve_hc_trade_date(conn, params)
+        if not trade_date:
+            return {"error": "没有可用日 K 数据", "meta": {}, "groups": []}
+        if not params.get("refresh") and not params.get("no_cache"):
+            cached = load_high_confidence_cached_payload(conn, trade_date)
+            if cached is not None:
+                cached = maybe_autofill_cached_market_caps(conn, trade_date, cached)
+                cached.setdefault("params", {})
+                cached["params"]["date"] = trade_date
+                cached["params"]["refresh"] = False
+                cached["meta"]["available_dates"] = available_dates
+                return cached
+    finally:
+        conn.close()
+
+    try:
+        payload = build_high_confidence_payload_realtime({**params, "date": trade_date})
+        if not payload.get("error") and not params.get("no_cache"):
+            set_hc_progress(trade_date, "save", "正在保存同步结果", 97)
+            conn = get_db()
+            try:
+                ensure_high_confidence_tables(conn)
+                save_high_confidence_payload(conn, trade_date, payload)
+            finally:
+                conn.close()
+            set_hc_progress(
+                trade_date,
+                "done",
+                f"同步完成，候选 {payload.get('meta', {}).get('output_rows', 0)} 只",
+                100,
+                output_rows=payload.get("meta", {}).get("output_rows", 0),
+            )
+    except Exception as exc:
+        set_hc_progress(trade_date, "error", f"同步失败：{exc}", 100, error=str(exc))
+        raise
+    return payload
+
+
+def run_high_confidence_sync_job(sync_key, params):
+    try:
+        high_confidence_payload({**params, "refresh": True})
+    finally:
+        with HC_SYNC_THREADS_LOCK:
+            HC_SYNC_THREADS.pop(sync_key, None)
+
+
+def start_high_confidence_sync(params):
+    days = coerce_int(params.get("days"), HC_DEFAULT_HISTORY_DAYS, 1, 250)
+    if days > 1:
+        sync_key = f"_latest_{days}"
+        with HC_SYNC_THREADS_LOCK:
+            existing = HC_SYNC_THREADS.get(sync_key)
+            if existing and existing.is_alive():
+                return {
+                    "started": False,
+                    "days": days,
+                    "progress": get_hc_progress(sync_key),
+                }, 200
+            set_hc_progress(sync_key, "queued", f"最近{days}个交易日已加入同步队列", 1)
+            thread = threading.Thread(
+                target=run_high_confidence_sync_job,
+                args=(sync_key, {**params, "date": None, "days": days}),
+                daemon=True,
+            )
+            HC_SYNC_THREADS[sync_key] = thread
+            thread.start()
+        return {
+            "started": True,
+            "days": days,
+            "progress": get_hc_progress(sync_key),
+        }, 200
+
+    conn = get_db()
+    try:
+        ensure_high_confidence_tables(conn)
+        trade_date, _available_dates = resolve_hc_trade_date(conn, params)
+    finally:
+        conn.close()
+    if not trade_date:
+        return {"error": "没有可用日 K 数据"}, 400
+
+    with HC_SYNC_THREADS_LOCK:
+        existing = HC_SYNC_THREADS.get(trade_date)
+        if existing and existing.is_alive():
+            return {
+                "started": False,
+                "trade_date": trade_date,
+                "progress": get_hc_progress(trade_date),
+            }, 200
+        set_hc_progress(trade_date, "queued", f"{trade_date} 已加入同步队列", 1)
+        thread = threading.Thread(
+            target=run_high_confidence_sync_job,
+            args=(trade_date, {**params, "date": trade_date, "days": 1}),
+            daemon=True,
+        )
+        HC_SYNC_THREADS[trade_date] = thread
+        thread.start()
+    return {
+        "started": True,
+        "trade_date": trade_date,
+        "progress": get_hc_progress(trade_date),
+    }, 200
 
 
 def get_source_value(source, *names, default=None):
@@ -1219,7 +2437,7 @@ def fetch_eastmoney_market_caps(codes):
     caps = {}
     if not codes:
         return caps
-    fields = "f12,f20,f21"
+    fields = "f12,f2,f20,f21"
     for batch in chunked(list(dict.fromkeys(codes)), 80):
         params = {
             "fltt": 2,
@@ -1251,9 +2469,11 @@ def fetch_eastmoney_market_caps(codes):
                 break
         for item in diff:
             code = str(item.get("f12") or "")
+            price = to_float(item.get("f2"))
             total_cap = to_float(item.get("f20"))
             float_cap = to_float(item.get("f21"))
             caps[code] = {
+                "price": price,
                 "market_cap_yi": total_cap / 100000000.0 if total_cap else None,
                 "float_market_cap_yi": float_cap / 100000000.0 if float_cap else None,
             }
@@ -4009,6 +5229,7 @@ HTML = """<!DOCTYPE html>
   <div class="header-right">
     <a class="nav-link" href="/pattern">收盘形态</a>
     <a class="nav-link" href="/momentum">14:30 选股</a>
+    <a class="nav-link" href="/high-confidence">高置信小集合</a>
     <select class="days-select" id="daysSelect" onchange="loadData()">
       <option value="5">最近 5 日</option>
       <option value="10">最近 10 日</option>
@@ -4499,6 +5720,7 @@ MOMENTUM_HTML = """<!DOCTYPE html>
   <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
     <a class="nav-link" href="/pattern">收盘形态</a>
     <a class="nav-link" href="/">行业宽度</a>
+    <a class="nav-link" href="/high-confidence">高置信小集合</a>
   </div>
 </div>
 
@@ -5043,6 +6265,7 @@ PATTERN_HTML = """<!DOCTYPE html>
   <div class="nav">
     <a class="nav-link" href="/">行业宽度</a>
     <a class="nav-link" href="/momentum">14:30 选股</a>
+    <a class="nav-link" href="/high-confidence">高置信小集合</a>
   </div>
 </div>
 
@@ -5607,6 +6830,286 @@ loadHistory(1);
 """
 
 
+HIGH_CONFIDENCE_HTML = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>每日高置信选股</title>
+<style>
+:root {
+  --bg:#111318; --surface:#171a21; --surface2:#20242d; --border:#2d3340;
+  --text:#d7dce6; --muted:#87909f; --head:#f4f6fb; --accent:#3d7fff;
+  --red:#ff5b5f; --green:#39c27f;
+}
+* { box-sizing:border-box; }
+body {
+  margin:0; padding:28px 24px; background:var(--bg); color:var(--text);
+  font:13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif;
+}
+.header { display:flex; justify-content:space-between; align-items:flex-end; gap:16px; padding-bottom:18px; margin-bottom:18px; border-bottom:1px solid var(--border); }
+h1 { margin:0; color:var(--head); font-size:20px; font-weight:600; letter-spacing:0; }
+.sub { margin-top:6px; color:var(--muted); font-size:12px; }
+.nav { display:flex; gap:8px; flex-wrap:wrap; }
+.nav a { color:var(--text); text-decoration:none; border:1px solid var(--border); background:var(--surface2); padding:7px 12px; border-radius:6px; }
+.nav a:hover { border-color:var(--accent); }
+.actions { display:flex; justify-content:flex-end; align-items:flex-end; gap:10px; margin-bottom:14px; }
+.date-field { display:flex; flex-direction:column; gap:5px; color:var(--muted); font-size:10px; }
+input {
+  width:148px; height:34px; border:1px solid var(--border); border-radius:6px;
+  background:var(--surface2); color:var(--text); padding:7px 9px; outline:none; font:12px inherit;
+}
+input:focus { border-color:var(--accent); }
+button {
+  height:34px; border:0; border-radius:6px; background:var(--accent); color:white; padding:0 14px;
+  cursor:pointer; font:600 12px inherit;
+}
+.stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(120px,1fr)); gap:10px; margin:14px 0; }
+.stat { min-height:58px; border:1px solid var(--border); border-radius:8px; background:var(--surface); padding:10px 12px; }
+.stat-label { color:var(--muted); font-size:10px; margin-bottom:6px; }
+.stat-value { color:var(--head); font:600 18px "DM Mono","SFMono-Regular",monospace; }
+.split { display:grid; grid-template-columns: 1fr 1fr; gap:14px; margin-bottom:14px; }
+.panel { border:1px solid var(--border); border-radius:8px; background:var(--surface); overflow:hidden; }
+.panel-head { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 12px; border-bottom:1px solid var(--border); color:var(--head); font-weight:600; }
+.tags { display:flex; flex-wrap:wrap; gap:6px; padding:10px 12px; }
+.tag { border:1px solid var(--border); border-radius:999px; padding:5px 8px; color:var(--text); background:var(--surface2); }
+.tag b { color:var(--head); font-family:"DM Mono","SFMono-Regular",monospace; font-weight:600; }
+.day { margin-top:14px; border:1px solid var(--border); border-radius:8px; background:var(--surface); overflow:hidden; }
+.day-head { display:flex; justify-content:space-between; gap:10px; padding:11px 12px; border-bottom:1px solid var(--border); }
+.day-title { color:var(--head); font:600 14px "DM Mono","SFMono-Regular",monospace; }
+.day-meta { color:var(--muted); }
+.rate { color:var(--green); font-weight:600; }
+table { width:100%; border-collapse:collapse; }
+th, td { padding:10px 9px; border-bottom:1px solid var(--border); text-align:left; white-space:nowrap; }
+th { color:var(--muted); font-size:10px; font-weight:600; background:var(--surface2); }
+tr:last-child td { border-bottom:0; }
+.code { display:block; margin-top:2px; color:var(--muted); font:10px "DM Mono","SFMono-Regular",monospace; }
+.stock-link { color:var(--head); text-decoration:none; font-weight:600; }
+.stock-link:hover { color:#8eb1ff; }
+.stock-link:hover .code { color:#8eb1ff; }
+.num { font-family:"DM Mono","SFMono-Regular",monospace; }
+.up { color:var(--red); } .down { color:var(--green); }
+.flag { color:var(--red); font-weight:600; }
+.empty { min-height:220px; display:flex; align-items:center; justify-content:center; color:var(--muted); }
+.progress-box { min-height:220px; display:flex; align-items:center; justify-content:center; color:var(--text); }
+.progress-inner { width:min(520px, 100%); border:1px solid var(--border); border-radius:8px; background:var(--surface); padding:16px; }
+.progress-title { color:var(--head); font-weight:600; margin-bottom:8px; }
+.progress-msg { color:var(--muted); margin-bottom:12px; }
+.progress-track { height:8px; background:var(--surface2); border-radius:999px; overflow:hidden; }
+.progress-bar { height:100%; width:0; background:var(--accent); transition:width .25s ease; }
+@media (max-width: 980px) {
+  body { padding:20px 14px; }
+  .header { flex-direction:column; align-items:flex-start; }
+  .actions { justify-content:flex-start; flex-wrap:wrap; }
+  .stats, .split { grid-template-columns:1fr; }
+}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>每日高置信选股</h1>
+    <div class="sub">默认最近30个完整交易日 · 固定规则 · K线形态 · 指标耦合 · 小数量优先</div>
+  </div>
+  <div class="nav">
+    <a href="/">行业宽度</a>
+    <a href="/pattern">收盘形态</a>
+    <a href="/momentum">14:30 选股</a>
+  </div>
+</div>
+
+<div class="actions">
+  <label class="date-field">交易日期（留空最近30日）
+    <input id="tradeDate" type="date">
+  </label>
+  <button onclick="loadData()">筛选</button>
+  <button onclick="loadData(true)">重新同步</button>
+</div>
+
+<div class="stats" id="stats"></div>
+
+<div class="split">
+  <div class="panel">
+    <div class="panel-head">形态分布</div>
+    <div class="tags" id="patternTags"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">耦合分布</div>
+    <div class="tags" id="couplingTags"></div>
+  </div>
+</div>
+
+<div id="result"><div class="empty">加载中…</div></div>
+
+<script>
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+function pct(v, digits=1) {
+  return `${((Number(v) || 0) * 100).toFixed(digits)}%`;
+}
+function num(v, digits=2) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toFixed(digits) : '-';
+}
+function params(refresh=false) {
+  const p = new URLSearchParams();
+  const date = document.getElementById('tradeDate').value;
+  if (date) p.set('date', date);
+  if (refresh) p.set('refresh', '1');
+  return p;
+}
+function renderTags(id, rows) {
+  const el = document.getElementById(id);
+  el.innerHTML = rows.length ? rows.map(([k,v]) => `<span class="tag">${esc(k)} <b>${v}</b></span>`).join('') : '<span class="tag">无</span>';
+}
+function renderStats(meta) {
+  const items = [
+    ['覆盖区间', meta.date_start && meta.date_end ? `${meta.date_start} → ${meta.date_end}` : (meta.trade_date || '-')],
+    ['交易日数', meta.days || 1],
+    ['缺缓存', meta.cache_missing_days || 0],
+    ['来源', meta.result_source === 'cache' ? '本地' : '实时'],
+    ['日K覆盖', meta.daily_rows],
+    ['扫描股票', meta.scanned_stocks],
+    ['原始信号', meta.raw_signal_rows],
+    ['质量信号', meta.quality_signal_rows],
+    ['候选股票', meta.raw_filtered_rows],
+    ['输出股票', meta.output_rows],
+    ['最低市值', `${meta.min_market_cap_yi ?? '-'}亿`],
+    ['市值拉取', meta.market_cap_fetched],
+    ['市值缺失', meta.market_cap_missing],
+    ['市值过滤', meta.market_cap_filtered],
+    ['触板', meta.touch_limit_rows],
+    ['封板', meta.close_limit_rows],
+  ];
+  document.getElementById('stats').innerHTML = items.map(([k,v]) => `
+    <div class="stat"><div class="stat-label">${esc(k)}</div><div class="stat-value">${esc(v)}</div></div>
+  `).join('');
+}
+function renderProgress(progress) {
+  const pctValue = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+  const title = progress.phase === 'error' ? '同步失败' : '正在重新同步';
+  document.getElementById('result').innerHTML = `
+    <div class="progress-box">
+      <div class="progress-inner">
+        <div class="progress-title">${esc(title)} ${pctValue.toFixed(0)}%</div>
+        <div class="progress-msg">${esc(progress.message || '准备中…')}</div>
+        <div class="progress-track"><div class="progress-bar" style="width:${pctValue}%"></div></div>
+      </div>
+    </div>`;
+}
+function progressParams() {
+  const p = new URLSearchParams();
+  const date = document.getElementById('tradeDate').value;
+  if (date) p.set('date', date);
+  return p;
+}
+async function pollProgressOnce() {
+  const query = progressParams().toString();
+  const res = await fetch('/api/high-confidence/progress' + (query ? '?' + query : ''));
+  const progress = await res.json();
+  renderProgress(progress);
+  return progress;
+}
+function xueqiuUrl(row) {
+  const code = String(row.code || '').padStart(6, '0');
+  const secucode = String(row.secucode || '').toUpperCase();
+  let prefix = secucode.endsWith('.SH') ? 'SH' : 'SZ';
+  if (secucode.endsWith('.BJ')) prefix = 'BJ';
+  return `https://xueqiu.com/S/${prefix}${code}`;
+}
+function renderGroup(group) {
+  const rows = group.rows.map(r => {
+    const changeClass = Number(r.pct_change) >= 0 ? 'up' : 'down';
+    return `<tr>
+      <td><a class="stock-link" href="${esc(xueqiuUrl(r))}" target="_blank" rel="noopener noreferrer">${esc(r.name)}<span class="code">${esc(r.code)}</span></a></td>
+      <td>${esc(r.pattern)}</td>
+      <td>${esc(r.coupling)}</td>
+      <td class="num">${num(r.rank_score, 2)}</td>
+      <td class="num">${pct(r.hist_win_rate, 1)}</td>
+      <td class="num">${r.hist_samples}</td>
+      <td class="num">${r.signal_count}</td>
+      <td class="num">${num(r.close, 2)}</td>
+      <td class="num ${changeClass}">${num(r.pct_change, 2)}%</td>
+      <td class="num">${num(r.turnover, 2)}%</td>
+      <td class="num">${r.market_cap_yi === null || r.market_cap_yi === undefined ? '-' : num(r.market_cap_yi, 0)}</td>
+      <td class="num">${num(r.amount_yi, 2)}</td>
+      <td>${r.touch_limit ? '<span class="flag">触板</span>' : ''}${r.close_limit ? ' <span class="flag">封板</span>' : ''}</td>
+    </tr>`;
+  }).join('');
+  return `<section class="day">
+    <div class="day-head">
+      <div class="day-title">${esc(group.date)}</div>
+      <div class="day-meta">输出 ${group.count} / 候选 ${group.raw_count}</div>
+    </div>
+    <table>
+      <thead><tr><th>股票</th><th>最佳形态</th><th>最佳耦合</th><th>评分</th><th>历史胜率</th><th>样本</th><th>信号数</th><th>收盘</th><th>涨跌幅</th><th>换手</th><th>总市值(亿)</th><th>成交额(亿)</th><th>状态</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </section>`;
+}
+async function loadData(refresh=false) {
+  if (refresh) {
+    await syncData();
+    return;
+  }
+  document.getElementById('result').innerHTML = '<div class="empty">加载中…</div>';
+  const query = params(false).toString();
+  const res = await fetch('/api/high-confidence/scan' + (query ? '?' + query : ''));
+  const data = await res.json();
+  if (!res.ok) {
+    document.getElementById('result').innerHTML = `<div class="empty">${esc(data.error || '加载失败')}</div>`;
+    return;
+  }
+  renderStats(data.meta);
+  if (data.meta.trade_date && !document.getElementById('tradeDate').value && Number(data.meta.days || 1) <= 1) {
+    document.getElementById('tradeDate').value = data.meta.trade_date;
+  }
+  renderTags('patternTags', data.meta.pattern_counts || []);
+  renderTags('couplingTags', data.meta.coupling_counts || []);
+  document.getElementById('result').innerHTML = data.groups.length
+    ? data.groups.map(renderGroup).join('')
+    : '<div class="empty">没有符合条件的股票</div>';
+}
+
+async function syncData() {
+  document.getElementById('result').innerHTML = '<div class="empty">准备重新同步…</div>';
+  const startQuery = params(false).toString();
+  const startRes = await fetch('/api/high-confidence/sync' + (startQuery ? '?' + startQuery : ''), { method: 'POST' });
+  const startData = await startRes.json();
+  if (!startRes.ok) {
+    document.getElementById('result').innerHTML = `<div class="empty">${esc(startData.error || '同步启动失败')}</div>`;
+    return;
+  }
+  if (startData.trade_date) {
+    document.getElementById('tradeDate').value = startData.trade_date;
+  }
+  renderProgress(startData.progress || { phase:'queued', percent:1, message:'已启动同步' });
+
+  const progressTimer = setInterval(async () => {
+    try {
+      const progress = await pollProgressOnce();
+      if (progress.phase === 'done') {
+        clearInterval(progressTimer);
+        await loadData(false);
+      } else if (progress.phase === 'error') {
+        clearInterval(progressTimer);
+      }
+    } catch (err) {
+      clearInterval(progressTimer);
+      document.getElementById('result').innerHTML = `<div class="empty">${esc(err.message || '同步进度读取失败')}</div>`;
+      return;
+    }
+  }, 800);
+}
+loadData();
+</script>
+</body>
+</html>
+"""
+
+
 # ─────────────────────────────────────────────────────────────────
 # 路由
 # ─────────────────────────────────────────────────────────────────
@@ -5623,6 +7126,38 @@ def momentum_page():
 @app.route("/pattern")
 def pattern_page():
     return render_template_string(PATTERN_HTML)
+
+
+@app.route("/high-confidence")
+def high_confidence_page():
+    return render_template_string(HIGH_CONFIDENCE_HTML)
+
+
+@app.route("/api/high-confidence/scan")
+def api_high_confidence_scan():
+    params = build_hc_params(request.args)
+    return jsonify(high_confidence_payload(params))
+
+
+@app.route("/api/high-confidence/progress")
+def api_high_confidence_progress():
+    trade_date = normalize_trade_date(
+        request.args.get("date") or request.args.get("tradeDate"),
+        None,
+    )
+    progress = get_hc_progress(trade_date)
+    return jsonify(progress or {
+        "phase": "idle",
+        "message": "暂无同步任务",
+        "percent": 0,
+    })
+
+
+@app.route("/api/high-confidence/sync", methods=["POST"])
+def api_high_confidence_sync():
+    params = build_hc_params(request.args)
+    payload, status = start_high_confidence_sync(params)
+    return jsonify(payload), status
 
 
 @app.route("/api/indices")
