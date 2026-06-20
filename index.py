@@ -103,6 +103,8 @@ PRESET_INDICES = [
     ("399967", "中证军工", "csindex"),
     ("399707", "申万证券", "csindex"),
     ("399989", "中证医疗", "csindex"),
+    ("980080", "国证自由现金流", "cnindex"),
+    ("980092", "国证行业指数", "cnindex"),
 ]
 
 logging.basicConfig(
