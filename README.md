@@ -220,6 +220,131 @@ python3 app.py --momentum-backfill --backfill-days 30 --no-daily-fallback
 python3 app.py --momentum-backfill --backfill-days 30 --daily-fallback-only
 ```
 
+### 9. 中证1000择时策略
+
+文档 `1000判断 (1).docx` 对应的择时策略已整理到 `csi1000_timing.py`。第一版规则：
+
+- 做多：中证1000宽度强、沪深300不弱，5日成交额均值大于20日均值的 1.1 倍，且价格较10日低点涨出 4% 以上。
+- 做空：中证1000和沪深300的3日宽度均值偏弱，5日成交额不高于20日均值的 1.05 倍，且价格距10日高点回撤不超过 5%。
+- 风控：空单遇中证1000两日涨幅超过 2% 时止损；跌深后默认不追空。
+
+常用命令：
+
+```bash
+# 初始化策略表
+python csi1000_timing.py --init-db
+
+# 同步沪深300和中证1000指数日线
+python csi1000_timing.py --fetch-index-prices --start 20100101
+
+# 用当前成分股补算近10年宽度指标
+python csi1000_timing.py --backfill-width --start 2016-06-20 --end 2026-06-18 --force
+
+# 回测当前已具备宽度指标的区间
+python csi1000_timing.py --backtest --start 2026-02-03 --run-key first_width_2026
+
+# 回测最近10年
+python csi1000_timing.py --backtest --start 2016-06-20 --end 2026-06-18 --run-key current_constituents_10y
+
+# 直接使用历史 Excel 里的 300/1000 宽度做回测
+python csi1000_timing.py --backtest --data-source excel --start 2016-06-20 --end 2025-09-24 --run-key excel_width_10y
+
+# 使用本地指数行情/量能，但日期范围和 300/1000 宽度来自历史 Excel
+python csi1000_timing.py --backtest --data-source excel_width --run-key excel_width_db_price_logic
+
+# 每日信号提醒
+python csi1000_timing.py --signal
+
+# 查看最近信号和交易
+python csi1000_timing.py --signals --limit 20
+python csi1000_timing.py --trades --limit 20
+```
+
+注意：`--backfill-width` 使用当前成分股反推历史宽度，适合快速验证策略，但不是严格历史成分股口径。
+
+### 10. 历史指数成分快照
+
+`index_history.py` 用于保存历史指数成分快照。当前 baostock 支持：
+
+- `000016` 上证50
+- `000300` 沪深300
+- `000905` 中证500
+
+本地 baostock 版本没有中证1000历史成分接口。
+
+中证1000历史成分推荐用 JoinQuant/聚宽导出：
+
+```bash
+# 1) 在聚宽 Notebook 中运行脚本，生成 csi1000_history_cons_joinquant.csv
+#    脚本位置：scripts/export_joinquant_csi1000_history.py
+
+# 2) 将 CSV 放入 data/ 后导入本地历史成分表
+python index_history.py --import-csv data/csi1000_history_cons_joinquant.csv --index-code 000852 --source joinquant
+```
+
+如果本地安装并配置了 `jqdatasdk`，也可以直接拉：
+
+```bash
+export JQ_USERNAME=你的账号
+export JQ_PASSWORD=你的密码
+python index_history.py --fetch-jq 000852 --start 2014-12-31 --end 2026-06-30 --frequency month
+```
+
+Tushare Pro 也可以用 `index_weight` 还原历史成分，但账号需要开通指数权重/成分接口权限：
+
+```bash
+export TUSHARE_TOKEN=你的token
+python index_history.py --fetch-tushare 000852 --start 2016-06-20 --end 2026-06-18 --frequency month
+```
+
+当前已验证：Tushare token 本身有效，`index_basic` 可访问；但 `index_weight` 和 `index_member` 返回无权限，所以暂时不能用该账号直接拉中证1000历史成分。
+
+RiceQuant/米筐也已接入，但本地 `rqdatac` 初始化需要米筐账号或 URI：
+
+```bash
+export RQ_USERNAME=你的账号
+export RQ_PASSWORD=你的密码
+python index_history.py --fetch-rq 000852 --start 2016-06-20 --end 2026-06-18 --frequency month
+```
+
+中证指数官网公告附件是官方免费源，可以抓“指数调样”公告里的调入/调出名单，再从当前快照倒推历史快照：
+
+```bash
+# 抓公告附件并倒推，锚点默认使用 akshare_csindex_current 的最新 000852 快照
+python index_history.py --fetch-csindex 000852 --start 2016-06-20 --end 2026-06-20 --derive-csindex
+
+# 如果调样记录已经入库，只重新倒推
+python index_history.py --derive-csindex-only 000852
+```
+
+当前已验证：`2026-05-06` 公告 `id=3006120` 的 Excel 附件可解析，调入 6 只、调出 6 只，并能从 `2026-06-18` 当前快照倒推出 1000 只快照。继续批量抓取时官网详情接口触发了 WAF/403，后续可等限流解除或换网络续跑。
+
+touzid 已验证两个接口，都不能单独作为完整历史成分股来源：
+
+- `get_follow_indice_custom`：`rp` 控制报告期财务/估值指标；`2021-06-30` 到 `2025-12-31` 每期返回 1000 行，但股票集合完全相同。
+- `company_indice`：返回当前中证1000成分 1000 只 + 备选 100 只；`report_date` 不回溯历史成分，`type33=2` 只返回最新一次调出的 6 只。
+
+`company_indice` 可用作诊断，不写入历史成分表：
+
+```bash
+export TOUZID_COOKIE='浏览器里的登录cookie'
+python index_history.py --fetch-touzid 000852 --start 2025-12-31 --end 2025-12-31
+```
+
+```bash
+# 初始化历史成分表
+python index_history.py --init-db
+
+# 拉取沪深300历史成分快照
+python index_history.py --fetch-baostock 000300 --start 2016-06-20 --end 2025-09-24
+
+# 查看已入库快照
+python index_history.py --list 000300
+
+# 查看相邻快照的成分变化
+python index_history.py --changes 000300
+```
+
 ### 添加指数成分股
 
 ```bash
