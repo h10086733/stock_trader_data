@@ -271,20 +271,28 @@ def fetch_index_kline(index_code: str, start: str, end: str | None = None) -> li
         "end": end,
         "lmt": 10000,
     }
-    resp = requests.get(
-        KLINE_URL,
-        params=params,
-        timeout=20,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/120 Safari/537.36"
-            ),
-            "Referer": "https://quote.eastmoney.com/",
-        },
-    )
-    resp.raise_for_status()
-    data = resp.json().get("data") or {}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+        ),
+        "Referer": "https://quote.eastmoney.com/",
+    }
+    last_error: Exception | None = None
+    data = {}
+    for attempt in range(5):
+        try:
+            resp = requests.get(KLINE_URL, params=params, timeout=20, headers=headers)
+            resp.raise_for_status()
+            data = resp.json().get("data") or {}
+            break
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == 4:
+                raise
+            time.sleep(2 * (attempt + 1))
+    if not data and last_error:
+        raise last_error
     rows = []
     for item in data.get("klines") or []:
         parts = item.split(",")
