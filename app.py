@@ -29,6 +29,7 @@ from hc_strategy_scanner import (
     prepare_scan_frame as prepare_hc_scan_frame,
 )
 from evaluate_historical_quality import load_or_build_quality as build_hc_signal_quality
+import csi1000_timing
 
 try:
     import baostock as bs
@@ -75,6 +76,9 @@ HC_PROGRESS = {}
 HC_PROGRESS_LOCK = threading.Lock()
 HC_SYNC_THREADS = {}
 HC_SYNC_THREADS_LOCK = threading.Lock()
+CSI1000_RUN_KEY = "default"
+CSI1000_BACKTEST_START = "2016-06-20"
+CSI1000_EXCEL_PATH = os.path.join(BASE_DIR, "data", "历史新高新低300和1000.xlsx")
 EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 EASTMONEY_TRENDS_URLS = [
     "https://push2delay.eastmoney.com/api/qt/stock/trends2/get",
@@ -500,6 +504,172 @@ def coerce_float(value, default, min_value=None, max_value=None):
     if max_value is not None:
         value = min(max_value, value)
     return value
+
+
+def json_safe(value):
+    if value is None:
+        return None
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    try:
+        if math.isnan(value):
+            return None
+    except TypeError:
+        pass
+    return value
+
+
+def row_to_plain(row):
+    if not row:
+        return None
+    return {key: json_safe(row[key]) for key in row.keys()}
+
+
+def csi1000_direction_text(direction):
+    if direction == "LONG":
+        return "多1000"
+    if direction == "SHORT":
+        return "空1000"
+    return "空仓"
+
+
+def csi1000_display_exit_reason(row, latest_signal):
+    if row["exit_reason"] == "end_of_data":
+        latest_state = (latest_signal or {}).get("trade_state")
+        direction_state = csi1000_direction_text(row["direction"])
+        if latest_state == direction_state and row["exit_date"] == (latest_signal or {}).get("trade_date"):
+            return "持有中"
+    return row["exit_reason"] or "-"
+
+
+def run_csi1000_timing_job(end_date=None, sync_index=False, backfill_width=False):
+    config = csi1000_timing.STRATEGY_PRESETS["low_dd"]
+    config = csi1000_timing.replace(config, fee_bps=2.0)
+    target_date = (
+        datetime.strptime(end_date, "%Y-%m-%d")
+        if end_date
+        else datetime.now()
+    )
+    end_dash = target_date.strftime("%Y-%m-%d")
+    conn = csi1000_timing.connect(DB_PATH)
+    try:
+        csi1000_timing.init_db(conn)
+        if sync_index:
+            fetch_start = (target_date - timedelta(days=45)).strftime("%Y%m%d")
+            csi1000_timing.cmd_fetch_index_prices(
+                conn,
+                start=fetch_start,
+                end=target_date.strftime("%Y%m%d"),
+            )
+        if backfill_width:
+            width_start = (target_date - timedelta(days=90)).strftime("%Y-%m-%d")
+            csi1000_timing.cmd_backfill_width(
+                conn,
+                start=width_start,
+                end=end_dash,
+                force=True,
+            )
+        df = csi1000_timing.load_frame_by_source(
+            conn,
+            "db",
+            CSI1000_EXCEL_PATH,
+            start=CSI1000_BACKTEST_START,
+            end=end_dash,
+        )
+        if df.empty:
+            raise RuntimeError("没有可用的中证1000择时数据")
+        signals = csi1000_timing.generate_and_save_signals(conn, df, config)
+        result = csi1000_timing.backtest(conn, df, config, CSI1000_RUN_KEY)
+        latest = signals.tail(1).to_dict("records")[0] if not signals.empty else {}
+        return {
+            "ok": True,
+            "run_key": CSI1000_RUN_KEY,
+            "synced_index": bool(sync_index),
+            "backfilled_width": bool(backfill_width),
+            "result": result,
+            "latest_signal": {k: json_safe(v) for k, v in latest.items()},
+            "updated_at": local_now_text(),
+        }
+    finally:
+        conn.close()
+
+
+def load_csi1000_timing_payload(days=365, run_key=CSI1000_RUN_KEY):
+    days = clamp(int(days), 30, 3650)
+    conn = get_db()
+    try:
+        csi1000_timing.init_db(conn)
+        latest_row = conn.execute("""
+            SELECT trade_date, signal, trade_state, action, reason, csi_close,
+                   csi_score, hs300_score, csi_score_ma3, hs300_score_ma3,
+                   vol_ratio_5_20, price_from_low10, drawdown_from_high10,
+                   pct_2d, payload_json, updated_at
+            FROM csi1000_timing_signals
+            ORDER BY trade_date DESC
+            LIMIT 1
+        """).fetchone()
+        latest_signal = row_to_plain(latest_row) or {}
+        if latest_signal.get("payload_json"):
+            try:
+                latest_signal["payload"] = json.loads(latest_signal.pop("payload_json"))
+            except (TypeError, ValueError):
+                latest_signal.pop("payload_json", None)
+        anchor_text = latest_signal.get("trade_date") or datetime.now().strftime("%Y-%m-%d")
+        anchor = datetime.strptime(anchor_text, "%Y-%m-%d")
+        cutoff = (anchor - timedelta(days=days)).strftime("%Y-%m-%d")
+
+        trade_rows = conn.execute("""
+            SELECT id, run_key, direction, entry_date, entry_price, exit_date, exit_price,
+                   exit_reason, hold_days, return_pct, signal_date, entry_reason
+            FROM csi1000_timing_trades
+            WHERE run_key = ?
+              AND COALESCE(exit_date, entry_date) >= ?
+            ORDER BY entry_date DESC, id DESC
+        """, (run_key, cutoff)).fetchall()
+        trades = []
+        for row in trade_rows:
+            item = row_to_plain(row)
+            item["direction_text"] = csi1000_direction_text(item["direction"])
+            item["exit_reason_text"] = csi1000_display_exit_reason(row, latest_signal)
+            item["is_open_mark"] = item["exit_reason_text"] == "持有中"
+            trades.append(item)
+
+        all_rows = conn.execute("""
+            SELECT direction, return_pct
+            FROM csi1000_timing_trades
+            WHERE run_key = ?
+              AND COALESCE(exit_date, entry_date) >= ?
+        """, (run_key, cutoff)).fetchall()
+        returns = [float(r["return_pct"]) for r in all_rows if r["return_pct"] is not None]
+        long_returns = [
+            float(r["return_pct"]) for r in all_rows
+            if r["direction"] == "LONG" and r["return_pct"] is not None
+        ]
+        short_returns = [
+            float(r["return_pct"]) for r in all_rows
+            if r["direction"] == "SHORT" and r["return_pct"] is not None
+        ]
+        summary = {
+            "days": days,
+            "start_date": cutoff,
+            "end_date": anchor_text,
+            "trade_count": len(returns),
+            "win_rate_pct": (sum(1 for x in returns if x > 0) / len(returns) * 100) if returns else 0,
+            "return_sum_pct": sum(returns),
+            "long_count": len(long_returns),
+            "long_return_sum_pct": sum(long_returns),
+            "short_count": len(short_returns),
+            "short_return_sum_pct": sum(short_returns),
+        }
+        return {
+            "run_key": run_key,
+            "latest_signal": latest_signal,
+            "summary": summary,
+            "trades": trades,
+            "updated_at": local_now_text(),
+        }
+    finally:
+        conn.close()
 
 
 def build_hc_params(args):
@@ -5230,6 +5400,7 @@ HTML = """<!DOCTYPE html>
     <a class="nav-link" href="/pattern">收盘形态</a>
     <a class="nav-link" href="/momentum">14:30 选股</a>
     <a class="nav-link" href="/high-confidence">高置信小集合</a>
+    <a class="nav-link" href="/csi1000">中证1000择时</a>
     <select class="days-select" id="daysSelect" onchange="loadData()">
       <option value="5">最近 5 日</option>
       <option value="10">最近 10 日</option>
@@ -5721,6 +5892,7 @@ MOMENTUM_HTML = """<!DOCTYPE html>
     <a class="nav-link" href="/pattern">收盘形态</a>
     <a class="nav-link" href="/">行业宽度</a>
     <a class="nav-link" href="/high-confidence">高置信小集合</a>
+    <a class="nav-link" href="/csi1000">中证1000择时</a>
   </div>
 </div>
 
@@ -6266,6 +6438,7 @@ PATTERN_HTML = """<!DOCTYPE html>
     <a class="nav-link" href="/">行业宽度</a>
     <a class="nav-link" href="/momentum">14:30 选股</a>
     <a class="nav-link" href="/high-confidence">高置信小集合</a>
+    <a class="nav-link" href="/csi1000">中证1000择时</a>
   </div>
 </div>
 
@@ -6916,6 +7089,7 @@ tr:last-child td { border-bottom:0; }
     <a href="/">行业宽度</a>
     <a href="/pattern">收盘形态</a>
     <a href="/momentum">14:30 选股</a>
+    <a href="/csi1000">中证1000择时</a>
   </div>
 </div>
 
@@ -7110,6 +7284,226 @@ loadData();
 """
 
 
+CSI1000_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>中证1000择时</title>
+<style>
+  :root {
+    --bg:#0f1218; --panel:#171b24; --panel2:#1e2430; --line:#2b3242;
+    --text:#d7dce7; --muted:#8b93a4; --head:#ffffff;
+    --red:#ff5c7a; --green:#19c37d; --blue:#4d8dff; --yellow:#e5b84b;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--text);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif;
+  }
+  .wrap { max-width:1180px; margin:0 auto; padding:24px; }
+  header {
+    display:flex; justify-content:space-between; gap:18px; align-items:flex-end;
+    border-bottom:1px solid var(--line); padding-bottom:18px; margin-bottom:18px;
+  }
+  h1 { margin:0; font-size:22px; font-weight:650; color:var(--head); }
+  .sub { margin-top:4px; color:var(--muted); font-size:12px; }
+  nav { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+  nav a, button, select {
+    border:1px solid var(--line); background:var(--panel2); color:var(--text);
+    border-radius:6px; padding:7px 11px; text-decoration:none; font:inherit; cursor:pointer;
+  }
+  button.primary { background:var(--blue); border-color:var(--blue); color:#fff; }
+  button:disabled { opacity:.55; cursor:wait; }
+  .grid { display:grid; grid-template-columns:1.1fr .9fr; gap:14px; margin-bottom:14px; }
+  .section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+  .label { color:var(--muted); font-size:12px; margin-bottom:4px; }
+  .state { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .state strong { font-size:28px; color:var(--head); }
+  .pill { display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:999px; padding:3px 9px; font-size:12px; color:var(--muted); }
+  .pill.long { color:var(--green); border-color:rgba(25,195,125,.45); }
+  .pill.short { color:var(--red); border-color:rgba(255,92,122,.45); }
+  .pill.flat { color:var(--yellow); border-color:rgba(229,184,75,.45); }
+  .metrics { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:10px; margin-top:14px; }
+  .latest-metrics { display:none; }
+  .metric { background:var(--panel2); border:1px solid var(--line); border-radius:7px; padding:11px; min-height:70px; }
+  .metric .v { margin-top:4px; color:var(--head); font-size:18px; font-weight:650; }
+  .toolbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin:18px 0 10px; }
+  .toolbar h2 { margin:0; color:var(--head); font-size:17px; }
+  .controls { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  th, td { padding:10px 9px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }
+  th { color:var(--muted); font-size:12px; font-weight:500; background:#151923; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  tr:last-child td { border-bottom:0; }
+  .pos { color:var(--green); }
+  .neg { color:var(--red); }
+  .muted { color:var(--muted); }
+  .reason { max-width:160px; overflow:hidden; text-overflow:ellipsis; }
+  .empty { padding:36px; text-align:center; color:var(--muted); border:1px solid var(--line); border-radius:8px; background:var(--panel); }
+  @media (max-width: 860px) {
+    .wrap { padding:16px; }
+    header { align-items:flex-start; flex-direction:column; }
+    .grid { grid-template-columns:1fr; }
+    .metrics { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+    .table-scroll { overflow-x:auto; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>中证1000择时</h1>
+      <div class="sub">稳定低回撤版本，信号与交易记录来自本地数据库</div>
+    </div>
+    <nav>
+      <a href="/">行业宽度</a>
+      <a href="/pattern">收盘形态</a>
+      <a href="/momentum">14:30 选股</a>
+      <a href="/high-confidence">高置信小集合</a>
+    </nav>
+  </header>
+
+  <div class="grid">
+    <section class="section">
+      <div class="label">最新做单状态</div>
+      <div class="state">
+        <strong id="latestState">加载中</strong>
+        <span class="pill" id="latestDate">-</span>
+        <span class="pill" id="latestAction">-</span>
+      </div>
+      <div class="sub" id="latestReason">-</div>
+      <div class="metrics latest-metrics">
+        <div class="metric"><div class="label">中证1000收盘</div><div class="v" id="mClose">-</div></div>
+        <div class="metric"><div class="label">1000宽度MA3</div><div class="v" id="mCsi">-</div></div>
+        <div class="metric"><div class="label">300宽度MA3</div><div class="v" id="mHs300">-</div></div>
+        <div class="metric"><div class="label">量比5/20</div><div class="v" id="mVol">-</div></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="label">近一年交易汇总</div>
+      <div class="metrics">
+        <div class="metric"><div class="label">交易次数</div><div class="v" id="sTrades">-</div></div>
+        <div class="metric"><div class="label">胜率</div><div class="v" id="sWin">-</div></div>
+        <div class="metric"><div class="label">多单收益和</div><div class="v" id="sLong">-</div></div>
+        <div class="metric"><div class="label">空单收益和</div><div class="v" id="sShort">-</div></div>
+      </div>
+      <div class="sub" id="sRange">-</div>
+    </section>
+  </div>
+
+  <div class="toolbar">
+    <h2>历史做多/做空记录</h2>
+    <div class="controls">
+      <select id="days">
+        <option value="365">最近一年</option>
+        <option value="180">最近半年</option>
+        <option value="730">最近两年</option>
+      </select>
+      <button id="reloadBtn">刷新页面数据</button>
+      <button class="primary" id="runBtn">重跑信号</button>
+    </div>
+  </div>
+  <div class="table-scroll" id="tableWrap"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = (v, d=2) => v === null || v === undefined || Number.isNaN(Number(v)) ? '-' : Number(v).toFixed(d);
+const pct = (v, d=2) => v === null || v === undefined || Number.isNaN(Number(v)) ? '-' : Number(v).toFixed(d) + '%';
+const ratioPct = (v, d=2) => v === null || v === undefined || Number.isNaN(Number(v)) ? '-' : (Number(v) * 100).toFixed(d) + '%';
+const cls = v => Number(v) >= 0 ? 'pos' : 'neg';
+function stateClass(text) {
+  if (text === '多1000') return 'pill long';
+  if (text === '空1000') return 'pill short';
+  return 'pill flat';
+}
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function render(data) {
+  const sig = data.latest_signal || {};
+  const payload = sig.payload || {};
+  $('latestState').textContent = sig.trade_state || '空仓';
+  $('latestDate').textContent = sig.trade_date || '-';
+  $('latestDate').className = stateClass(sig.trade_state || '空仓');
+  $('latestAction').textContent = sig.action || '-';
+  $('latestReason').textContent = sig.reason || '-';
+  $('mClose').textContent = fmt(sig.csi_close ?? payload.close, 2);
+  $('mCsi').textContent = fmt(sig.csi_score_ma3 ?? payload.csi_score_ma3, 1);
+  $('mHs300').textContent = fmt(sig.hs300_score_ma3 ?? payload.hs300_score_ma3, 1);
+  $('mVol').textContent = fmt(sig.vol_ratio_5_20 ?? payload.vol_ratio_5_20, 3);
+
+  const s = data.summary || {};
+  $('sTrades').textContent = s.trade_count ?? '-';
+  $('sWin').textContent = pct(s.win_rate_pct, 1);
+  $('sLong').textContent = pct(s.long_return_sum_pct, 2);
+  $('sLong').className = 'v ' + cls(s.long_return_sum_pct || 0);
+  $('sShort').textContent = pct(s.short_return_sum_pct, 2);
+  $('sShort').className = 'v ' + cls(s.short_return_sum_pct || 0);
+  $('sRange').textContent = `${s.start_date || '-'} 至 ${s.end_date || '-'}，多单 ${s.long_count || 0} 笔，空单 ${s.short_count || 0} 笔`;
+
+  const rows = data.trades || [];
+  if (!rows.length) {
+    $('tableWrap').innerHTML = '<div class="empty">暂无最近一年交易记录</div>';
+    return;
+  }
+  let html = `<table><thead><tr>
+    <th>方向</th><th>开始日期</th><th>终止日期</th><th class="num">开仓价</th>
+    <th class="num">平仓/最新价</th><th class="num">持有天数</th><th class="num">收益</th>
+    <th>开仓原因</th><th>平仓原因</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    const p = Number(r.return_pct);
+    const endText = r.is_open_mark ? '持有中' : (r.exit_date || '-');
+    html += `<tr>
+      <td><span class="${stateClass(r.direction_text)}">${esc(r.direction_text)}</span></td>
+      <td>${esc(r.entry_date)}</td>
+      <td>${esc(endText)}</td>
+      <td class="num">${fmt(r.entry_price, 2)}</td>
+      <td class="num">${fmt(r.exit_price, 2)}</td>
+      <td class="num">${r.hold_days ?? '-'}</td>
+      <td class="num ${cls(p)}">${pct(p, 2)}</td>
+      <td class="reason" title="${esc(r.entry_reason)}">${esc(r.entry_reason || '-')}</td>
+      <td class="reason" title="${esc(r.exit_reason_text)}">${esc(r.exit_reason_text || '-')}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  $('tableWrap').innerHTML = html;
+}
+async function loadData() {
+  $('tableWrap').innerHTML = '<div class="empty">加载中</div>';
+  const res = await fetch('/api/csi1000-timing?days=' + encodeURIComponent($('days').value));
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || '加载失败');
+  render(data);
+}
+async function rerun() {
+  const btn = $('runBtn');
+  btn.disabled = true;
+  btn.textContent = '重跑中';
+  try {
+    const res = await fetch('/api/csi1000-timing/refresh', {method:'POST'});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '重跑失败');
+    await loadData();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '重跑信号';
+  }
+}
+$('days').addEventListener('change', loadData);
+$('reloadBtn').addEventListener('click', loadData);
+$('runBtn').addEventListener('click', rerun);
+loadData().catch(err => { $('tableWrap').innerHTML = `<div class="empty">${esc(err.message)}</div>`; });
+</script>
+</body>
+</html>
+"""
+
+
 # ─────────────────────────────────────────────────────────────────
 # 路由
 # ─────────────────────────────────────────────────────────────────
@@ -7131,6 +7525,30 @@ def pattern_page():
 @app.route("/high-confidence")
 def high_confidence_page():
     return render_template_string(HIGH_CONFIDENCE_HTML)
+
+
+@app.route("/csi1000")
+def csi1000_page():
+    return render_template_string(CSI1000_HTML)
+
+
+@app.route("/api/csi1000-timing")
+def api_csi1000_timing():
+    days = to_int_arg("days", 365, 30, 3650)
+    return jsonify(load_csi1000_timing_payload(days=days))
+
+
+@app.route("/api/csi1000-timing/refresh", methods=["POST"])
+def api_csi1000_timing_refresh():
+    sync_index = str(request.args.get("syncIndex") or "").lower() in ("1", "true", "yes", "on")
+    backfill_width = str(request.args.get("backfillWidth") or "").lower() in ("1", "true", "yes", "on")
+    end_date = normalize_trade_date(request.args.get("date") or request.args.get("tradeDate"), None)
+    payload = run_csi1000_timing_job(
+        end_date=end_date,
+        sync_index=sync_index,
+        backfill_width=backfill_width,
+    )
+    return jsonify(payload)
 
 
 @app.route("/api/high-confidence/scan")
@@ -9027,6 +9445,8 @@ def parse_cli_args():
                          help="扫描并保存收盘K线形态")
     actions.add_argument("--pattern-backfill", action="store_true",
                          help="回扫并保存最近一段时间的四针形态结果")
+    actions.add_argument("--csi1000-daily", action="store_true",
+                         help="重算中证1000择时信号和最近10年回测记录")
 
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5000)
@@ -9130,6 +9550,10 @@ def parse_cli_args():
                         help="收盘形态扫描最低成交额，单位万元；不填则不限制")
     parser.add_argument("--pattern-backfill-days", type=int, default=None,
                         help="收盘形态历史回扫天数；不填时四根针365天，底部反转30天")
+    parser.add_argument("--csi1000-sync-index", action="store_true",
+                        help="配合 --csi1000-daily 同步沪深300/中证1000指数日线")
+    parser.add_argument("--csi1000-backfill-width", action="store_true",
+                        help="配合 --csi1000-daily 补算最近宽度指标")
     return parser.parse_args()
 
 
@@ -9154,6 +9578,26 @@ def main():
             run_id=result["run_id"],
             saved=result["saved"],
         )
+    elif args.csi1000_daily:
+        result = run_csi1000_timing_job(
+            end_date=args.trade_date,
+            sync_index=args.csi1000_sync_index,
+            backfill_width=args.csi1000_backfill_width,
+        )
+        latest = result.get("latest_signal") or {}
+        backtest_result = result.get("result") or {}
+        print(json.dumps({
+            "updated_at": result.get("updated_at"),
+            "trade_date": latest.get("trade_date"),
+            "trade_state": latest.get("trade_state"),
+            "action": latest.get("action"),
+            "reason": latest.get("reason"),
+            "total_return_pct": backtest_result.get("total_return_pct"),
+            "max_drawdown_pct": backtest_result.get("max_drawdown_pct"),
+            "trade_count": backtest_result.get("trade_count"),
+            "synced_index": result.get("synced_index"),
+            "backfilled_width": result.get("backfilled_width"),
+        }, ensure_ascii=False, indent=2))
     elif args.momentum_scan_save:
         payload, status_code = perform_momentum_scan(params, started_at=time.time())
         conn = get_db()

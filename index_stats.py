@@ -385,7 +385,14 @@ def cmd_calc_today(conn):
     log.info(f"今日计算完成，共 {len(results)} 个指数")
 
 
-def cmd_calc_intraday(conn):
+def parse_index_codes(value):
+    if not value:
+        return None
+    codes = [item.strip() for item in value.split(",") if item.strip()]
+    return codes or None
+
+
+def cmd_calc_intraday(conn, index_codes=None):
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")
     if now.weekday() >= 5:
@@ -404,7 +411,14 @@ def cmd_calc_intraday(conn):
     log.info(f"计算盘中快照（{today} {slot}）行业宽度指标")
 
     cur = conn.cursor()
-    cur.execute("SELECT code, name FROM indices ORDER BY code")
+    if index_codes:
+        placeholders = ",".join("?" * len(index_codes))
+        cur.execute(
+            f"SELECT code, name FROM indices WHERE code IN ({placeholders}) ORDER BY code",
+            index_codes,
+        )
+    else:
+        cur.execute("SELECT code, name FROM indices ORDER BY code")
     indices = cur.fetchall()
     if not indices:
         log.warning("没有维护的指数，请先运行 index.py --init-all")
@@ -667,6 +681,8 @@ def main():
     parser = argparse.ArgumentParser(description="行业宽度指标计算")
     parser.add_argument("--calc-today",   action="store_true",   help="计算今日所有行业指标")
     parser.add_argument("--calc-intraday", action="store_true",  help="计算盘中快照，并刷新今日最新值")
+    parser.add_argument("--index-codes", default=None,
+                        help="配合 --calc-intraday 指定指数代码，逗号分隔，如 000300,000852")
     parser.add_argument("--backfill",     metavar="CODE",        help="回填指定指数历史净值")
     parser.add_argument("--backfill-all", action="store_true",   help="回填所有指数历史净值")
     parser.add_argument("--recent-days",  type=int, metavar="N",   help="补算所有指数最近N个交易日净值，如: --recent-days 20")
@@ -686,7 +702,7 @@ def main():
     if args.calc_today:
         cmd_calc_today(conn)
     elif args.calc_intraday:
-        cmd_calc_intraday(conn)
+        cmd_calc_intraday(conn, index_codes=parse_index_codes(args.index_codes))
     elif args.backfill:
         cmd_backfill(conn, args.backfill, force=args.force)
     elif args.backfill_all:

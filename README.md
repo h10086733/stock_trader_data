@@ -184,6 +184,7 @@ python app.py
 # crontab -e
 30 11 * * 1-5  cd ~/project/stock_trader_data && python3 fetch.py --sync && python3 index_stats.py --calc-intraday >> cron.log 2>&1
 30 14 * * 1-5  cd ~/project/stock_trader_data && python3 app.py --momentum-daily >> momentum_cron.log 2>&1
+50 14 * * 1-5  cd ~/project/stock_trader_data && ./scripts/run_csi1000_1450_job.sh >> csi1000_timing_cron.log 2>&1
 00 15 * * 1-5 cd ~/project/stock_trader_data && python3 fetch.py --sync && python3 index_stats.py --calc-intraday >> cron.log 2>&1
 35 16 * * 1-5  cd ~/project/stock_trader_data && python3 fetch.py --sync && python3 index_stats.py --calc-today >> cron.log 2>&1
 20 18 * * 0 cd ~/project/stock_trader_data && python3 index.py --update-all >> index_constituents_cron.log 2>&1
@@ -258,6 +259,16 @@ python csi1000_timing.py --signal
 # 查看最近信号和交易
 python csi1000_timing.py --signals --limit 20
 python csi1000_timing.py --trades --limit 20
+
+# Web 页面
+python app.py --serve
+# 浏览器访问 http://localhost:5000/csi1000
+
+# 定时刷新页面使用的信号和最近一年交易记录
+python app.py --csi1000-daily
+
+# 14:50 盘中任务：同步股票实时行情 -> 只重算沪深300/中证1000宽度 -> 同步指数行情 -> 重跑择时信号
+./scripts/run_csi1000_1450_job.sh
 ```
 
 注意：`--backfill-width` 使用当前成分股反推历史宽度，适合快速验证策略，但不是严格历史成分股口径。
