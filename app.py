@@ -17,6 +17,7 @@ import json
 import math
 import os
 import pickle
+import subprocess
 import sys
 import threading
 import time
@@ -542,7 +543,20 @@ def csi1000_display_exit_reason(row, latest_signal):
     return row["exit_reason"] or "-"
 
 
-def run_csi1000_timing_job(end_date=None, sync_index=False, backfill_width=False):
+def has_csi1000_index_prices(conn, trade_date):
+    row = conn.execute("""
+        SELECT COUNT(DISTINCT index_code) AS n
+        FROM index_prices
+        WHERE trade_date = ?
+          AND index_code IN ('000300', '000852')
+          AND close IS NOT NULL
+          AND close > 0
+    """, (trade_date,)).fetchone()
+    return bool(row and row["n"] == 2)
+
+
+def run_csi1000_timing_job(end_date=None, sync_index=False, backfill_width=False,
+                           lookback_days=None):
     config = csi1000_timing.STRATEGY_PRESETS["low_dd"]
     config = csi1000_timing.replace(config, fee_bps=2.0)
     target_date = (
@@ -551,16 +565,40 @@ def run_csi1000_timing_job(end_date=None, sync_index=False, backfill_width=False
         else datetime.now()
     )
     end_dash = target_date.strftime("%Y-%m-%d")
+    start_dash = (
+        target_date - timedelta(days=lookback_days)
+    ).strftime("%Y-%m-%d") if lookback_days else CSI1000_BACKTEST_START
     conn = csi1000_timing.connect(DB_PATH)
     try:
         csi1000_timing.init_db(conn)
+        index_sync_source = None
         if sync_index:
-            fetch_start = (target_date - timedelta(days=45)).strftime("%Y%m%d")
-            csi1000_timing.cmd_fetch_index_prices(
-                conn,
-                start=fetch_start,
-                end=target_date.strftime("%Y%m%d"),
-            )
+            if has_csi1000_index_prices(conn, end_dash):
+                index_sync_source = "local_db"
+            else:
+                fetch_start = (target_date - timedelta(days=45)).strftime("%Y%m%d")
+                try:
+                    csi1000_timing.cmd_fetch_index_prices(
+                        conn,
+                        start=fetch_start,
+                        end=target_date.strftime("%Y%m%d"),
+                    )
+                    index_sync_source = "history_kline"
+                except requests.RequestException as exc:
+                    print(f"指数历史K线同步失败，改用实时行情兜底: {exc}", file=sys.stderr)
+                    try:
+                        rows = csi1000_timing.fetch_index_realtime_sina(trade_date=end_dash)
+                        saved = csi1000_timing.save_index_prices(conn, rows)
+                        if saved <= 0:
+                            raise RuntimeError("新浪指数实时行情没有返回有效数据")
+                        index_sync_source = "sina_realtime_fallback"
+                    except Exception as sina_exc:
+                        print(f"新浪指数实时行情失败，改用东方财富实时行情: {sina_exc}", file=sys.stderr)
+                        rows = csi1000_timing.fetch_index_realtime_quotes(trade_date=end_dash)
+                        saved = csi1000_timing.save_index_prices(conn, rows)
+                        if saved <= 0:
+                            raise
+                        index_sync_source = "eastmoney_realtime_fallback"
         if backfill_width:
             width_start = (target_date - timedelta(days=90)).strftime("%Y-%m-%d")
             csi1000_timing.cmd_backfill_width(
@@ -573,7 +611,7 @@ def run_csi1000_timing_job(end_date=None, sync_index=False, backfill_width=False
             conn,
             "db",
             CSI1000_EXCEL_PATH,
-            start=CSI1000_BACKTEST_START,
+            start=start_dash,
             end=end_dash,
         )
         if df.empty:
@@ -584,7 +622,10 @@ def run_csi1000_timing_job(end_date=None, sync_index=False, backfill_width=False
         return {
             "ok": True,
             "run_key": CSI1000_RUN_KEY,
+            "start": start_dash,
+            "end": end_dash,
             "synced_index": bool(sync_index),
+            "index_sync_source": index_sync_source,
             "backfilled_width": bool(backfill_width),
             "result": result,
             "latest_signal": {k: json_safe(v) for k, v in latest.items()},
@@ -594,7 +635,32 @@ def run_csi1000_timing_job(end_date=None, sync_index=False, backfill_width=False
         conn.close()
 
 
-def load_csi1000_timing_payload(days=365, run_key=CSI1000_RUN_KEY):
+def run_csi1000_realtime_today_job():
+    script_path = os.path.join(BASE_DIR, "scripts", "run_csi1000_1450_job.sh")
+    started_at = time.time()
+    proc = subprocess.run(
+        [script_path],
+        cwd=BASE_DIR,
+        text=True,
+        capture_output=True,
+        timeout=900,
+        check=False,
+    )
+    payload = {
+        "ok": proc.returncode == 0,
+        "returncode": proc.returncode,
+        "elapsed_s": round(time.time() - started_at, 1),
+        "stdout_tail": proc.stdout[-6000:],
+        "stderr_tail": proc.stderr[-6000:],
+        "updated_at": local_now_text(),
+    }
+    if proc.returncode != 0:
+        return payload, 500
+    payload["data"] = load_csi1000_timing_payload(days=180)
+    return payload, 200
+
+
+def load_csi1000_timing_payload(days=180, run_key=CSI1000_RUN_KEY):
     days = clamp(int(days), 30, 3650)
     conn = get_db()
     try:
@@ -7383,7 +7449,7 @@ CSI1000_HTML = """<!doctype html>
     </section>
 
     <section class="section">
-      <div class="label">近一年交易汇总</div>
+      <div class="label">区间交易汇总</div>
       <div class="metrics">
         <div class="metric"><div class="label">交易次数</div><div class="v" id="sTrades">-</div></div>
         <div class="metric"><div class="label">胜率</div><div class="v" id="sWin">-</div></div>
@@ -7398,12 +7464,13 @@ CSI1000_HTML = """<!doctype html>
     <h2>历史做多/做空记录</h2>
     <div class="controls">
       <select id="days">
+        <option value="180" selected>最近半年</option>
         <option value="365">最近一年</option>
-        <option value="180">最近半年</option>
         <option value="730">最近两年</option>
       </select>
       <button id="reloadBtn">刷新页面数据</button>
       <button class="primary" id="runBtn">重跑信号</button>
+      <button class="primary" id="realtimeBtn">实时跑今日</button>
     </div>
   </div>
   <div class="table-scroll" id="tableWrap"></div>
@@ -7447,7 +7514,7 @@ function render(data) {
 
   const rows = data.trades || [];
   if (!rows.length) {
-    $('tableWrap').innerHTML = '<div class="empty">暂无最近一年交易记录</div>';
+    $('tableWrap').innerHTML = '<div class="empty">暂无区间交易记录</div>';
     return;
   }
   let html = `<table><thead><tr>
@@ -7494,9 +7561,28 @@ async function rerun() {
     btn.textContent = '重跑信号';
   }
 }
+async function runRealtimeToday() {
+  const btn = $('realtimeBtn');
+  btn.disabled = true;
+  btn.textContent = '实时运行中';
+  $('tableWrap').innerHTML = '<div class="empty">正在同步实时行情、重算宽度并生成今日信号</div>';
+  try {
+    const res = await fetch('/api/csi1000-timing/run-today', {method:'POST'});
+    const data = await res.json();
+    if (!res.ok) {
+      const msg = data.stderr_tail || data.stdout_tail || data.error || '实时运行失败';
+      throw new Error(msg);
+    }
+    await loadData();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '实时跑今日';
+  }
+}
 $('days').addEventListener('change', loadData);
 $('reloadBtn').addEventListener('click', loadData);
 $('runBtn').addEventListener('click', rerun);
+$('realtimeBtn').addEventListener('click', runRealtimeToday);
 loadData().catch(err => { $('tableWrap').innerHTML = `<div class="empty">${esc(err.message)}</div>`; });
 </script>
 </body>
@@ -7534,7 +7620,7 @@ def csi1000_page():
 
 @app.route("/api/csi1000-timing")
 def api_csi1000_timing():
-    days = to_int_arg("days", 365, 30, 3650)
+    days = to_int_arg("days", 180, 30, 3650)
     return jsonify(load_csi1000_timing_payload(days=days))
 
 
@@ -7549,6 +7635,12 @@ def api_csi1000_timing_refresh():
         backfill_width=backfill_width,
     )
     return jsonify(payload)
+
+
+@app.route("/api/csi1000-timing/run-today", methods=["POST"])
+def api_csi1000_timing_run_today():
+    payload, status = run_csi1000_realtime_today_job()
+    return jsonify(payload), status
 
 
 @app.route("/api/high-confidence/scan")
@@ -9554,6 +9646,8 @@ def parse_cli_args():
                         help="配合 --csi1000-daily 同步沪深300/中证1000指数日线")
     parser.add_argument("--csi1000-backfill-width", action="store_true",
                         help="配合 --csi1000-daily 补算最近宽度指标")
+    parser.add_argument("--csi1000-lookback-days", type=int, default=180,
+                        help="配合 --csi1000-daily 指定策略回测回看自然日，默认180天")
     return parser.parse_args()
 
 
@@ -9583,11 +9677,14 @@ def main():
             end_date=args.trade_date,
             sync_index=args.csi1000_sync_index,
             backfill_width=args.csi1000_backfill_width,
+            lookback_days=args.csi1000_lookback_days,
         )
         latest = result.get("latest_signal") or {}
         backtest_result = result.get("result") or {}
         print(json.dumps({
             "updated_at": result.get("updated_at"),
+            "start": result.get("start"),
+            "end": result.get("end"),
             "trade_date": latest.get("trade_date"),
             "trade_state": latest.get("trade_state"),
             "action": latest.get("action"),
@@ -9596,6 +9693,7 @@ def main():
             "max_drawdown_pct": backtest_result.get("max_drawdown_pct"),
             "trade_count": backtest_result.get("trade_count"),
             "synced_index": result.get("synced_index"),
+            "index_sync_source": result.get("index_sync_source"),
             "backfilled_width": result.get("backfilled_width"),
         }, ensure_ascii=False, indent=2))
     elif args.momentum_scan_save:

@@ -264,10 +264,10 @@ python csi1000_timing.py --trades --limit 20
 python app.py --serve
 # 浏览器访问 http://localhost:5000/csi1000
 
-# 定时刷新页面使用的信号和最近一年交易记录
-python app.py --csi1000-daily
+# 定时刷新页面使用的信号和最近半年交易记录
+python app.py --csi1000-daily --csi1000-lookback-days 180
 
-# 14:50 盘中任务：同步股票实时行情 -> 只重算沪深300/中证1000宽度 -> 同步指数行情 -> 重跑择时信号
+# 14:50 盘中任务：同步股票实时行情 -> 只重算沪深300/中证1000宽度 -> 同步/复用指数行情 -> 重跑最近半年择时信号
 ./scripts/run_csi1000_1450_job.sh
 ```
 

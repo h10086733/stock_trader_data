@@ -35,12 +35,23 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "stock_data.db"
 KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+SINA_PRICE_URL = "https://hq.sinajs.cn/list="
+QUOTE_URLS = [
+    "https://push2delay.eastmoney.com/api/qt/ulist.np/get",
+    "https://push2.eastmoney.com/api/qt/ulist.np/get",
+]
 
 
 INDEX_PRICE_SOURCES = {
     # 东方财富 secid：沪深/中证指数通常是 1.xxxxxx。
     "000300": {"name": "沪深300", "market": "1"},
     "000852": {"name": "中证1000", "market": "1"},
+}
+
+
+SINA_INDEX_SYMBOLS = {
+    "000300": "sh000300",
+    "000852": "sh000852",
 }
 
 
@@ -224,6 +235,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             created_at      DATETIME DEFAULT (datetime('now','localtime'))
         )
     """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_csi1000_trades_run_exit
+        ON csi1000_timing_trades(run_key, exit_date)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_csi1000_trades_run_entry
+        ON csi1000_timing_trades(run_key, entry_date)
+    """)
     conn.commit()
 
 
@@ -311,6 +330,126 @@ def fetch_index_kline(index_code: str, start: str, end: str | None = None) -> li
             "turnover": safe_float(parts[10]),
         })
     return rows
+
+
+def fetch_index_realtime_sina(trade_date: str | None = None) -> list[dict[str, Any]]:
+    trade_date = trade_date or datetime.today().strftime("%Y-%m-%d")
+    symbol_to_code = {symbol: code for code, symbol in SINA_INDEX_SYMBOLS.items()}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+        ),
+        "Referer": "https://finance.sina.com.cn/",
+    }
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            resp = requests.get(
+                SINA_PRICE_URL + ",".join(SINA_INDEX_SYMBOLS.values()),
+                timeout=15,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            rows = []
+            for line in resp.text.strip().splitlines():
+                if "=" not in line or '"' not in line:
+                    continue
+                prefix, payload = line.split("=", 1)
+                symbol = prefix.rsplit("_", 1)[-1]
+                index_code = symbol_to_code.get(symbol)
+                if not index_code:
+                    continue
+                parts = payload.strip().strip('";').split(",")
+                if len(parts) < 10:
+                    continue
+                close = safe_float(parts[3])
+                if close is None or close <= 0:
+                    continue
+                prev_close = safe_float(parts[2])
+                quote_date = parts[30] if len(parts) > 30 and parts[30] else trade_date
+                rows.append({
+                    "index_code": index_code,
+                    "trade_date": quote_date,
+                    "open": safe_float(parts[1]),
+                    "close": close,
+                    "high": safe_float(parts[4]),
+                    "low": safe_float(parts[5]),
+                    "volume": safe_float(parts[8]),
+                    "amount": safe_float(parts[9]),
+                    "pct_change": ((close - prev_close) / prev_close * 100.0 if prev_close else None),
+                    "turnover": None,
+                })
+            if rows:
+                return rows
+        except requests.RequestException as exc:
+            last_error = exc
+        time.sleep(2 * (attempt + 1))
+    if last_error:
+        raise last_error
+    return []
+
+
+def fetch_index_realtime_quotes(trade_date: str | None = None) -> list[dict[str, Any]]:
+    """用实时行情接口兜底写入当日 000300/000852 指数价格。"""
+    trade_date = trade_date or datetime.today().strftime("%Y-%m-%d")
+    secids = ",".join(
+        f"{source['market']}.{index_code}"
+        for index_code, source in INDEX_PRICE_SOURCES.items()
+    )
+    params = {
+        "fltt": 2,
+        "invt": 2,
+        "secids": secids,
+        "fields": "f12,f14,f2,f3,f5,f6,f15,f16,f17,f18",
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+        ),
+        "Referer": "https://quote.eastmoney.com/",
+    }
+    last_error: Exception | None = None
+    for attempt in range(5):
+        for url in QUOTE_URLS:
+            try:
+                resp = requests.get(url, params=params, timeout=15, headers=headers)
+                resp.raise_for_status()
+                diff = (resp.json().get("data") or {}).get("diff") or []
+                rows = []
+                for item in diff:
+                    index_code = str(item.get("f12") or "").strip()
+                    if index_code not in INDEX_PRICE_SOURCES:
+                        continue
+                    close = safe_float(item.get("f2"))
+                    if close is None or close <= 0:
+                        continue
+                    prev_close = safe_float(item.get("f18"))
+                    pct_change = safe_float(item.get("f3"))
+                    rows.append({
+                        "index_code": index_code,
+                        "trade_date": trade_date,
+                        "open": safe_float(item.get("f17")),
+                        "close": close,
+                        "high": safe_float(item.get("f15")),
+                        "low": safe_float(item.get("f16")),
+                        "volume": safe_float(item.get("f5")),
+                        "amount": safe_float(item.get("f6")),
+                        "pct_change": (
+                            pct_change if pct_change is not None
+                            else ((close - prev_close) / prev_close * 100.0 if prev_close else None)
+                        ),
+                        "turnover": None,
+                    })
+                if rows:
+                    return rows
+            except requests.RequestException as exc:
+                last_error = exc
+        time.sleep(2 * (attempt + 1))
+    if last_error:
+        raise last_error
+    return []
 
 
 def save_index_prices(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> int:
