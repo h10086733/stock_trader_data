@@ -614,7 +614,7 @@ def sync_csi1000_index_prices_for_run(conn, start_date, end_date, target_date):
             end=target_date.strftime("%Y%m%d"),
         )
         source = "history_kline"
-    except requests.RequestException as exc:
+    except (requests.RequestException, RuntimeError) as exc:
         print(f"指数历史K线同步失败，改用实时行情兜底: {exc}", file=sys.stderr)
         source = save_csi1000_realtime_index_prices(conn, end_date)
 

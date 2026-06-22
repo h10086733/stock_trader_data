@@ -55,6 +55,12 @@ SINA_INDEX_SYMBOLS = {
 }
 
 
+BAOSTOCK_INDEX_CODES = {
+    "000300": "sh.000300",
+    "000852": "sh.000852",
+}
+
+
 @dataclass(frozen=True)
 class StrategyConfig:
     long_csi_score_min: float = 10.0
@@ -276,6 +282,15 @@ def safe_float(value: Any, default: float | None = None) -> float | None:
         return default
 
 
+def normalize_baostock_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = value.strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return text
+
+
 def fetch_index_kline(index_code: str, start: str, end: str | None = None) -> list[dict[str, Any]]:
     source = INDEX_PRICE_SOURCES[index_code]
     end = end or datetime.today().strftime("%Y%m%d")
@@ -329,6 +344,57 @@ def fetch_index_kline(index_code: str, start: str, end: str | None = None) -> li
             "pct_change": safe_float(parts[8]),
             "turnover": safe_float(parts[10]),
         })
+    return rows
+
+
+def fetch_index_kline_baostock(index_code: str, start: str, end: str | None = None) -> list[dict[str, Any]]:
+    baostock_code = BAOSTOCK_INDEX_CODES.get(index_code)
+    if not baostock_code:
+        raise RuntimeError(f"baostock 不支持指数 {index_code}")
+    try:
+        import baostock as bs
+    except ImportError as exc:
+        raise RuntimeError("未安装 baostock，无法使用历史K线兜底") from exc
+
+    try:
+        login = bs.login()
+    except Exception as exc:
+        raise RuntimeError(f"baostock 登录异常: {exc}") from exc
+    if login.error_code != "0":
+        raise RuntimeError(f"baostock 登录失败: {login.error_code} {login.error_msg}")
+    fields = "date,open,high,low,close,preclose,volume,amount,pctChg"
+    rows = []
+    try:
+        rs = bs.query_history_k_data_plus(
+            baostock_code,
+            fields,
+            start_date=normalize_baostock_date(start),
+            end_date=normalize_baostock_date(end),
+            frequency="d",
+            adjustflag="3",
+        )
+        if rs.error_code != "0":
+            raise RuntimeError(f"baostock 查询失败: {rs.error_code} {rs.error_msg}")
+        columns = rs.fields
+        while rs.next():
+            data = dict(zip(columns, rs.get_row_data()))
+            close = safe_float(data.get("close"))
+            if close is None or close <= 0:
+                continue
+            rows.append({
+                "index_code": index_code,
+                "trade_date": data.get("date"),
+                "open": safe_float(data.get("open")),
+                "close": close,
+                "high": safe_float(data.get("high")),
+                "low": safe_float(data.get("low")),
+                "volume": safe_float(data.get("volume")),
+                "amount": safe_float(data.get("amount")),
+                "pct_change": safe_float(data.get("pctChg")),
+                "turnover": None,
+            })
+    finally:
+        bs.logout()
     return rows
 
 
@@ -481,10 +547,19 @@ def save_index_prices(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> i
 def cmd_fetch_index_prices(conn: sqlite3.Connection, start: str, end: str | None) -> None:
     init_db(conn)
     for index_code, source in INDEX_PRICE_SOURCES.items():
-        rows = fetch_index_kline(index_code, start=start, end=end)
+        provider = "eastmoney"
+        try:
+            rows = fetch_index_kline(index_code, start=start, end=end)
+        except (requests.RequestException, RuntimeError) as exc:
+            print(f"[{index_code}] {source['name']} 东方财富失败，改用 baostock: {exc}")
+            rows = fetch_index_kline_baostock(index_code, start=start, end=end)
+            provider = "baostock"
         saved = save_index_prices(conn, rows)
         if rows:
-            print(f"[{index_code}] {source['name']} 写入 {saved} 条：{rows[0]['trade_date']} ~ {rows[-1]['trade_date']}")
+            print(
+                f"[{index_code}] {source['name']} 写入 {saved} 条："
+                f"{rows[0]['trade_date']} ~ {rows[-1]['trade_date']} source={provider}"
+            )
         else:
             print(f"[{index_code}] {source['name']} 未获取到行情")
         time.sleep(0.5)
