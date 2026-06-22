@@ -7485,8 +7485,8 @@ CSI1000_HTML = """<!doctype html>
 <div class="wrap">
   <header>
     <div>
-      <h1>中证1000择时</h1>
-      <div class="sub">稳定低回撤版本，信号与交易记录来自本地数据库</div>
+      <h1>中证1000择时监控</h1>
+      <div class="sub">中证1000择时模型 · 本地行情与宽度数据</div>
     </div>
     <nav>
       <a href="/">行业宽度</a>
@@ -7498,7 +7498,7 @@ CSI1000_HTML = """<!doctype html>
 
   <div class="grid">
     <section class="section">
-      <div class="label">最新做单状态</div>
+      <div class="label">当前策略状态</div>
       <div class="state">
         <strong id="latestState">加载中</strong>
         <span class="pill" id="latestDate">-</span>
@@ -7514,28 +7514,28 @@ CSI1000_HTML = """<!doctype html>
     </section>
 
     <section class="section">
-      <div class="label">区间交易汇总</div>
+      <div class="label">区间交易归因</div>
       <div class="metrics">
-        <div class="metric"><div class="label">交易次数</div><div class="v" id="sTrades">-</div></div>
-        <div class="metric"><div class="label">胜率</div><div class="v" id="sWin">-</div></div>
-        <div class="metric"><div class="label">多单收益和</div><div class="v" id="sLong">-</div></div>
-        <div class="metric"><div class="label">空单收益和</div><div class="v" id="sShort">-</div></div>
+        <div class="metric"><div class="label">交易笔数</div><div class="v" id="sTrades">-</div></div>
+        <div class="metric"><div class="label">交易胜率</div><div class="v" id="sWin">-</div></div>
+        <div class="metric"><div class="label">多头交易贡献</div><div class="v" id="sLong">-</div></div>
+        <div class="metric"><div class="label">空头交易贡献</div><div class="v" id="sShort">-</div></div>
       </div>
       <div class="sub" id="sRange">-</div>
     </section>
   </div>
 
   <div class="toolbar">
-    <h2>历史做多/做空记录</h2>
+    <h2>已平仓交易明细</h2>
     <div class="controls">
       <select id="days">
         <option value="180" selected>最近半年</option>
         <option value="365">最近一年</option>
         <option value="730">最近两年</option>
       </select>
-      <button id="reloadBtn">刷新页面数据</button>
-      <button class="primary" id="runBtn">重跑信号</button>
-      <button class="primary" id="realtimeBtn">实时跑今日</button>
+      <button id="reloadBtn">刷新视图</button>
+      <button class="primary" id="runBtn">重算信号</button>
+      <button class="primary" id="realtimeBtn">运行今日信号</button>
     </div>
   </div>
   <div class="table-scroll" id="tableWrap"></div>
@@ -7575,16 +7575,16 @@ function render(data) {
   $('sLong').className = 'v ' + cls(s.long_return_sum_pct || 0);
   $('sShort').textContent = pct(s.short_return_sum_pct, 2);
   $('sShort').className = 'v ' + cls(s.short_return_sum_pct || 0);
-  $('sRange').textContent = `${s.start_date || '-'} 至 ${s.end_date || '-'}，多单 ${s.long_count || 0} 笔，空单 ${s.short_count || 0} 笔`;
+  $('sRange').textContent = `${s.start_date || '-'} 至 ${s.end_date || '-'} · 已平仓交易收益率加总 · 多头 ${s.long_count || 0} 笔 / 空头 ${s.short_count || 0} 笔`;
 
   const rows = data.trades || [];
   if (!rows.length) {
-    $('tableWrap').innerHTML = '<div class="empty">暂无区间交易记录</div>';
+    $('tableWrap').innerHTML = '<div class="empty">当前区间暂无已平仓交易</div>';
     return;
   }
   let html = `<table><thead><tr>
     <th>方向</th><th>开始日期</th><th>终止日期</th><th class="num">开仓价</th>
-    <th class="num">平仓/最新价</th><th class="num">持有天数</th><th class="num">收益</th>
+    <th class="num">平仓/最新价</th><th class="num">持有天数</th><th class="num">单笔收益</th>
     <th>开仓原因</th><th>平仓原因</th>
   </tr></thead><tbody>`;
   for (const r of rows) {
@@ -7615,33 +7615,33 @@ async function loadData() {
 async function rerun() {
   const btn = $('runBtn');
   btn.disabled = true;
-  btn.textContent = '重跑中';
+  btn.textContent = '重算中';
   try {
     const res = await fetch('/api/csi1000-timing/refresh', {method:'POST'});
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || '重跑失败');
+    if (!res.ok) throw new Error(data.error || '信号重算失败');
     await loadData();
   } finally {
     btn.disabled = false;
-    btn.textContent = '重跑信号';
+    btn.textContent = '重算信号';
   }
 }
 async function runRealtimeToday() {
   const btn = $('realtimeBtn');
   btn.disabled = true;
-  btn.textContent = '实时运行中';
-  $('tableWrap').innerHTML = '<div class="empty">正在同步实时行情、重算宽度并生成今日信号</div>';
+  btn.textContent = '运行中';
+  $('tableWrap').innerHTML = '<div class="empty">正在执行今日信号流程</div>';
   try {
     const res = await fetch('/api/csi1000-timing/run-today', {method:'POST'});
     const data = await res.json();
     if (!res.ok) {
-      const msg = data.stderr_tail || data.stdout_tail || data.error || '实时运行失败';
+      const msg = data.stderr_tail || data.stdout_tail || data.error || '今日信号运行失败';
       throw new Error(msg);
     }
     await loadData();
   } finally {
     btn.disabled = false;
-    btn.textContent = '实时跑今日';
+    btn.textContent = '运行今日信号';
   }
 }
 $('days').addEventListener('change', loadData);
