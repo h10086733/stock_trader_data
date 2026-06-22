@@ -543,16 +543,93 @@ def csi1000_display_exit_reason(row, latest_signal):
     return row["exit_reason"] or "-"
 
 
-def has_csi1000_index_prices(conn, trade_date):
-    row = conn.execute("""
-        SELECT COUNT(DISTINCT index_code) AS n
+def csi1000_index_price_coverage(conn, start_date, end_date):
+    rows = conn.execute("""
+        SELECT index_code, COUNT(*) AS n, MIN(trade_date) AS min_date, MAX(trade_date) AS max_date
         FROM index_prices
-        WHERE trade_date = ?
+        WHERE trade_date >= ?
+          AND trade_date <= ?
           AND index_code IN ('000300', '000852')
           AND close IS NOT NULL
           AND close > 0
-    """, (trade_date,)).fetchone()
-    return bool(row and row["n"] == 2)
+        GROUP BY index_code
+    """, (start_date, end_date)).fetchall()
+    coverage = {
+        "000300": {"count": 0, "min_date": None, "max_date": None},
+        "000852": {"count": 0, "min_date": None, "max_date": None},
+    }
+    for row in rows:
+        coverage[row["index_code"]] = {
+            "count": int(row["n"] or 0),
+            "min_date": row["min_date"],
+            "max_date": row["max_date"],
+        }
+    return coverage
+
+
+def has_csi1000_index_prices_for_run(conn, start_date, end_date, min_days=30):
+    coverage = csi1000_index_price_coverage(conn, start_date, end_date)
+    enough_history = all(item["count"] >= min_days for item in coverage.values())
+    has_end = all(item["max_date"] == end_date for item in coverage.values())
+    return enough_history and has_end, coverage
+
+
+def format_csi1000_price_coverage(coverage):
+    parts = []
+    for code, name in (("000300", "沪深300"), ("000852", "中证1000")):
+        item = coverage.get(code) or {}
+        parts.append(
+            f"{code}{name}: {item.get('count', 0)}条 "
+            f"{item.get('min_date') or '-'}~{item.get('max_date') or '-'}"
+        )
+    return "；".join(parts)
+
+
+def save_csi1000_realtime_index_prices(conn, end_date):
+    try:
+        rows = csi1000_timing.fetch_index_realtime_sina(trade_date=end_date)
+        saved = csi1000_timing.save_index_prices(conn, rows)
+        if saved <= 0:
+            raise RuntimeError("新浪指数实时行情没有返回有效数据")
+        return "sina_realtime_fallback"
+    except Exception as sina_exc:
+        print(f"新浪指数实时行情失败，改用东方财富实时行情: {sina_exc}", file=sys.stderr)
+        rows = csi1000_timing.fetch_index_realtime_quotes(trade_date=end_date)
+        saved = csi1000_timing.save_index_prices(conn, rows)
+        if saved <= 0:
+            raise
+        return "eastmoney_realtime_fallback"
+
+
+def sync_csi1000_index_prices_for_run(conn, start_date, end_date, target_date):
+    ready, coverage = has_csi1000_index_prices_for_run(conn, start_date, end_date)
+    if ready:
+        return "local_db", coverage
+
+    fetch_start = start_date.replace("-", "")
+    try:
+        csi1000_timing.cmd_fetch_index_prices(
+            conn,
+            start=fetch_start,
+            end=target_date.strftime("%Y%m%d"),
+        )
+        source = "history_kline"
+    except requests.RequestException as exc:
+        print(f"指数历史K线同步失败，改用实时行情兜底: {exc}", file=sys.stderr)
+        source = save_csi1000_realtime_index_prices(conn, end_date)
+
+    ready, coverage = has_csi1000_index_prices_for_run(conn, start_date, end_date)
+    if not ready and source == "history_kline":
+        realtime_source = save_csi1000_realtime_index_prices(conn, end_date)
+        source = f"{source}+{realtime_source}"
+        ready, coverage = has_csi1000_index_prices_for_run(conn, start_date, end_date)
+    if not ready:
+        raise RuntimeError(
+            "最近半年指数行情不足，无法回测。"
+            f"{format_csi1000_price_coverage(coverage)}。"
+            "需要 000300/000852 在该区间各至少30个交易日，且包含结束日。"
+        )
+    return source, coverage
 
 
 def run_csi1000_timing_job(end_date=None, sync_index=False, backfill_width=False,
@@ -572,33 +649,14 @@ def run_csi1000_timing_job(end_date=None, sync_index=False, backfill_width=False
     try:
         csi1000_timing.init_db(conn)
         index_sync_source = None
+        index_price_coverage = None
         if sync_index:
-            if has_csi1000_index_prices(conn, end_dash):
-                index_sync_source = "local_db"
-            else:
-                fetch_start = (target_date - timedelta(days=45)).strftime("%Y%m%d")
-                try:
-                    csi1000_timing.cmd_fetch_index_prices(
-                        conn,
-                        start=fetch_start,
-                        end=target_date.strftime("%Y%m%d"),
-                    )
-                    index_sync_source = "history_kline"
-                except requests.RequestException as exc:
-                    print(f"指数历史K线同步失败，改用实时行情兜底: {exc}", file=sys.stderr)
-                    try:
-                        rows = csi1000_timing.fetch_index_realtime_sina(trade_date=end_dash)
-                        saved = csi1000_timing.save_index_prices(conn, rows)
-                        if saved <= 0:
-                            raise RuntimeError("新浪指数实时行情没有返回有效数据")
-                        index_sync_source = "sina_realtime_fallback"
-                    except Exception as sina_exc:
-                        print(f"新浪指数实时行情失败，改用东方财富实时行情: {sina_exc}", file=sys.stderr)
-                        rows = csi1000_timing.fetch_index_realtime_quotes(trade_date=end_dash)
-                        saved = csi1000_timing.save_index_prices(conn, rows)
-                        if saved <= 0:
-                            raise
-                        index_sync_source = "eastmoney_realtime_fallback"
+            index_sync_source, index_price_coverage = sync_csi1000_index_prices_for_run(
+                conn,
+                start_date=start_dash,
+                end_date=end_dash,
+                target_date=target_date,
+            )
         if backfill_width:
             width_start = (target_date - timedelta(days=90)).strftime("%Y-%m-%d")
             csi1000_timing.cmd_backfill_width(
@@ -616,6 +674,12 @@ def run_csi1000_timing_job(end_date=None, sync_index=False, backfill_width=False
         )
         if df.empty:
             raise RuntimeError("没有可用的中证1000择时数据")
+        if len(df) < 30:
+            coverage = index_price_coverage or csi1000_index_price_coverage(conn, start_dash, end_dash)
+            raise RuntimeError(
+                f"可回测数据不足：合并后只有 {len(df)} 个交易日。"
+                f"{format_csi1000_price_coverage(coverage)}"
+            )
         signals = csi1000_timing.generate_and_save_signals(conn, df, config)
         result = csi1000_timing.backtest(conn, df, config, CSI1000_RUN_KEY)
         latest = signals.tail(1).to_dict("records")[0] if not signals.empty else {}
@@ -626,6 +690,7 @@ def run_csi1000_timing_job(end_date=None, sync_index=False, backfill_width=False
             "end": end_dash,
             "synced_index": bool(sync_index),
             "index_sync_source": index_sync_source,
+            "index_price_coverage": index_price_coverage,
             "backfilled_width": bool(backfill_width),
             "result": result,
             "latest_signal": {k: json_safe(v) for k, v in latest.items()},
