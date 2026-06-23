@@ -26,6 +26,10 @@ from hc_strategy_scanner import (
     build_signals,
     detect_couplings,
     detect_patterns,
+    pattern_fid,
+    signal_coupling_override,
+    signal_pattern_override,
+    signal_win_return_threshold,
     load_selected_for_date,
     normalize_pattern,
     prepare_scan_frame,
@@ -61,9 +65,9 @@ def load_or_build_today_panel(conn: sqlite3.Connection, date: str, args, cache_d
     return panel
 
 
-def build_signal_events(hist: pd.DataFrame, mode: str, date: str) -> pd.DataFrame:
+def build_signal_events(hist: pd.DataFrame, mode: str, date: str, pattern_engine: str = "recall") -> pd.DataFrame:
     rows = []
-    pattern_masks = detect_patterns(hist)
+    pattern_masks = detect_patterns(hist, pattern_engine)
     coupling_masks = detect_couplings(hist, mode)
     base = hist[["code", "trade_date", "close"]].copy()
     base["next_close"] = hist.groupby("code")["close"].shift(-1)
@@ -75,15 +79,23 @@ def build_signal_events(hist: pd.DataFrame, mode: str, date: str) -> pd.DataFram
         if not p_mask.any():
             continue
         for family, (c_mask, _rule, _source) in coupling_masks.items():
-            mask = valid_date & p_mask & trueish(c_mask) & base["forward_return"].notna()
+            fid = pattern_fid(pattern)
+            pattern_override = signal_pattern_override(hist, fid, pattern, family)
+            signal_p_mask = trueish(pattern_override[0]) if pattern_override is not None else p_mask
+            override = signal_coupling_override(hist, fid, pattern, family)
+            if override is not None:
+                c_mask = override[0]
+            mask = valid_date & signal_p_mask & trueish(c_mask) & base["forward_return"].notna()
             if not mask.any():
                 continue
             part = base.loc[mask, ["code", "forward_return"]].copy()
             part["形态名称"] = pattern
+            part["signal_fid"] = fid
             part["coupling_family"] = family
+            part["耦合条件"] = part["signal_fid"] + "-" + part["coupling_family"]
             rows.append(part)
     if not rows:
-        return pd.DataFrame(columns=["code", "形态名称", "coupling_family", "forward_return"])
+        return pd.DataFrame(columns=["code", "形态名称", "signal_fid", "coupling_family", "耦合条件", "forward_return"])
     return pd.concat(rows, ignore_index=True)
 
 
@@ -91,10 +103,14 @@ def quality_from_events(events: pd.DataFrame, win_return_threshold: float = 0.0)
     if events.empty:
         return pd.DataFrame()
     events = events.copy()
-    events["win"] = events["forward_return"] > win_return_threshold
+    events["win_threshold"] = [
+        signal_win_return_threshold(fid, pattern, family, win_return_threshold)
+        for fid, pattern, family in zip(events["signal_fid"], events["形态名称"], events["coupling_family"])
+    ]
+    events["win"] = events["forward_return"] > events["win_threshold"]
     events["up_return"] = events["forward_return"].where(events["win"])
     events["down_return"] = events["forward_return"].where(~events["win"])
-    quality = events.groupby(["code", "形态名称", "coupling_family"], as_index=False).agg(
+    quality = events.groupby(["code", "形态名称", "signal_fid", "coupling_family", "耦合条件"], as_index=False).agg(
         hist_samples=("forward_return", "size"),
         hist_win_rate=("win", "mean"),
         hist_up_avg=("up_return", "mean"),
@@ -118,8 +134,12 @@ def load_or_build_quality(conn: sqlite3.Connection, date: str, scan: pd.DataFram
 
     scan = scan.copy()
     scan["code"] = scan["code"].astype(str).str.zfill(6)
+    if "signal_fid" not in scan.columns:
+        scan["signal_fid"] = scan["形态名称"].map(pattern_fid)
+    if "耦合条件" not in scan.columns:
+        scan["耦合条件"] = scan["signal_fid"] + "-" + scan["coupling_family"]
     needed_pairs = (
-        scan.groupby("code")[["形态名称", "coupling_family"]]
+        scan.groupby("code")[["signal_fid", "形态名称", "coupling_family", "耦合条件"]]
         .apply(lambda g: set(map(tuple, g.drop_duplicates().to_numpy())))
         .to_dict()
     )
@@ -159,25 +179,40 @@ def load_or_build_quality(conn: sqlite3.Connection, date: str, scan: pd.DataFram
             )
             if not valid.any():
                 continue
-            pattern_masks = detect_patterns(hist)
+            pattern_masks = detect_patterns(hist, getattr(args, "pattern_engine", "recall"))
             coupling_masks = detect_couplings(hist, args.mode)
-            for pattern, family in pairs:
+            for fid, pattern, family, coupling in pairs:
                 if pattern not in pattern_masks or family not in coupling_masks:
                     continue
-                mask = valid & trueish(pattern_masks[pattern]) & trueish(coupling_masks[family][0])
+                pattern_override = signal_pattern_override(hist, fid, pattern, family)
+                pattern_mask = trueish(pattern_override[0]) if pattern_override is not None else trueish(pattern_masks[pattern])
+                if getattr(args, "coupling_match_mode", "rule") == "label":
+                    coupling_mask = pd.Series(True, index=hist.index)
+                else:
+                    override = signal_coupling_override(hist, fid, pattern, family)
+                    coupling_mask = trueish(override[0] if override is not None else coupling_masks[family][0])
+                mask = valid & pattern_mask & coupling_mask
                 if not mask.any():
                     continue
                 returns = hist.loc[mask, "forward_return"].astype(float)
-                wins = returns[returns > args.win_return_threshold]
-                losses = returns[returns <= args.win_return_threshold]
+                win_threshold = signal_win_return_threshold(
+                    fid,
+                    pattern,
+                    family,
+                    args.win_return_threshold,
+                )
+                wins = returns[returns > win_threshold]
+                losses = returns[returns <= win_threshold]
                 up_avg = float(wins.mean()) if len(wins) else np.nan
                 down_avg = float(losses.mean()) if len(losses) else np.nan
                 rows.append({
                     "code": code,
                     "形态名称": pattern,
+                    "signal_fid": fid,
                     "coupling_family": family,
+                    "耦合条件": coupling,
                     "hist_samples": int(len(returns)),
-                    "hist_win_rate": float((returns > args.win_return_threshold).mean()),
+                    "hist_win_rate": float((returns > win_threshold).mean()),
                     "hist_up_avg": up_avg,
                     "hist_down_avg": down_avg,
                     "hist_pl_ratio": abs(up_avg) / abs(down_avg) if pd.notna(up_avg) and pd.notna(down_avg) and down_avg != 0 else np.nan,
@@ -227,11 +262,12 @@ def run(args) -> int:
             patterns_filter=split_filter(args.patterns),
             couplings_filter=split_filter(args.couplings),
             exclude_proxy=args.exclude_proxy,
+            coupling_match_mode=args.coupling_match_mode,
         )
         quality = load_or_build_quality(conn, date, scan, args, cache_dir)
         enriched = scan.merge(
             quality,
-            on=["code", "形态名称", "coupling_family"],
+            on=["code", "形态名称", "signal_fid", "coupling_family", "耦合条件"],
             how="left",
         )
         filtered = enriched[
@@ -296,6 +332,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--win-return-threshold", type=float, default=0.0)
     parser.add_argument("--patterns")
     parser.add_argument("--couplings")
+    parser.add_argument("--coupling-match-mode", choices=["rule", "label"], default="rule")
+    parser.add_argument("--pattern-engine", default="recall")
     parser.add_argument("--exclude-proxy", action="store_true")
     parser.add_argument("--include-bj", action="store_true")
     parser.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)

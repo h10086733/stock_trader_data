@@ -25,11 +25,17 @@ import sqlite3
 import requests
 from werkzeug.exceptions import HTTPException
 from hc_strategy_scanner import (
+    FOCUS_LONG_100YI_SIGNAL_COMBOS,
     PANEL_CACHE_VERSION as HC_SCAN_PANEL_CACHE_VERSION,
     build_signals as build_hc_scan_signals,
     prepare_scan_frame as prepare_hc_scan_frame,
 )
 from evaluate_historical_quality import load_or_build_quality as build_hc_signal_quality
+from lizi_focus_model import (
+    DEFAULT_CALIBRATION_DATE as HC_FOCUS_MODEL_CALIBRATION_DATE,
+    DEFAULT_THRESHOLD as HC_FOCUS_MODEL_THRESHOLD,
+    score_focus_rows,
+)
 import csi1000_timing
 
 try:
@@ -45,32 +51,58 @@ DB_PATH = (
     or os.path.join(BASE_DIR, "stock_data.db")
 )
 HC_DEFAULT_MAX_PER_DATE = 0
-HC_DEFAULT_HISTORY_DAYS = 30
-HC_DEFAULT_PATTERNS = ["长蜡烛", "母子线", "光头光脚缺影线", "黄包车夫", "风高浪大线"]
+HC_DEFAULT_HISTORY_DAYS = 7
+HC_FOCUS_SIGNAL_COMBOS = FOCUS_LONG_100YI_SIGNAL_COMBOS
+HC_DEFAULT_PATTERNS = sorted({pattern for _fid, pattern, _family in HC_FOCUS_SIGNAL_COMBOS})
 HC_DEFAULT_MIN_MARKET_CAP_YI = 100
 HC_ENABLE_MARKET_CAP_FILTER = True
+HC_KEEP_MISSING_MARKET_CAP = True
 HC_ENABLE_REALTIME_MARKET_CAP = True
-HC_ENABLE_QUALITY_CACHE_FALLBACK = True
+HC_ENABLE_QUALITY_CACHE = False
+HC_ENABLE_QUALITY_CACHE_FALLBACK = False
 HC_QUALITY_LOOKBACK_DAYS = 4200
 HC_QUALITY_FORWARD_DAYS = 5
 HC_QUALITY_OUTCOME = "max_high"
 HC_QUALITY_WIN_RETURN_THRESHOLD = 0.02
 HC_QUALITY_MIN_SAMPLES = 31
-HC_QUALITY_MIN_WIN_RATE = 0.88
+HC_QUALITY_MIN_WIN_RATE = 0.70
+HC_ENABLE_FOCUS_MODEL = False
+HC_ENABLE_PRECISION_FILTER = True
+HC_PRECISION_RULE_VERSION = "precision_top5_p75"
 HC_SCAN_LOOKBACK_DAYS = 400
 HC_SCAN_MIN_HISTORY = 120
 HC_SCAN_MODE = "loose"
-HC_SCAN_PATTERN_ENGINE = "recall"
+HC_SCAN_PATTERN_ENGINE = "lizi_relaxed"
+HC_SCAN_COUPLING_MATCH_MODE = "rule"
+HC_QUALITY_COUPLING_MATCH_MODE = "rule"
+HC_SHAPE_RULE_VERSION = "shape_lizi_relaxed6_fid18_fid47_fid26_fid19_fid23"
 HC_MIN_FULL_MARKET_ROWS = 4500
+HC_FOCUS_RULE_PART = (
+    f"_focuson_noleak_ft{int(HC_FOCUS_MODEL_THRESHOLD * 1000)}"
+    if HC_ENABLE_FOCUS_MODEL
+    else "_focusoff"
+)
+HC_PRECISION_RULE_PART = (
+    f"_{HC_PRECISION_RULE_VERSION}"
+    if HC_ENABLE_PRECISION_FILTER
+    else "_precisionoff"
+)
 HC_RULE_VERSION = (
     f"hc_{HC_SCAN_MODE}_{HC_SCAN_PATTERN_ENGINE}"
+    f"_{HC_SHAPE_RULE_VERSION}"
+    f"_scan{HC_SCAN_COUPLING_MATCH_MODE}"
+    f"_qual{HC_QUALITY_COUPLING_MATCH_MODE}"
     f"_q{int(HC_QUALITY_MIN_WIN_RATE * 100)}"
     f"_s{HC_QUALITY_MIN_SAMPLES}"
     f"_fwd{HC_QUALITY_FORWARD_DAYS}_{HC_QUALITY_OUTCOME}"
     f"_wr{int(HC_QUALITY_WIN_RETURN_THRESHOLD * 100)}"
+    f"{HC_FOCUS_RULE_PART}"
+    f"{HC_PRECISION_RULE_PART}"
     f"_max{HC_DEFAULT_MAX_PER_DATE}"
     f"_cap{'on' if HC_ENABLE_MARKET_CAP_FILTER else 'off'}"
+    f"_capmiss{'keep' if HC_KEEP_MISSING_MARKET_CAP else 'drop'}"
 )
+HC_FOCUS_MODEL_TRAIN_RULE_VERSION = HC_RULE_VERSION.replace(HC_FOCUS_RULE_PART, "").replace(HC_PRECISION_RULE_PART, "")
 HC_SCAN_CACHE = {}
 HC_SCAN_CACHE_LOCK = threading.Lock()
 HC_PROGRESS = {}
@@ -996,6 +1028,8 @@ def build_hc_quality_args(use_cache=True):
         outcome=HC_QUALITY_OUTCOME,
         win_return_threshold=HC_QUALITY_WIN_RETURN_THRESHOLD,
         quality_chunk_size=200,
+        coupling_match_mode=HC_QUALITY_COUPLING_MATCH_MODE,
+        pattern_engine=HC_SCAN_PATTERN_ENGINE,
         cache=use_cache,
     )
 
@@ -1003,9 +1037,10 @@ def build_hc_quality_args(use_cache=True):
 def apply_hc_quality_filter(signal_rows, trade_date, conn=None, use_cache=True, allow_fallback=True):
     if signal_rows.empty:
         return signal_rows, {"quality_rows": 0, "quality_cache_hit": False}
+    quality_cache_enabled = use_cache and HC_ENABLE_QUALITY_CACHE
     quality, cache_hit, quality_source_date = load_hc_signal_quality(
         trade_date,
-        use_cache=use_cache,
+        use_cache=quality_cache_enabled,
         allow_fallback=allow_fallback,
     )
     if quality is not None and quality_source_date and quality_source_date != trade_date:
@@ -1028,7 +1063,7 @@ def apply_hc_quality_filter(signal_rows, trade_date, conn=None, use_cache=True, 
             conn,
             trade_date,
             signal_rows,
-            build_hc_quality_args(use_cache=use_cache),
+            build_hc_quality_args(use_cache=quality_cache_enabled),
             Path(BASE_DIR) / "outputs" / "cache",
         )
         cache_hit = False
@@ -1040,9 +1075,17 @@ def apply_hc_quality_filter(signal_rows, trade_date, conn=None, use_cache=True, 
     quality = quality.copy()
     signal_rows["code"] = signal_rows["code"].astype(str).str.zfill(6)
     quality["code"] = quality["code"].astype(str).str.zfill(6)
+    if "signal_fid" not in signal_rows.columns:
+        signal_rows["signal_fid"] = ""
+    if "signal_fid" not in quality.columns:
+        quality["signal_fid"] = ""
+    if "耦合条件" not in signal_rows.columns:
+        signal_rows["耦合条件"] = signal_rows["signal_fid"].astype(str) + "-" + signal_rows["coupling_family"].astype(str)
+    if "耦合条件" not in quality.columns:
+        quality["耦合条件"] = quality["signal_fid"].astype(str) + "-" + quality["coupling_family"].astype(str)
     enriched = signal_rows.merge(
         quality,
-        on=["code", "形态名称", "coupling_family"],
+        on=["code", "形态名称", "signal_fid", "coupling_family", "耦合条件"],
         how="left",
     )
     filtered = enriched[
@@ -1221,10 +1264,17 @@ def apply_hc_market_cap_filter(conn, trade_date, rows, use_cache=True):
         float_cap = cap.get("float_market_cap_yi")
         if market_cap is None:
             missing += 1
-            filtered += 1
+            if not HC_KEEP_MISSING_MARKET_CAP:
+                filtered += 1
+                continue
+            row["market_cap_yi"] = None
+            row["float_market_cap_yi"] = None
+            row["market_cap_missing"] = True
+            kept.append(row)
             continue
         row["market_cap_yi"] = round(market_cap, 2)
         row["float_market_cap_yi"] = round(float_cap, 2) if float_cap is not None else None
+        row["market_cap_missing"] = False
         if market_cap < HC_DEFAULT_MIN_MARKET_CAP_YI:
             filtered += 1
             continue
@@ -1296,9 +1346,13 @@ def rank_hc_scan_stocks(scan):
     for (code, secucode, name, trade_date), group in ordered.groupby(
         ["code", "secucode", "name", "trade_date"], sort=False
     ):
-        best = group.iloc[0]
+        best = group.sort_values(
+            ["hist_win_rate", "hist_samples", "hist_pl_ratio", "scan_score"],
+            ascending=[False, False, False, False],
+        ).iloc[0]
         patterns = sorted({str(v) for v in group["形态名称"].dropna()})
         couplings = sorted({str(v) for v in group["coupling_family"].dropna()})
+        signal_keys = sorted({str(v) for v in group["耦合条件"].dropna()}) if "耦合条件" in group else []
         pct_change = clean_number(best.get("pct_change"))
         prev_close = clean_number(best.get("prev_close"))
         high = clean_number(best.get("high"))
@@ -1317,15 +1371,18 @@ def rank_hc_scan_stocks(scan):
             + math.log1p(hist_samples) * 0.6
             + min(hist_pl_ratio, 5) * 0.4
         )
-        rows.append({
+        row = {
             "date": trade_date,
             "code": code,
             "secucode": secucode,
             "name": name,
             "pattern": str(best.get("形态名称") or ""),
             "coupling": str(best.get("coupling_family") or ""),
+            "signal_fid": str(best.get("signal_fid") or ""),
+            "signal_key": str(best.get("耦合条件") or ""),
             "patterns": patterns,
             "couplings": couplings,
+            "signal_keys": signal_keys,
             "signal_count": int(len(group)),
             "pattern_count": int(len(patterns)),
             "coupling_count": int(len(couplings)),
@@ -1340,7 +1397,31 @@ def rank_hc_scan_stocks(scan):
             "amount_yi": clean_number(best.get("amount")) / 100000000,
             "touch_limit": high_pct >= limit_pct,
             "close_limit": pct_change >= limit_pct,
-        })
+        }
+        for col in (
+            "range_close_pct",
+            "body_range_pct",
+            "upper_range_pct",
+            "lower_range_pct",
+            "close_position_day_pct",
+            "close_ma5_dist_pct",
+            "close_ma10_dist_pct",
+            "close_ma30_dist_pct",
+            "close_ma60_dist_pct",
+            "close_hma20_dist_pct",
+            "close_hma30_dist_pct",
+            "ma30_slope_pct",
+            "ma60_slope_pct",
+            "hma20_slope_pct",
+            "hma30_slope_pct",
+            "macd",
+            "macd_dif",
+            "macd_dea",
+            "amount_ratio20",
+            "volume_ratio20",
+        ):
+            row[col] = clean_number(best.get(col))
+        rows.append(row)
     return sorted(
         rows,
         key=lambda r: (
@@ -1350,6 +1431,98 @@ def rank_hc_scan_stocks(scan):
             -r["signal_count"],
         ),
     )
+
+
+def hc_precision_rule_names(row):
+    signal_key = str(row.get("signal_key") or "")
+    top_sparse = signal_key in {"fid28-Fscore", "fid40-ash", "fid23-MA5"}
+    high_prec_signal = signal_key in {
+        "fid28-Fscore",
+        "fid40-ash",
+        "fid23-MA5",
+        "fid40-MACD",
+        "fid26-MACD",
+        "fid47-MACD",
+    }
+    rules = []
+    if (
+        clean_number(row.get("close_ma5_dist_pct")) <= -3
+        and clean_number(row.get("hist_samples")) <= 50
+        and clean_number(row.get("pct_change")) >= 0
+        and clean_number(row.get("range_close_pct")) <= 3
+        and clean_number(row.get("lower_range_pct")) <= 0.5
+    ):
+        rules.append("R1_pullback_small_sample")
+    if (
+        top_sparse
+        and clean_number(row.get("close_position_day_pct")) >= 70
+        and clean_number(row.get("hist_pl_ratio")) <= 50
+        and clean_number(row.get("hma30_slope_pct")) <= 1
+        and clean_number(row.get("range_close_pct")) >= 1.5
+    ):
+        rules.append("R2_sparse_close_high")
+    if (
+        clean_number(row.get("hist_samples")) >= 300
+        and clean_number(row.get("ma30_slope_pct")) >= 1
+        and clean_number(row.get("range_close_pct")) >= 8
+        and clean_number(row.get("scan_score")) >= 28
+        and clean_number(row.get("macd_dea")) <= 1
+    ):
+        rules.append("R3_strong_wide_trend")
+    if HC_PRECISION_RULE_VERSION != "precision_top3_p80" and (
+        signal_key == "fid39-Fscore"
+        and clean_number(row.get("hist_win_rate")) >= 0.78
+        and clean_number(row.get("hma20_slope_pct")) >= 4
+        and clean_number(row.get("amount_yi")) <= 20
+    ):
+        rules.append("R4_fid39_fscore_accel")
+    if HC_PRECISION_RULE_VERSION != "precision_top3_p80" and (
+        clean_number(row.get("close_position_day_pct")) >= 99
+        and clean_number(row.get("hist_samples")) >= 120
+        and clean_number(row.get("hist_win_rate")) >= 0.85
+        and clean_number(row.get("turnover")) >= 5
+    ):
+        rules.append("R5_limit_high_quality")
+    return rules
+
+
+def apply_hc_precision_filter(rows):
+    if not HC_ENABLE_PRECISION_FILTER:
+        return rows, {
+            "precision_filter_enabled": False,
+            "precision_rule_version": HC_PRECISION_RULE_VERSION,
+            "precision_input_rows": len(rows),
+            "precision_output_rows": len(rows),
+        }
+    filtered = []
+    for row in rows:
+        rule_names = hc_precision_rule_names(row)
+        if not rule_names:
+            continue
+        item = dict(row)
+        item["precision_rules"] = rule_names
+        item["precision_rule_count"] = len(rule_names)
+        item["precision_score"] = (
+            len(rule_names) * 10
+            + clean_number(item.get("hist_win_rate")) * 5
+            + min(clean_number(item.get("hist_pl_ratio")), 50) * 0.05
+            + min(clean_number(item.get("rank_score")), 80) * 0.03
+        )
+        filtered.append(item)
+    filtered = sorted(
+        filtered,
+        key=lambda row: (
+            -clean_number(row.get("precision_score")),
+            -clean_number(row.get("rank_score")),
+            -clean_number(row.get("hist_win_rate")),
+        ),
+    )
+    return filtered, {
+        "precision_filter_enabled": True,
+        "precision_rule_version": HC_PRECISION_RULE_VERSION,
+        "precision_input_rows": len(rows),
+        "precision_output_rows": len(filtered),
+    }
 
 
 def build_high_confidence_payload_realtime(params):
@@ -1423,6 +1596,8 @@ def build_high_confidence_payload_realtime(params):
             couplings_filter=None,
             exclude_proxy=False,
             pattern_engine=HC_SCAN_PATTERN_ENGINE,
+            signal_combos_filter=HC_FOCUS_SIGNAL_COMBOS,
+            coupling_match_mode=HC_SCAN_COUPLING_MATCH_MODE,
         )
         set_hc_progress(
             trade_date,
@@ -1464,6 +1639,33 @@ def build_high_confidence_payload_realtime(params):
     finally:
         conn.close()
 
+    pre_focus_rows = ranked_rows
+    focus_meta = {
+        "focus_model_enabled": False,
+        "focus_input_rows": len(pre_focus_rows),
+        "focus_output_rows": len(pre_focus_rows),
+    }
+    if HC_ENABLE_FOCUS_MODEL:
+        ranked_rows, focus_meta = score_focus_rows(
+            pre_focus_rows,
+            DB_PATH,
+            HC_FOCUS_MODEL_TRAIN_RULE_VERSION,
+            threshold=HC_FOCUS_MODEL_THRESHOLD,
+            calibration_date=HC_FOCUS_MODEL_CALIBRATION_DATE,
+            lizi_dir=os.path.join(BASE_DIR, "lizi"),
+            exclude_dates=[trade_date],
+        )
+        ranked_rows = sorted(
+            ranked_rows,
+            key=lambda row: (
+                -clean_number(row.get("focus_score")),
+                -clean_number(row.get("rank_score")),
+                -clean_number(row.get("hist_win_rate")),
+            ),
+        )
+
+    pre_precision_rows = ranked_rows
+    ranked_rows, precision_meta = apply_hc_precision_filter(pre_precision_rows)
     output_rows = ranked_rows[:params["max_per_date"]] if params["max_per_date"] else ranked_rows
 
     pattern_counts = {}
@@ -1482,7 +1684,7 @@ def build_high_confidence_payload_realtime(params):
 
     groups = [{
         "date": trade_date,
-        "raw_count": len(ranked_rows),
+        "raw_count": len(pre_precision_rows),
         "count": len(output_rows),
         "rows": output_rows,
     }]
@@ -1501,10 +1703,14 @@ def build_high_confidence_payload_realtime(params):
             "quality_source_date": quality_meta.get("quality_source_date"),
             "quality_min_win_rate": HC_QUALITY_MIN_WIN_RATE,
             "quality_min_samples": HC_QUALITY_MIN_SAMPLES,
-            "raw_filtered_rows": len(ranked_rows),
+            "raw_filtered_rows": len(pre_focus_rows),
+            "pre_focus_rows": len(pre_focus_rows),
+            "pre_precision_rows": len(pre_precision_rows),
             "output_rows": len(output_rows),
             "min_market_cap_yi": HC_DEFAULT_MIN_MARKET_CAP_YI,
             **cap_meta,
+            **focus_meta,
+            **precision_meta,
             "close_limit_rows": close_limit_count,
             "touch_limit_rows": touch_limit_count,
             "cache_hit": cache_hit,
@@ -7331,6 +7537,7 @@ function renderGroup(group) {
       <td><a class="stock-link" href="${esc(xueqiuUrl(r))}" target="_blank" rel="noopener noreferrer">${esc(r.name)}<span class="code">${esc(r.code)}</span></a></td>
       <td>${esc(r.pattern)}</td>
       <td>${esc(r.coupling)}</td>
+      <td class="num">${r.focus_score === undefined || r.focus_score === null ? '-' : num(r.focus_score, 3)}</td>
       <td class="num">${num(r.rank_score, 2)}</td>
       <td class="num">${pct(r.hist_win_rate, 1)}</td>
       <td class="num">${r.hist_samples}</td>
@@ -7349,7 +7556,7 @@ function renderGroup(group) {
       <div class="day-meta">输出 ${group.count} / 候选 ${group.raw_count}</div>
     </div>
     <table>
-      <thead><tr><th>股票</th><th>最佳形态</th><th>最佳耦合</th><th>评分</th><th>历史胜率</th><th>样本</th><th>信号数</th><th>收盘</th><th>涨跌幅</th><th>换手</th><th>总市值(亿)</th><th>成交额(亿)</th><th>状态</th></tr></thead>
+      <thead><tr><th>股票</th><th>最佳形态</th><th>最佳耦合</th><th>精选分</th><th>评分</th><th>历史胜率</th><th>样本</th><th>信号数</th><th>收盘</th><th>涨跌幅</th><th>换手</th><th>总市值(亿)</th><th>成交额(亿)</th><th>状态</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   </section>`;

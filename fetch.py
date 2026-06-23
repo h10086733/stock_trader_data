@@ -424,16 +424,11 @@ def get_price_sina_with_fallback(codes, today_dash):
 
 
 def get_price_today_with_fallback(codes, market_by_code, today_dash):
-    """先用新浪，新浪缺失的代码再用东方财富补齐。"""
-    result = get_price_sina_with_fallback(codes, today_dash)
+    """用东方财富批量获取今日价格。"""
+    result = get_price_eastmoney_batch(codes, market_by_code, today_dash)
     missing = [code for code in codes if not is_today_quote(result.get(code), today_dash)]
     if missing:
-        log.info(f"  新浪仍缺 {len(missing)} 只，改用东方财富补齐")
-        eastmoney_prices = get_price_eastmoney_batch(missing, market_by_code, today_dash)
-        result.update({
-            code: row for code, row in eastmoney_prices.items()
-            if is_today_quote(row, today_dash)
-        })
+        log.warning(f"  东方财富今日行情仍缺 {len(missing)} 只")
     return result
 
 
@@ -892,9 +887,9 @@ def run_batch(conn, stock_rows, mode, sync_type, new_stocks=0, use_sina_today=Fa
     ok, fail = 0, 0
     fail_codes = []
 
-    # 如果是daily模式且使用新浪接口，批量获取今日价格
+    # daily 模式下批量获取今日价格。
     if mode == "daily" and use_sina_today:
-        log.info("使用新浪接口批量获取今日价格，失败时用东方财富补齐...")
+        log.info("使用东方财富接口批量获取今日价格...")
         all_codes = [code for code, _ in stock_rows]
         market_by_code = {code: market for code, market in stock_rows}
         today_dash = datetime.today().strftime("%Y-%m-%d")

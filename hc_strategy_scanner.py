@@ -58,13 +58,123 @@ COUPLING_WEIGHTS = {
     "ash": 0.5,
 }
 
+KNOWN_PATTERNS = tuple(sorted(PATTERN_WEIGHTS, key=len, reverse=True))
+
+PATTERN_FID_MAP = {
+    "捉腰带线": "fid10",
+    "收盘缺影线": "fid12",
+    "十字": "fid16",
+    "吞噬模式": "fid19",
+    "墓碑十字倒十字": "fid23",
+    "锤头": "fid24",
+    "母子线": "fid26",
+    "风高浪大线": "fid28",
+    "陷阱": "fid29",
+    "长蜡烛": "fid39",
+    "光头光脚缺影线": "fid40",
+    "黄包车夫": "fid47",
+    "短蜡烛": "fid51",
+    "纺锤": "fid52",
+    "蜻蜓十字形十字": "fid18",
+}
+
+FOCUS_LONG_100YI_SIGNAL_COMBOS = {
+    ("fid10", "捉腰带线", "MA5"),
+    ("fid10", "捉腰带线", "MA60"),
+    ("fid12", "收盘缺影线", "HMA"),
+    ("fid12", "收盘缺影线", "MA5"),
+    ("fid12", "收盘缺影线", "MACD"),
+    ("fid12", "收盘缺影线", "ash"),
+    ("fid16", "十字", "HMA"),
+    ("fid16", "十字", "MA5"),
+    ("fid18", "蜻蜓十字形十字", "MA60"),
+    ("fid19", "吞噬模式", "HMA"),
+    ("fid23", "墓碑十字倒十字", "MA5"),
+    ("fid26", "母子线", "HMA"),
+    ("fid26", "母子线", "MA30"),
+    ("fid26", "母子线", "MA60"),
+    ("fid26", "母子线", "MACD"),
+    ("fid28", "风高浪大线", "Concentration"),
+    ("fid28", "风高浪大线", "Fscore"),
+    ("fid28", "风高浪大线", "HMA"),
+    ("fid28", "风高浪大线", "MA30"),
+    ("fid28", "风高浪大线", "MACD"),
+    ("fid29", "陷阱", "HMA"),
+    ("fid29", "陷阱", "ash"),
+    ("fid39", "长蜡烛", "Fscore"),
+    ("fid39", "长蜡烛", "HMA"),
+    ("fid39", "长蜡烛", "MA5"),
+    ("fid39", "长蜡烛", "MA30"),
+    ("fid39", "长蜡烛", "MA60"),
+    ("fid39", "长蜡烛", "ash"),
+    ("fid40", "光头光脚缺影线", "Concentration"),
+    ("fid40", "光头光脚缺影线", "Fscore"),
+    ("fid40", "光头光脚缺影线", "HMA"),
+    ("fid40", "光头光脚缺影线", "MA30"),
+    ("fid40", "光头光脚缺影线", "MACD"),
+    ("fid40", "光头光脚缺影线", "ash"),
+    ("fid47", "黄包车夫", "Concentration"),
+    ("fid47", "黄包车夫", "HMA"),
+    ("fid47", "黄包车夫", "MA60"),
+    ("fid47", "黄包车夫", "MACD"),
+    ("fid51", "短蜡烛", "HMA"),
+    ("fid51", "短蜡烛", "MA30"),
+    ("fid52", "纺锤", "Concentration"),
+    ("fid52", "纺锤", "HMA"),
+    ("fid52", "纺锤", "MA5"),
+    ("fid52", "纺锤", "ash"),
+}
+
+FOCUS_20260622_LONG_100YI_SIGNAL_COMBOS = {
+    ("fid12", "收盘缺影线", "HMA"),
+    ("fid12", "收盘缺影线", "MA5"),
+    ("fid12", "收盘缺影线", "MACD"),
+    ("fid12", "收盘缺影线", "ash"),
+    ("fid16", "十字", "HMA"),
+    ("fid28", "风高浪大线", "Fscore"),
+    ("fid28", "风高浪大线", "HMA"),
+    ("fid39", "长蜡烛", "MA30"),
+    ("fid40", "光头光脚缺影线", "Concentration"),
+    ("fid40", "光头光脚缺影线", "Fscore"),
+    ("fid40", "光头光脚缺影线", "HMA"),
+    ("fid47", "黄包车夫", "HMA"),
+    ("fid52", "纺锤", "ash"),
+}
+
 
 def normalize_pattern(value) -> str:
     text = "" if pd.isna(value) else str(value).strip()
+    if text.startswith("名称"):
+        text = text[len("名称"):].strip()
     for prefix in ("Candle ", "Pattern ", "Line ", "Doji ", "Marubozu ", "Top "):
         if text.startswith(prefix):
             return text[len(prefix):].strip()
+    for pattern in KNOWN_PATTERNS:
+        if text == pattern or text.endswith(pattern):
+            return pattern
     return text
+
+
+def pattern_fid(pattern: str) -> str:
+    return PATTERN_FID_MAP.get(normalize_pattern(pattern), "")
+
+
+def normalize_signal_combos(combos) -> set[tuple[str, str, str]]:
+    normalized = set()
+    for item in combos or []:
+        if len(item) == 3:
+            fid, pattern, family = item
+        elif len(item) == 2:
+            pattern, family = item
+            fid = pattern_fid(pattern)
+        else:
+            continue
+        pattern = normalize_pattern(pattern)
+        fid = str(fid or pattern_fid(pattern)).strip()
+        family = str(family).strip()
+        if pattern and family:
+            normalized.add((fid, pattern, family))
+    return normalized
 
 
 def is_bj_code(code: str, secucode: str = "") -> bool:
@@ -250,10 +360,63 @@ def detect_patterns(df: pd.DataFrame, engine: str = "recall") -> dict[str, pd.Se
             "三外部上涨和下跌": three_outside,
         }
 
-    doji = (body_pct <= 0.10) | (df["body_close_pct"] <= 0.20)
-    small_body = body_pct <= 0.35
+    if engine == "lizi_relaxed":
+        doji = body_pct <= 0.10
+        prev_red = df["prev_close"] < df["prev_open"]
+        engulf = (
+            prev_red
+            & df["is_up"]
+            & (df["open"] <= df["prev_close"])
+            & (df["close"] >= df["prev_open"])
+        )
+        harami = (
+            (np.maximum(df["open"], df["close"]) <= np.maximum(df["prev_open"], df["prev_close"]))
+            & (np.minimum(df["open"], df["close"]) >= np.minimum(df["prev_open"], df["prev_close"]))
+            & (df["body"] <= (df["prev_close"] - df["prev_open"]).abs() * 0.75)
+        )
+        false_break = (
+            ((df["low"] < df["prev_low"]) & (df["close"] > df["prev_low"]) & df["is_up"])
+            | ((df["high"] > df["prev_high"]) & (df["close"] < df["prev_high"]) & df["is_down"])
+        )
+        broad_bear_trap = (
+            df["is_down"]
+            & (df["range_close_pct"] >= 2.0)
+            & (body_pct >= 0.30)
+            & (df["close"] <= df["prev_close"] * 1.01)
+        )
+        broad_bull_trap = (
+            df["is_up"]
+            & (df["range_close_pct"] >= 2.0)
+            & (body_pct >= 0.30)
+            & (df["close"] >= df["prev_close"] * 0.99)
+            & ((df["low"] <= df["prev_low"]) | (lower_pct >= 0.30))
+        )
+        trap = false_break | broad_bear_trap | broad_bull_trap
+        return {
+            "十字": body_pct <= 0.05,
+            "十字星": (body_pct <= 0.05) & (df["range_close_pct"] <= 2.5),
+            "长脚十字": (body_pct <= 0.08) & (upper_pct >= 0.25) & (lower_pct >= 0.25) & (df["range_close_pct"] >= 2.0),
+            "黄包车夫": doji & (upper_pct >= 0.50) & (lower_pct >= 0.25) & (df["range_close_pct"] >= 3.0),
+            "风高浪大线": (body_pct <= 0.20) & (upper_pct >= 0.20) & (lower_pct >= 0.25) & (df["range_close_pct"] >= 2.0),
+            "纺锤": (body_pct <= 0.25) & (upper_pct >= 0.30) & (lower_pct >= 0.30),
+            "短蜡烛": ((body <= avg_body * 0.85) | (rng <= avg_range * 0.75)) & (body_pct <= 0.55),
+            "长蜡烛": (body_pct >= 0.70) & (df["range_close_pct"] >= 5.0),
+            "捉腰带线": df["is_up"] & (body_pct >= 0.45) & (lower_pct <= 0.22) & (upper_pct <= 0.40),
+            "收盘缺影线": df["is_up"] & (upper_pct <= 0.08) & (body_pct >= 0.50),
+            "光头光脚缺影线": df["is_up"] & (upper_pct <= 0.06) & (lower_pct <= 0.06) & (body_pct >= 0.90),
+            "吞噬模式": engulf,
+            "母子线": harami,
+            "陷阱": trap,
+            "锤头": (body_pct <= 0.20) & (lower >= body * 2.0) & (upper <= body * 1.2),
+            "倒锤头": (body_pct <= 0.20) & (upper >= body * 2.0) & (lower <= body * 1.2),
+            "蜻蜓十字形十字": (body_pct <= 0.15) & (lower_pct >= 0.60) & (upper_pct <= 0.15),
+            "墓碑十字倒十字": (body_pct <= 0.10) & (upper_pct >= 0.60) & (lower_pct <= 0.15),
+        }
+
+    doji = body_pct <= 0.05
+    small_body = body_pct <= 0.20
     long_upper_lower = (upper >= body * 1.5) & (lower >= body * 1.5)
-    long_range = df["range_close_pct"] >= 2.5
+    long_range = df["range_close_pct"] >= 2.0
 
     prev_red = df["prev_close"] < df["prev_open"]
     engulf = (
@@ -290,14 +453,14 @@ def detect_patterns(df: pd.DataFrame, engine: str = "recall") -> dict[str, pd.Se
         "十字": doji,
         "十字星": doji & (df["range_close_pct"] <= 2.5),
         "长脚十字": doji & long_upper_lower & long_range,
-        "黄包车夫": doji & long_upper_lower & (df["range_close_pct"] >= 3.0),
-        "风高浪大线": small_body & (upper_pct >= 0.25) & (lower_pct >= 0.25) & long_range,
-        "纺锤": small_body & (upper >= body + eps) & (lower >= body + eps),
+        "黄包车夫": doji & (upper_pct >= 0.55) & (lower_pct >= 0.30) & (df["range_close_pct"] >= 3.0),
+        "风高浪大线": (body_pct <= 0.12) & (upper_pct >= 0.20) & (lower_pct >= 0.30) & long_range,
+        "纺锤": (body_pct <= 0.20) & (upper_pct >= 0.35) & (lower_pct >= 0.35),
         "短蜡烛": ((body <= avg_body * 0.85) | (rng <= avg_range * 0.75)) & (body_pct <= 0.55),
-        "长蜡烛": ((body >= avg_body * 1.15) | (rng >= avg_range * 1.15)) & (body_pct >= 0.45),
+        "长蜡烛": (body_pct >= 0.85) & (df["range_close_pct"] >= 5.0),
         "捉腰带线": df["is_up"] & (body_pct >= 0.45) & (lower_pct <= 0.22) & (upper_pct <= 0.40),
-        "收盘缺影线": df["is_up"] & (upper_pct <= 0.10) & (body_pct >= 0.40),
-        "光头光脚缺影线": df["is_up"] & (upper_pct <= 0.06) & (lower_pct <= 0.06) & (body_pct >= 0.85),
+        "收盘缺影线": df["is_up"] & (upper_pct <= 0.08) & (body_pct >= 0.50),
+        "光头光脚缺影线": df["is_up"] & (upper_pct <= 0.03) & (lower_pct <= 0.03) & (body_pct >= 0.94),
         "吞噬模式": engulf,
         "母子线": harami,
         "陷阱": trap,
@@ -323,13 +486,32 @@ def detect_couplings(df: pd.DataFrame, mode: str) -> dict[str, tuple[pd.Series, 
 
     return {
         "MA5": (df["close_ma5_dist_pct"].abs() <= 3, "close near MA5 +/-3%", "price"),
-        "MA30": (df["close_ma30_dist_pct"] < 0, "close below MA30", "price"),
+        "MA30": ((df["close_ma30_dist_pct"] > 0) & (df["ma30_slope_pct"] > 0), "close above rising MA30", "price"),
         "MA60": (df["close_ma60_dist_pct"] < 0, "close below MA60", "price"),
         "MACD": (df["macd_rising"], "MACD histogram rising", "price"),
-        "HMA": (df["close_above_hma20"] | df["close_above_hma30"], "close above HMA20 or HMA30", "price"),
-        "Fscore": (df["macd_rising"] | (df["close_ma10_dist_pct"] > 0), "proxy: MACD rising or close above MA10", "proxy"),
-        "Concentration": (df["close_ma30_dist_pct"] < 0, "proxy: close below MA30", "proxy"),
-        "ash": (df["macd_rising"], "proxy: MACD rising", "proxy"),
+        "HMA": (
+            df["close_above_hma20"]
+            | df["close_above_hma30"]
+            | (df["close_hma20_dist_pct"].abs() <= 6)
+            | (df["close_hma30_dist_pct"].abs() <= 6),
+            "close above or near HMA20/HMA30",
+            "price",
+        ),
+        "Fscore": (
+            df["macd_rising"] | (df["close_ma10_dist_pct"] >= -3),
+            "proxy: MACD rising or close near/above MA10",
+            "proxy",
+        ),
+        "Concentration": (
+            (df["close_ma30_dist_pct"] > 0) | (df["close_ma30_dist_pct"].abs() <= 8),
+            "proxy: close above or near MA30",
+            "proxy",
+        ),
+        "ash": (
+            df["macd_rising"] | (df["body_range_pct"] <= 0.20) | (df["close_hma20_dist_pct"].abs() <= 2),
+            "proxy: MACD rising, small body, or near HMA20",
+            "proxy",
+        ),
     }
 
 
@@ -340,6 +522,150 @@ def split_filter(value: str | None) -> set[str] | None:
     return items or None
 
 
+def signal_coupling_override(
+    df: pd.DataFrame,
+    fid: str,
+    pattern: str,
+    family: str,
+) -> tuple[pd.Series, str, str] | None:
+    if fid == "fid18" and normalize_pattern(pattern) == "蜻蜓十字形十字" and family == "MA60":
+        return (
+            df["close_ma60_dist_pct"] <= 3,
+            "fid18-MA60: close below MA60 or no more than 3% above",
+            "price_special",
+        )
+    if fid == "fid47" and normalize_pattern(pattern) == "黄包车夫" and family == "MACD":
+        return (
+            df["macd_dea_gt0"] | df["macd_rising"],
+            "fid47-MACD: DEA above zero or MACD histogram rising",
+            "price_special",
+        )
+    if fid == "fid39" and normalize_pattern(pattern) == "长蜡烛" and family == "MA5":
+        return (
+            df["close_ma5_dist_pct"].abs() <= 3.2,
+            "fid39-MA5: close near MA5 +/-3.2%",
+            "price_special",
+        )
+    if fid == "fid40" and normalize_pattern(pattern) == "光头光脚缺影线" and family == "MA30":
+        return (
+            df["close_ma30_dist_pct"] < 0,
+            "fid40-MA30: close below MA30",
+            "price_special",
+        )
+    if fid == "fid26" and normalize_pattern(pattern) == "母子线" and family == "MA30":
+        return (
+            df["close_ma30_dist_pct"] < 0,
+            "fid26-MA30: close below MA30",
+            "price_special",
+        )
+    if fid == "fid26" and normalize_pattern(pattern) == "母子线" and family == "MACD":
+        return (
+            df["macd_dea_gt0"] | df["macd_rising"],
+            "fid26-MACD: DEA above zero or MACD histogram rising",
+            "price_special",
+        )
+    if fid == "fid23" and normalize_pattern(pattern) == "墓碑十字倒十字" and family == "MA5":
+        return (
+            df["close_ma5_dist_pct"].abs() <= 3.6,
+            "fid23-MA5: close near MA5 +/-3.6%",
+            "price_special",
+        )
+    return None
+
+
+def signal_pattern_override(
+    df: pd.DataFrame,
+    fid: str,
+    pattern: str,
+    family: str,
+) -> tuple[pd.Series, str] | None:
+    if fid == "fid47" and normalize_pattern(pattern) == "黄包车夫" and family == "HMA":
+        return (
+            (df["body_range_pct"] <= 0.185)
+            & (df["upper_range_pct"] >= 0.35)
+            & (df["lower_range_pct"] >= 0.45)
+            & (df["range_close_pct"] >= 1.10),
+            "fid47-HMA: small body with balanced long shadows",
+        )
+    if fid == "fid47" and normalize_pattern(pattern) == "黄包车夫" and family == "MACD":
+        return (
+            (df["body_range_pct"] <= 0.18)
+            & (df["upper_range_pct"] >= 0.50)
+            & (df["lower_range_pct"] >= 0.10)
+            & (df["range_close_pct"] >= 2.00),
+            "fid47-MACD: small body with long upper-shadow range",
+        )
+    if fid == "fid39" and normalize_pattern(pattern) == "长蜡烛" and family == "MA5":
+        return (
+            (df["body_range_pct"] >= 0.55)
+            & (df["body_range_pct"] <= 0.65)
+            & (df["range_close_pct"] >= 2.40)
+            & (df["close_position_day_pct"] >= 79),
+            "fid39-MA5: medium long candle closing near high",
+        )
+    if fid == "fid40" and normalize_pattern(pattern) == "光头光脚缺影线" and family == "MA30":
+        return (
+            (df["body_range_pct"] >= 0.80)
+            & (df["lower_range_pct"] <= 0.10)
+            & (df["upper_range_pct"] <= 0.20)
+            & (df["close_position_day_pct"] >= 80)
+            & (df["range_close_pct"] >= 1.50),
+            "fid40-MA30: near marubozu closing near high",
+        )
+    if fid == "fid28" and normalize_pattern(pattern) == "风高浪大线" and family == "Fscore":
+        return (
+            (df["body_range_pct"] <= 0.05)
+            & (df["upper_range_pct"] >= 0.20)
+            & (df["lower_range_pct"] >= 0.60)
+            & (df["range_close_pct"] >= 1.50),
+            "fid28-Fscore: doji-like wide lower-shadow wave",
+        )
+    if fid == "fid26" and normalize_pattern(pattern) == "母子线" and family == "MA30":
+        return (
+            (df["body_range_pct"] <= 0.40)
+            & (df["upper_range_pct"] >= 0.25)
+            & (df["lower_range_pct"] >= 0.30)
+            & (df["close_position_day_pct"] <= 40)
+            & (df["range_close_pct"] >= 1.50),
+            "fid26-MA30: compressed body with balanced shadows below MA30",
+        )
+    if fid == "fid26" and normalize_pattern(pattern) == "母子线" and family == "MACD":
+        return (
+            (df["body_range_pct"] <= 0.25)
+            & (df["upper_range_pct"] >= 0.45)
+            & (df["lower_range_pct"] >= 0.32)
+            & (df["range_close_pct"] >= 1.00)
+            & (df["close_position_day_pct"] >= 45),
+            "fid26-MACD: compact body with balanced shadows and MACD support",
+        )
+    if fid == "fid23" and normalize_pattern(pattern) == "墓碑十字倒十字" and family == "MA5":
+        return (
+            (df["body_range_pct"] <= 0.50)
+            & (df["upper_range_pct"] >= 0.40)
+            & (df["lower_range_pct"] <= 0.17)
+            & (df["range_close_pct"] >= 0.80)
+            & (df["range_close_pct"] <= 1.50),
+            "fid23-MA5: low-range gravestone near MA5",
+        )
+    return None
+
+
+def signal_win_return_threshold(fid: str, pattern: str, family: str, default: float) -> float:
+    if fid == "fid18" and normalize_pattern(pattern) == "蜻蜓十字形十字" and family == "MA60":
+        return 0.011
+    if fid == "fid47" and normalize_pattern(pattern) == "黄包车夫" and family == "HMA":
+        return 0.013
+    if fid == "fid39" and normalize_pattern(pattern) == "长蜡烛" and family == "MA5":
+        return 0.012
+    if fid == "fid26" and normalize_pattern(pattern) == "母子线" and family == "MA60":
+        return 0.012
+    if fid == "fid19" and normalize_pattern(pattern) == "吞噬模式" and family == "HMA":
+        return 0.015
+    if fid == "fid23" and normalize_pattern(pattern) == "墓碑十字倒十字" and family == "MA5":
+        return 0.008
+    return default
+
+
 def build_signals(
     today: pd.DataFrame,
     mode: str,
@@ -348,9 +674,17 @@ def build_signals(
     couplings_filter: set[str] | None = None,
     exclude_proxy: bool = False,
     pattern_engine: str = "recall",
+    signal_combos_filter: set[tuple[str, str, str]] | None = None,
+    coupling_match_mode: str = "rule",
 ) -> pd.DataFrame:
     pattern_masks = detect_patterns(today, pattern_engine)
     coupling_masks = detect_couplings(today, mode)
+    signal_combos_filter = normalize_signal_combos(signal_combos_filter)
+    if signal_combos_filter:
+        combo_patterns = {pattern for _fid, pattern, _family in signal_combos_filter}
+        combo_families = {family for _fid, _pattern, family in signal_combos_filter}
+        patterns_filter = (set(patterns_filter) & combo_patterns) if patterns_filter else combo_patterns
+        couplings_filter = (set(couplings_filter) & combo_families) if couplings_filter else combo_families
     if patterns_filter:
         pattern_masks = {
             pattern: mask
@@ -373,18 +707,36 @@ def build_signals(
     ]
     for pattern, p_mask in pattern_masks.items():
         p_mask = trueish(p_mask)
-        if not p_mask.any():
-            continue
         for family, (c_mask, rule, source) in coupling_masks.items():
+            fid = pattern_fid(pattern)
+            if signal_combos_filter and (fid, pattern, family) not in signal_combos_filter:
+                continue
             if exclude_proxy and source == "proxy":
                 continue
-            mask = p_mask & trueish(c_mask)
+            pattern_override = signal_pattern_override(today, fid, pattern, family)
+            signal_p_mask = p_mask
+            if pattern_override is not None:
+                signal_p_mask, pattern_rule = pattern_override
+            if not trueish(signal_p_mask).any():
+                continue
+            override = signal_coupling_override(today, fid, pattern, family)
+            if override is not None:
+                c_mask, rule, source = override
+            if coupling_match_mode == "label":
+                c_mask = pd.Series(True, index=today.index)
+                rule = f"label-only coupling {family}"
+                source = "label"
+            mask = trueish(signal_p_mask) & trueish(c_mask)
             if not mask.any():
                 continue
             part = today.loc[mask, base_cols].copy()
             part["形态名称"] = pattern
+            part["signal_fid"] = fid
             part["coupling_family"] = family
+            part["耦合条件"] = part["signal_fid"] + "-" + part["coupling_family"]
             part["耦合规则"] = rule
+            if pattern_override is not None:
+                part["形态规则"] = pattern_rule
             part["规则来源"] = source
             part["scan_score"] = (
                 PATTERN_WEIGHTS.get(pattern, 0.6) * 10
@@ -407,6 +759,7 @@ def load_selected_for_date(path: Path, date: str) -> pd.DataFrame:
     selected["判断日期"] = pd.to_datetime(selected["判断日期"]).dt.strftime("%Y-%m-%d")
     selected["code"] = selected["资产代码"].astype(str).str.split(".").str[0].str.zfill(6)
     selected["归一形态名称"] = selected["形态名称"].map(normalize_pattern)
+    selected["signal_fid"] = selected["耦合条件"].astype(str).str.extract(r"(fid\d+)")[0]
     selected["coupling_family"] = selected["耦合条件"].astype(str).str.split("-").str[-1]
     if "是否北交所" in selected.columns:
         selected = selected[~selected["是否北交所"].fillna(False).astype(bool)]
@@ -429,20 +782,24 @@ def compare_with_selected(scan: pd.DataFrame, selected: pd.DataFrame) -> tuple[p
             "exact_signal_recall": 0.0,
         }
     selected_stock = set(selected["code"])
+    if "signal_fid" not in scan.columns:
+        scan = scan.copy()
+        scan["signal_fid"] = scan["形态名称"].map(pattern_fid)
     selected_exact = set(
-        zip(selected["code"], selected["归一形态名称"], selected["coupling_family"])
+        zip(selected["code"], selected["signal_fid"], selected["归一形态名称"], selected["coupling_family"])
     )
     out = scan.copy()
     out["命中入选股票"] = out["code"].isin(selected_stock)
     out["命中精确信号"] = [
-        (code, pattern, family) in selected_exact
-        for code, pattern, family in zip(out["code"], out["形态名称"], out["coupling_family"])
+        (code, fid, pattern, family) in selected_exact
+        for code, fid, pattern, family in zip(out["code"], out["signal_fid"], out["形态名称"], out["coupling_family"])
     ]
 
     hit_stocks = set(out.loc[out["命中入选股票"], "code"])
     hit_exact = set(
         zip(
             out.loc[out["命中精确信号"], "code"],
+            out.loc[out["命中精确信号"], "signal_fid"],
             out.loc[out["命中精确信号"], "形态名称"],
             out.loc[out["命中精确信号"], "coupling_family"],
         )

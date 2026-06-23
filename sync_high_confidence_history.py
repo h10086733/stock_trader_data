@@ -97,7 +97,7 @@ def main():
             print(
                 f"[{index}/{total}] {trade_date} 完成 "
                 f"输出={meta.get('output_rows', 0)} "
-                f"质量缓存={meta.get('quality_source_date') or '-'} "
+                f"质量来源={meta.get('quality_source_date') or '-'} "
                 f"市值补抓={meta.get('market_cap_fetched', 0)} "
                 f"耗时={time.time() - t0:.1f}s",
                 flush=True,

@@ -28,7 +28,7 @@
 | 形态引擎 | `recall` | 使用宽松 K 线形态识别 |
 | 扫描回看日数 | 400 个交易日 | 用于构建当日指标面板 |
 | 最少历史 K 线 | 120 根 | 股票少于该数量不参与扫描 |
-| 默认展示天数 | 30 个完整交易日 | 页面留空日期时默认返回最近 30 个完整交易日 |
+| 默认展示天数 | 7 个完整交易日 | 页面留空日期时默认返回最近 7 个完整交易日 |
 | 完整市场阈值 | 日 K 覆盖 >= 4500 只 | 用于判断完整交易日 |
 | 默认输出上限 | 0 | 不截断，按规则全部输出 |
 | 默认最低总市值 | 100 亿 | 低于该市值过滤掉 |
@@ -37,12 +37,12 @@
 | 历史胜利口径 | `max_high` | 未来 5 日最高价相对当日收盘价 |
 | 胜利阈值 | 2% | 未来 5 日最高收益 > 2% 算胜利 |
 | 最少历史样本 | 31 次 | 同一股票 + 形态 + 耦合组合 |
-| 最低历史胜率 | 88% | `hist_win_rate >= 0.88` |
+| 最低历史胜率 | 70% | `hist_win_rate >= 0.70` |
 
 当前规则版本会被拼入缓存 key，例如：
 
 ```text
-hc_loose_recall_q88_s31_fwd5_max_high_wr2_max0_capon
+hc_loose_recall_q70_s31_fwd5_max_high_wr2_max0_capon
 ```
 
 ## 默认扫描形态
@@ -131,10 +131,10 @@ scan_score =
 
 ```text
 hist_samples >= 31
-hist_win_rate >= 0.88
+hist_win_rate >= 0.70
 ```
 
-如果当日质量缓存不存在，系统会计算并写入 `outputs/cache/`。如果允许 fallback，且目标日没有缓存，会复用不晚于目标日的最近一份质量缓存。
+生产默认不读取、不写入历史质量缓存。每个交易日都会基于当天信号集合独立回看历史 K 线并计算 `hist_samples`、`hist_win_rate` 等质量指标，避免跨日期缓存导致信号组合匹配不一致。
 
 ## 股票聚合与排序
 
@@ -240,12 +240,12 @@ curl -X POST "http://localhost:5000/api/high-confidence/sync?date=2026-06-17"
 
 ## 缓存与数据表
 
-高置信策略使用两类缓存：
+高置信策略保留页面结果和市值缓存，但历史质量结果不缓存：
 
 | 位置 | 内容 |
 |---|---|
 | `outputs/cache/hc_scan_panel_*.pkl` | 当日指标面板 |
-| `outputs/cache/hc_signal_quality_*.pkl` | 历史质量结果 |
+| `outputs/cache/hc_signal_quality_*.pkl` | 已停用；生产不再读取或写入 |
 | `high_confidence_scans` | 页面 payload 缓存 |
 | `high_confidence_market_caps` | 市值快照缓存 |
 
