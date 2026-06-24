@@ -8238,7 +8238,7 @@ tr:last-child td { border-bottom:0; }
     <input id="bigThreshold" type="number" value="7" min="3" max="20" step="0.5">
   </label>
   <label>最小样本
-    <input id="minSamples" type="number" value="80" min="5" max="500">
+    <input id="minSamples" type="number" value="50" min="5" max="500">
   </label>
   <label>信号日最低涨跌%
     <input id="minSignalPct" type="number" value="3" min="-20" max="20" step="0.5">
