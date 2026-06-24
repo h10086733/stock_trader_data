@@ -5,6 +5,7 @@
   python stock_db_pipeline.py --test      # 用10只股票验证流程
   python stock_db_pipeline.py --init      # 全量初始化（支持断点续传）
   python stock_db_pipeline.py --sync      # 每日收盘后增量同步
+  python stock_db_pipeline.py --backfill-days 35  # 强制回补最近35天日K
   python stock_db_pipeline.py --status    # 查看数据库状态
 
 定时任务（crontab）：
@@ -1036,6 +1037,69 @@ def run_daily_sync(conn):
     sync_market_caps_for_trade_date(conn, datetime.today().strftime("%Y-%m-%d"), rows)
 
 
+def run_recent_backfill(conn, days):
+    if days <= 0:
+        raise ValueError("--backfill-days 必须大于 0")
+
+    start_date = (datetime.today() - timedelta(days=days)).strftime("%Y%m%d")
+    start_dash = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+    log.info("=" * 55)
+    log.info(f"回补最近 {days} 天日K  start={start_dash}")
+
+    new_list = fetch_stock_list()
+    cur = conn.cursor()
+    cur.execute("SELECT code FROM stocks")
+    existing = {r[0] for r in cur.fetchall()}
+    upsert_stocks(conn, new_list)
+    new_codes = {s["code"] for s in new_list} - existing
+    if new_codes:
+        log.info(f"新上市股票 {len(new_codes)} 只: {sorted(new_codes)[:10]}")
+
+    cur.execute("SELECT code, market FROM stocks ORDER BY code")
+    stock_rows = cur.fetchall()
+    total = len(stock_rows)
+    ok, fail = 0, 0
+    fail_codes = []
+    t0 = time.time()
+
+    for i, (code, market) in enumerate(stock_rows, start=1):
+        try:
+            rows = fetch_kline(code, market, start_date)
+            insert_daily_prices(conn, code, rows)
+            update_stock_price_range(conn, code, rows)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            fail_codes.append(code)
+            log.warning(f"  ❌ {code} 回补失败: {e}")
+
+        if i % 100 == 0 or i == total:
+            elapsed = (time.time() - t0) / 60
+            done = ok + fail
+            eta = (elapsed / done * (total - done)) if done > 0 else 0
+            log.info(f"  进度 {i}/{total}  成功:{ok}  失败:{fail}  "
+                     f"已用:{elapsed:.1f}min  预计剩余:{eta:.1f}min")
+
+        time.sleep(REQUEST_INTERVAL + random.uniform(0, 0.5))
+
+    duration = time.time() - t0
+    fail_ratio = fail / total if total > 0 else 0
+    if fail_ratio > FAIL_ALERT_RATIO:
+        log.warning(f"⚠️  回补失败率 {fail_ratio*100:.1f}% 超过阈值！"
+                    f"失败代码（前20）: {fail_codes[:20]}")
+
+    conn.execute("""
+        INSERT INTO sync_log
+            (sync_type, sync_date, total, success, failed, new_stocks, duration_s, note)
+        VALUES (?,?,?,?,?,?,?,?)
+    """, ("recent_backfill", datetime.today().strftime("%Y-%m-%d"),
+          total, ok, fail, len(new_codes), round(duration, 1),
+          f"days={days} start={start_dash} failures={fail_codes[:20]}" if fail_codes else f"days={days} start={start_dash}"))
+    conn.commit()
+    sync_market_caps_for_trade_date(conn, datetime.today().strftime("%Y-%m-%d"), stock_rows)
+    log.info(f"回补完成  耗时:{duration/60:.1f}min  成功:{ok}  失败:{fail}")
+
+
 def run_status(conn):
     cur = conn.cursor()
     print("\n" + "=" * 55)
@@ -1095,6 +1159,7 @@ def main():
     parser.add_argument("--test",      action="store_true", help="测试模式（10只股票）")
     parser.add_argument("--init",      action="store_true", help="全量初始化（支持断点续传）")
     parser.add_argument("--sync",      action="store_true", help="每日增量同步")
+    parser.add_argument("--backfill-days", type=int, help="强制回补最近 N 天日K，适合修复近期缺行")
     parser.add_argument("--sync-caps", metavar="YYYY-MM-DD", help="为指定交易日的高置信候选票补市值快照")
     parser.add_argument("--status",    action="store_true", help="查看数据库状态")
     parser.add_argument("--no-resume", action="store_true", help="init 时不断点续传，重新全量")
@@ -1113,6 +1178,8 @@ def main():
         run_init(conn, resume=not args.no_resume)
     elif args.sync:
         run_daily_sync(conn)
+    elif args.backfill_days:
+        run_recent_backfill(conn, args.backfill_days)
     elif args.sync_caps:
         sync_market_caps_for_high_confidence_candidates(conn, args.sync_caps)
     else:

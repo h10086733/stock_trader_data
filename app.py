@@ -24,6 +24,7 @@ import time
 import sqlite3
 import requests
 from werkzeug.exceptions import HTTPException
+import next_day_surge_research as surge_research
 from hc_strategy_scanner import (
     FOCUS_LONG_100YI_SIGNAL_COMBOS,
     PANEL_CACHE_VERSION as HC_SCAN_PANEL_CACHE_VERSION,
@@ -109,6 +110,13 @@ HC_PROGRESS = {}
 HC_PROGRESS_LOCK = threading.Lock()
 HC_SYNC_THREADS = {}
 HC_SYNC_THREADS_LOCK = threading.Lock()
+SURGE_SCAN_LOCK = threading.Lock()
+SURGE_PROGRESS = {
+    "status": "idle",
+    "message": "暂无扫描任务",
+    "percent": 0,
+}
+SURGE_PROGRESS_LOCK = threading.Lock()
 CSI1000_RUN_KEY = "default"
 CSI1000_BACKTEST_START = "2016-06-20"
 CSI1000_EXCEL_PATH = os.path.join(BASE_DIR, "data", "历史新高新低300和1000.xlsx")
@@ -397,6 +405,82 @@ def ensure_pattern_tables(conn):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_runs_date ON pattern_scan_runs(trade_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_picks_run ON pattern_picks(run_id)")
+    conn.commit()
+
+
+def ensure_surge_tables(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS surge_scan_batches (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date          DATE NOT NULL,
+            status              TEXT NOT NULL,
+            row_count           INTEGER,
+            pre_trade_filter_count INTEGER,
+            raw_signal_count    INTEGER,
+            stock_count         INTEGER,
+            history_days        INTEGER,
+            big_threshold       REAL,
+            min_samples         INTEGER,
+            continuation_only   INTEGER,
+            min_signal_pct      REAL,
+            exclude_signal_limit INTEGER,
+            elapsed_s           REAL,
+            params_json         TEXT,
+            error               TEXT,
+            created_at          DATETIME DEFAULT (datetime('now','localtime')),
+            updated_at          DATETIME DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS surge_scan_rows (
+            id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id                   INTEGER NOT NULL,
+            trade_date                 DATE NOT NULL,
+            code                       TEXT NOT NULL,
+            name                       TEXT,
+            secucode                   TEXT,
+            pattern                    TEXT,
+            raw_pattern                TEXT,
+            coupling                   TEXT,
+            signal_key                 TEXT,
+            signal_count               INTEGER,
+            close                      REAL,
+            pct_change                 REAL,
+            turnover                   REAL,
+            amount_yi                  REAL,
+            scan_score                 REAL,
+            surge_score                REAL,
+            surge_samples              INTEGER,
+            next_touch_limit_rate      REAL,
+            next_close_limit_rate      REAL,
+            next_high_ge_big_rate      REAL,
+            next_close_ge_big_rate     REAL,
+            avg_next_high_gain_pct     REAL,
+            median_next_high_gain_pct  REAL,
+            avg_next_close_gain_pct    REAL,
+            avg_next_open_gain_pct     REAL,
+            max_next_high_gain_pct     REAL,
+            signal_touch_limit         INTEGER,
+            signal_close_limit         INTEGER,
+            patterns                   TEXT,
+            couplings                  TEXT,
+            row_json                   TEXT,
+            created_at                 DATETIME DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_surge_batches_date ON surge_scan_batches(trade_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_surge_rows_batch ON surge_scan_rows(batch_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_surge_rows_code ON surge_scan_rows(code)")
+    batch_columns = {row["name"] for row in conn.execute("PRAGMA table_info(surge_scan_batches)").fetchall()}
+    if "exclude_signal_limit" not in batch_columns:
+        conn.execute("ALTER TABLE surge_scan_batches ADD COLUMN exclude_signal_limit INTEGER")
+    if "pre_trade_filter_count" not in batch_columns:
+        conn.execute("ALTER TABLE surge_scan_batches ADD COLUMN pre_trade_filter_count INTEGER")
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(surge_scan_rows)").fetchall()}
+    if "signal_touch_limit" not in columns:
+        conn.execute("ALTER TABLE surge_scan_rows ADD COLUMN signal_touch_limit INTEGER")
+    if "signal_close_limit" not in columns:
+        conn.execute("ALTER TABLE surge_scan_rows ADD COLUMN signal_close_limit INTEGER")
     conn.commit()
 
 
@@ -5443,6 +5527,431 @@ def passes_momentum_filters(row, min_gain, max_gain, min_vol_ratio):
     return True
 
 
+def set_surge_progress(**updates):
+    with SURGE_PROGRESS_LOCK:
+        SURGE_PROGRESS.update(updates)
+        SURGE_PROGRESS["updated_at"] = local_now_text()
+
+
+def get_surge_progress():
+    with SURGE_PROGRESS_LOCK:
+        return dict(SURGE_PROGRESS)
+
+
+def build_surge_params(args):
+    date = normalize_trade_date(args.get("date") or args.get("tradeDate"), None)
+    return {
+        "date": date,
+        "history_days": coerce_int(args.get("historyDays") or args.get("history_days"), 1800, 300, 5000),
+        "lookback_days": coerce_int(args.get("lookbackDays") or args.get("lookback_days"), 400, 120, 1200),
+        "min_history": coerce_int(args.get("minHistory") or args.get("min_history"), 120, 60, 500),
+        "mode": args.get("mode") if args.get("mode") in ("loose", "strict") else "loose",
+        "pattern_engine": args.get("patternEngine") or args.get("pattern_engine") or "lizi_relaxed",
+        "big_threshold": clean_number(args.get("bigThreshold") or args.get("big_threshold") or 7.0),
+        "min_samples": coerce_int(args.get("minSamples") or args.get("min_samples"), 80, 5, 500),
+        "top": coerce_int(args.get("top"), 10, 1, 1000),
+        "include_bj": str(args.get("includeBj") or args.get("include_bj") or "").lower() in ("1", "true", "yes", "on"),
+        "include_risky": str(args.get("includeRisky") or args.get("include_risky") or "").lower() in ("1", "true", "yes", "on"),
+        "all_combos": str(args.get("allCombos") or args.get("all_combos") or "").lower() in ("1", "true", "yes", "on"),
+        "continuation_only": str(args.get("continuationOnly") or args.get("continuation_only") or "1").lower() not in ("0", "false", "no", "off"),
+        "min_signal_pct": clean_number(args.get("minSignalPct") or args.get("min_signal_pct") or 3.0),
+        "max_signal_pct": clean_number(args.get("maxSignalPct") or args.get("max_signal_pct") or 8.8),
+        "min_amount_yi": clean_number(args.get("minAmountYi") or args.get("min_amount_yi") or 5.0),
+        "min_next_high_rate": clean_number(args.get("minNextHighRate") or args.get("min_next_high_rate") or 30.0) / 100.0,
+        "min_touch_limit_rate": clean_number(args.get("minTouchLimitRate") or args.get("min_touch_limit_rate") or 20.0) / 100.0,
+        "only_10cm": str(args.get("only10cm") or args.get("only_10cm") or "1").lower() not in ("0", "false", "no", "off"),
+        "exclude_signal_limit": str(args.get("excludeSignalLimit") or args.get("exclude_signal_limit") or "1").lower() not in ("0", "false", "no", "off"),
+    }
+
+
+def surge_namespace(params):
+    return SimpleNamespace(
+        db=DB_PATH,
+        date=params.get("date"),
+        history_days=params["history_days"],
+        lookback_days=params["lookback_days"],
+        min_history=params["min_history"],
+        mode=params["mode"],
+        pattern_engine=params["pattern_engine"],
+        big_threshold=params["big_threshold"],
+        min_samples=params["min_samples"],
+        top=params["top"],
+        include_bj=params["include_bj"],
+        include_risky=params["include_risky"],
+        all_combos=params["all_combos"],
+        continuation_only=params["continuation_only"],
+        min_signal_pct=params["min_signal_pct"],
+        exclude_signal_limit=params["exclude_signal_limit"],
+        out_dir=os.path.join(BASE_DIR, "outputs"),
+    )
+
+
+def clean_json_value(value):
+    if value is None:
+        return None
+    try:
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return None
+    except TypeError:
+        pass
+    if hasattr(value, "item"):
+        try:
+            return clean_json_value(value.item())
+        except Exception:
+            return str(value)
+    if isinstance(value, dict):
+        return {str(k): clean_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [clean_json_value(v) for v in value]
+    return value
+
+
+def dataframe_records(df):
+    if df is None or getattr(df, "empty", True):
+        return []
+    records = []
+    for row in df.to_dict(orient="records"):
+        records.append(clean_json_value(row))
+    return records
+
+
+def is_20cm_or_bj_code(code):
+    code = str(code or "").zfill(6)
+    return code.startswith(("300", "301", "688", "689", "8", "9"))
+
+
+def apply_surge_trade_filters(candidates, params):
+    if candidates is None or getattr(candidates, "empty", True):
+        return candidates
+    filtered = candidates.copy()
+    if params.get("min_samples"):
+        filtered = filtered[filtered["surge_samples"].fillna(0) >= params["min_samples"]]
+    filtered = filtered[
+        (filtered["next_high_ge_big_rate"].fillna(0) >= params.get("min_next_high_rate", 0))
+        & (filtered["next_touch_limit_rate"].fillna(0) >= params.get("min_touch_limit_rate", 0))
+    ]
+    min_pct = params.get("min_signal_pct")
+    max_pct = params.get("max_signal_pct")
+    if min_pct is not None:
+        filtered = filtered[filtered["pct_change"].fillna(-999) >= min_pct]
+    if max_pct is not None:
+        filtered = filtered[filtered["pct_change"].fillna(999) <= max_pct]
+    min_amount = params.get("min_amount_yi")
+    if min_amount:
+        filtered = filtered[filtered["amount_yi"].fillna(0) >= min_amount]
+    if params.get("only_10cm"):
+        filtered = filtered[~filtered["code"].astype(str).map(is_20cm_or_bj_code)]
+    if params.get("exclude_signal_limit") and "signal_close_limit" in filtered.columns:
+        filtered = filtered[~filtered["signal_close_limit"].fillna(False).astype(bool)]
+    return filtered.sort_values(
+        ["surge_score", "next_touch_limit_rate", "next_high_ge_big_rate", "surge_samples"],
+        ascending=[False, False, False, False],
+    )
+
+
+def save_surge_batch(conn, params, meta, rows, status="ok", error=None, batch_id=None):
+    ensure_surge_tables(conn)
+    now = local_now_text()
+    if batch_id:
+        conn.execute("""
+            UPDATE surge_scan_batches
+            SET trade_date = ?, status = ?, row_count = ?, pre_trade_filter_count = ?, raw_signal_count = ?,
+                stock_count = ?, history_days = ?, big_threshold = ?, min_samples = ?,
+                continuation_only = ?, min_signal_pct = ?, exclude_signal_limit = ?, elapsed_s = ?,
+                params_json = ?, error = ?, updated_at = ?
+            WHERE id = ?
+        """, (
+            meta.get("trade_date") or params.get("date"),
+            status,
+            len(rows),
+            meta.get("pre_trade_filter_count"),
+            meta.get("raw_signal_count"),
+            meta.get("stock_count"),
+            params["history_days"],
+            params["big_threshold"],
+            params["min_samples"],
+            1 if params.get("continuation_only") else 0,
+            params.get("min_signal_pct"),
+            1 if params.get("exclude_signal_limit") else 0,
+            meta.get("elapsed_s"),
+            json.dumps(params, ensure_ascii=False, sort_keys=True),
+            error,
+            now,
+            batch_id,
+        ))
+        conn.execute("DELETE FROM surge_scan_rows WHERE batch_id = ?", (batch_id,))
+    else:
+        cur = conn.execute("""
+            INSERT INTO surge_scan_batches (
+                trade_date, status, row_count, pre_trade_filter_count, raw_signal_count, stock_count,
+                history_days, big_threshold, min_samples, continuation_only,
+                min_signal_pct, exclude_signal_limit, elapsed_s, params_json, error, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            meta.get("trade_date") or params.get("date"),
+            status,
+            len(rows),
+            meta.get("pre_trade_filter_count"),
+            meta.get("raw_signal_count"),
+            meta.get("stock_count"),
+            params["history_days"],
+            params["big_threshold"],
+            params["min_samples"],
+            1 if params.get("continuation_only") else 0,
+            params.get("min_signal_pct"),
+            1 if params.get("exclude_signal_limit") else 0,
+            meta.get("elapsed_s"),
+            json.dumps(params, ensure_ascii=False, sort_keys=True),
+            error,
+            now,
+        ))
+        batch_id = cur.lastrowid
+
+    for row in rows:
+        conn.execute("""
+            INSERT INTO surge_scan_rows (
+                batch_id, trade_date, code, name, secucode, pattern, raw_pattern,
+                coupling, signal_key, signal_count, close, pct_change, turnover,
+                amount_yi, scan_score, surge_score, surge_samples,
+                next_touch_limit_rate, next_close_limit_rate,
+                next_high_ge_big_rate, next_close_ge_big_rate,
+                avg_next_high_gain_pct, median_next_high_gain_pct,
+                avg_next_close_gain_pct, avg_next_open_gain_pct,
+                max_next_high_gain_pct, signal_touch_limit, signal_close_limit,
+                patterns, couplings, row_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            batch_id,
+            row.get("date") or meta.get("trade_date"),
+            row.get("code"),
+            row.get("name"),
+            row.get("secucode"),
+            row.get("pattern"),
+            row.get("raw_pattern"),
+            row.get("coupling"),
+            row.get("signal_key"),
+            row.get("signal_count"),
+            row.get("close"),
+            row.get("pct_change"),
+            row.get("turnover"),
+            row.get("amount_yi"),
+            row.get("scan_score"),
+            row.get("surge_score"),
+            row.get("surge_samples"),
+            row.get("next_touch_limit_rate"),
+            row.get("next_close_limit_rate"),
+            row.get("next_high_ge_big_rate"),
+            row.get("next_close_ge_big_rate"),
+            row.get("avg_next_high_gain_pct"),
+            row.get("median_next_high_gain_pct"),
+            row.get("avg_next_close_gain_pct"),
+            row.get("avg_next_open_gain_pct"),
+            row.get("max_next_high_gain_pct"),
+            1 if row.get("signal_touch_limit") else 0,
+            1 if row.get("signal_close_limit") else 0,
+            row.get("patterns"),
+            row.get("couplings"),
+            json.dumps(row, ensure_ascii=False, sort_keys=True),
+        ))
+    conn.commit()
+    return batch_id
+
+
+def create_surge_batch(conn, params, trade_date=None):
+    ensure_surge_tables(conn)
+    cur = conn.execute("""
+        INSERT INTO surge_scan_batches (
+            trade_date, status, row_count, history_days, big_threshold,
+            min_samples, continuation_only, min_signal_pct, exclude_signal_limit, params_json
+        )
+        VALUES (?, 'running', 0, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        trade_date or params.get("date") or "",
+        params["history_days"],
+        params["big_threshold"],
+        params["min_samples"],
+        1 if params.get("continuation_only") else 0,
+        params.get("min_signal_pct"),
+        1 if params.get("exclude_signal_limit") else 0,
+        json.dumps(params, ensure_ascii=False, sort_keys=True),
+    ))
+    conn.commit()
+    return cur.lastrowid
+
+
+def run_surge_scan(params, batch_id=None):
+    args = surge_namespace(params)
+    started_at = time.time()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        trade_date = params.get("date") or surge_research.latest_complete_date(conn)
+        params["date"] = trade_date
+        set_surge_progress(
+            status="running",
+            phase="scan",
+            batch_id=batch_id,
+            trade_date=trade_date,
+            message=f"正在扫描 {trade_date} 当日形态/耦合信号",
+            percent=10,
+        )
+        scan = surge_research.scan_target_signals(conn, args, trade_date)
+        raw_signal_count = int(len(scan)) if scan is not None else 0
+        stock_count = int(scan["code"].nunique()) if raw_signal_count else 0
+        set_surge_progress(
+            status="running",
+            phase="history",
+            batch_id=batch_id,
+            trade_date=trade_date,
+            message=f"当日信号 {raw_signal_count} 条，正在回看历史次日涨停/大涨概率",
+            percent=35,
+            raw_signal_count=raw_signal_count,
+            stock_count=stock_count,
+        )
+        stats = surge_research.historical_surge_stats(conn, scan, trade_date, args)
+        set_surge_progress(
+            status="running",
+            phase="rank",
+            batch_id=batch_id,
+            trade_date=trade_date,
+            message="历史概率统计完成，正在聚合排序",
+            percent=82,
+        )
+        candidates = surge_research.aggregate_target_rows(
+            scan,
+            stats,
+            args.min_samples,
+            exclude_signal_limit=args.exclude_signal_limit,
+        )
+        pre_trade_filter_count = int(len(candidates)) if candidates is not None else 0
+        candidates = apply_surge_trade_filters(candidates, params)
+        rows = dataframe_records(candidates)
+        meta = {
+            "trade_date": trade_date,
+            "raw_signal_count": raw_signal_count,
+            "stock_count": stock_count,
+            "pre_trade_filter_count": pre_trade_filter_count,
+            "row_count": len(rows),
+            "elapsed_s": round(time.time() - started_at, 1),
+            "params": params,
+        }
+        save_surge_batch(conn, params, meta, rows, batch_id=batch_id)
+        set_surge_progress(
+            status="done",
+            phase="done",
+            batch_id=batch_id,
+            trade_date=trade_date,
+            message=f"扫描完成，候选 {len(rows)} 只",
+            percent=100,
+            row_count=len(rows),
+            elapsed_s=meta["elapsed_s"],
+        )
+        return {"batch_id": batch_id, "meta": meta, "rows": rows}
+    except Exception as exc:
+        app.logger.exception("Next-day surge scan failed")
+        meta = {
+            "trade_date": params.get("date"),
+            "elapsed_s": round(time.time() - started_at, 1),
+        }
+        try:
+            save_surge_batch(conn, params, meta, [], status="error", error=str(exc), batch_id=batch_id)
+        except Exception:
+            app.logger.exception("Failed to save surge scan error state")
+        set_surge_progress(
+            status="error",
+            phase="error",
+            batch_id=batch_id,
+            trade_date=params.get("date"),
+            message=f"扫描失败：{exc}",
+            percent=100,
+            error=str(exc),
+        )
+        raise
+    finally:
+        conn.close()
+        SURGE_SCAN_LOCK.release()
+
+
+def start_surge_scan(params):
+    if not SURGE_SCAN_LOCK.acquire(blocking=False):
+        progress = get_surge_progress()
+        return {
+            "error": "已有涨停/大涨扫描任务进行中，请等待完成",
+            "progress": progress,
+        }, 429
+    conn = get_db()
+    try:
+        ensure_surge_tables(conn)
+        batch_id = create_surge_batch(conn, params, params.get("date"))
+    finally:
+        conn.close()
+    set_surge_progress(
+        status="queued",
+        phase="queued",
+        batch_id=batch_id,
+        trade_date=params.get("date"),
+        message="扫描任务已启动",
+        percent=1,
+    )
+    thread = threading.Thread(target=run_surge_scan, args=(params, batch_id), daemon=True)
+    try:
+        thread.start()
+    except Exception:
+        SURGE_SCAN_LOCK.release()
+        raise
+    return {
+        "status": "running",
+        "batch_id": batch_id,
+        "progress": get_surge_progress(),
+    }, 202
+
+
+def load_surge_history(conn, limit=20):
+    ensure_surge_tables(conn)
+    rows = conn.execute("""
+        SELECT *
+        FROM surge_scan_batches
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def load_surge_batch(conn, batch_id=None, limit=200):
+    ensure_surge_tables(conn)
+    if batch_id:
+        batch = conn.execute(
+            "SELECT * FROM surge_scan_batches WHERE id = ?",
+            (batch_id,),
+        ).fetchone()
+    else:
+        batch = conn.execute(
+            "SELECT * FROM surge_scan_batches WHERE status = 'ok' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if not batch:
+        return None
+    rows = conn.execute("""
+        SELECT *
+        FROM surge_scan_rows
+        WHERE batch_id = ?
+        ORDER BY surge_score DESC, next_touch_limit_rate DESC, next_high_ge_big_rate DESC
+        LIMIT ?
+    """, (batch["id"], limit)).fetchall()
+    batch_dict = dict(batch)
+    params = {}
+    try:
+        params = json.loads(batch_dict.get("params_json") or "{}")
+    except json.JSONDecodeError:
+        params = {}
+    return {
+        "batch": batch_dict,
+        "params": params,
+        "rows": [dict(row) for row in rows],
+    }
+
+
 # ─────────────────────────────────────────────────────────────────
 # HTML 模板
 # ─────────────────────────────────────────────────────────────────
@@ -5737,6 +6246,7 @@ HTML = """<!DOCTYPE html>
     <a class="nav-link" href="/pattern">收盘形态</a>
     <a class="nav-link" href="/momentum">14:30 选股</a>
     <a class="nav-link" href="/high-confidence">高置信小集合</a>
+    <a class="nav-link" href="/surge">涨停概率</a>
     <a class="nav-link" href="/csi1000">中证1000择时</a>
     <select class="days-select" id="daysSelect" onchange="loadData()">
       <option value="5">最近 5 日</option>
@@ -6229,6 +6739,7 @@ MOMENTUM_HTML = """<!DOCTYPE html>
     <a class="nav-link" href="/pattern">收盘形态</a>
     <a class="nav-link" href="/">行业宽度</a>
     <a class="nav-link" href="/high-confidence">高置信小集合</a>
+    <a class="nav-link" href="/surge">涨停概率</a>
     <a class="nav-link" href="/csi1000">中证1000择时</a>
   </div>
 </div>
@@ -6775,6 +7286,7 @@ PATTERN_HTML = """<!DOCTYPE html>
     <a class="nav-link" href="/">行业宽度</a>
     <a class="nav-link" href="/momentum">14:30 选股</a>
     <a class="nav-link" href="/high-confidence">高置信小集合</a>
+    <a class="nav-link" href="/surge">涨停概率</a>
     <a class="nav-link" href="/csi1000">中证1000择时</a>
   </div>
 </div>
@@ -7426,6 +7938,7 @@ tr:last-child td { border-bottom:0; }
     <a href="/">行业宽度</a>
     <a href="/pattern">收盘形态</a>
     <a href="/momentum">14:30 选股</a>
+    <a href="/surge">涨停概率</a>
     <a href="/csi1000">中证1000择时</a>
   </div>
 </div>
@@ -7622,6 +8135,323 @@ loadData();
 """
 
 
+SURGE_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>次日涨停/大涨概率扫描</title>
+<style>
+:root {
+  --bg:#101217; --surface:#171b22; --surface2:#202631; --border:#303744;
+  --text:#d7dce6; --muted:#8b94a3; --head:#f3f6fb; --accent:#2f80ed;
+  --red:#ff5b6e; --green:#22c55e; --yellow:#eab308;
+}
+* { box-sizing:border-box; }
+body {
+  margin:0; padding:24px; background:var(--bg); color:var(--text);
+  font:13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif;
+}
+header { display:flex; justify-content:space-between; align-items:flex-end; gap:16px; border-bottom:1px solid var(--border); padding-bottom:16px; margin-bottom:16px; }
+h1 { margin:0; color:var(--head); font-size:21px; font-weight:650; letter-spacing:0; }
+.sub { margin-top:6px; color:var(--muted); font-size:12px; }
+.nav { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+.nav a { color:var(--text); text-decoration:none; border:1px solid var(--border); background:var(--surface2); padding:7px 10px; border-radius:6px; }
+.nav a:hover { border-color:var(--accent); }
+.toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:end; margin-bottom:14px; }
+label { display:flex; flex-direction:column; gap:5px; color:var(--muted); font-size:11px; }
+input, select {
+  height:34px; border:1px solid var(--border); border-radius:6px;
+  background:var(--surface2); color:var(--text); padding:7px 9px; outline:none;
+}
+input[type="date"] { width:150px; }
+input[type="number"] { width:112px; }
+label.check { flex-direction:row; align-items:center; height:34px; gap:7px; color:var(--text); }
+label.check input { width:auto; height:auto; }
+button {
+  height:34px; border:0; border-radius:6px; background:var(--accent); color:#fff;
+  padding:0 14px; cursor:pointer; font-weight:650;
+}
+button.secondary { background:var(--surface2); border:1px solid var(--border); color:var(--text); }
+button:disabled { opacity:.55; cursor:wait; }
+.grid { display:grid; grid-template-columns: 1fr 320px; gap:14px; align-items:start; }
+.panel { border:1px solid var(--border); border-radius:8px; background:var(--surface); overflow:hidden; }
+.panel-head { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:10px 12px; border-bottom:1px solid var(--border); color:var(--head); font-weight:650; }
+.stats { display:grid; grid-template-columns:repeat(6, minmax(0, 1fr)); gap:8px; margin-bottom:14px; }
+.stat { border:1px solid var(--border); border-radius:8px; background:var(--surface); padding:10px; min-height:58px; }
+.stat-label { color:var(--muted); font-size:10px; margin-bottom:6px; }
+.stat-value { color:var(--head); font:650 17px "SFMono-Regular",Consolas,monospace; }
+.history { max-height:620px; overflow:auto; }
+.batch { display:block; width:100%; text-align:left; color:var(--text); background:transparent; border:0; border-bottom:1px solid var(--border); border-radius:0; height:auto; padding:10px 12px; cursor:pointer; }
+.batch:hover { background:var(--surface2); }
+.batch strong { color:var(--head); }
+.batch small { display:block; margin-top:3px; color:var(--muted); }
+.progress { padding:16px; }
+.progress-title { color:var(--head); font-weight:650; margin-bottom:7px; }
+.progress-msg { color:var(--muted); margin-bottom:12px; }
+.track { height:8px; background:var(--surface2); border-radius:999px; overflow:hidden; }
+.bar { height:100%; width:0; background:var(--accent); transition:width .2s ease; }
+table { width:100%; border-collapse:collapse; }
+th,td { padding:9px 8px; border-bottom:1px solid var(--border); text-align:left; white-space:nowrap; }
+th { color:var(--muted); font-size:10px; background:var(--surface2); font-weight:650; }
+tr:last-child td { border-bottom:0; }
+.num { font-family:"SFMono-Regular",Consolas,monospace; text-align:right; }
+.up { color:var(--red); }
+.down { color:var(--green); }
+.stock { color:var(--head); font-weight:650; text-decoration:none; }
+.stock span { display:block; color:var(--muted); font:10px "SFMono-Regular",Consolas,monospace; margin-top:2px; }
+.pill { border:1px solid var(--border); border-radius:999px; padding:3px 7px; background:var(--surface2); }
+.empty { min-height:240px; display:flex; align-items:center; justify-content:center; color:var(--muted); }
+.scroll { overflow:auto; }
+@media (max-width: 1020px) {
+  body { padding:16px 12px; }
+  header { flex-direction:column; align-items:flex-start; }
+  .grid { grid-template-columns:1fr; }
+  .stats { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>次日涨停/大涨概率扫描</h1>
+    <div class="sub">实时触发扫描 · 每次保存批次 · 统计同股票同形态/耦合的次日触板和高点大涨概率</div>
+  </div>
+  <nav class="nav">
+    <a href="/">行业宽度</a>
+    <a href="/pattern">收盘形态</a>
+    <a href="/momentum">14:30 选股</a>
+    <a href="/high-confidence">高置信小集合</a>
+    <a href="/surge">涨停概率</a>
+    <a href="/csi1000">中证1000择时</a>
+  </nav>
+</header>
+
+<div class="toolbar">
+  <label>交易日
+    <input id="tradeDate" type="date">
+  </label>
+  <label>历史交易日
+    <input id="historyDays" type="number" value="1800" min="300" max="5000">
+  </label>
+  <label>大涨阈值%
+    <input id="bigThreshold" type="number" value="7" min="3" max="20" step="0.5">
+  </label>
+  <label>最小样本
+    <input id="minSamples" type="number" value="80" min="5" max="500">
+  </label>
+  <label>信号日最低涨跌%
+    <input id="minSignalPct" type="number" value="3" min="-20" max="20" step="0.5">
+  </label>
+  <label>信号日最高涨跌%
+    <input id="maxSignalPct" type="number" value="8.8" min="-20" max="20" step="0.1">
+  </label>
+  <label>最低成交额(亿)
+    <input id="minAmountYi" type="number" value="5" min="0" max="200" step="0.5">
+  </label>
+  <label>最低高点大涨率%
+    <input id="minNextHighRate" type="number" value="30" min="0" max="100" step="1">
+  </label>
+  <label>最低触板率%
+    <input id="minTouchLimitRate" type="number" value="20" min="0" max="100" step="1">
+  </label>
+  <label class="check"><input id="continuationOnly" type="checkbox" checked> 强势延续</label>
+  <label class="check"><input id="excludeSignalLimit" type="checkbox" checked> 排除已封板</label>
+  <label class="check"><input id="only10cm" type="checkbox" checked> 只做10cm</label>
+  <button id="scanBtn" onclick="startScan()">实时扫描并保存</button>
+  <button class="secondary" onclick="loadLatest()">最新批次</button>
+  <button class="secondary" onclick="loadHistory()">刷新历史</button>
+</div>
+
+<div class="stats" id="stats"></div>
+
+<div class="grid">
+  <main class="panel">
+    <div class="panel-head">
+      <span id="resultTitle">最新结果</span>
+      <span id="resultMeta" class="pill">-</span>
+    </div>
+    <div id="result"><div class="empty">加载中…</div></div>
+  </main>
+  <aside class="panel">
+    <div class="panel-head">历史批次</div>
+    <div id="history" class="history"><div class="empty">加载中…</div></div>
+  </aside>
+</div>
+
+<script>
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+function num(v, d=2) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toFixed(d) : '-';
+}
+function pct(v, d=1) {
+  const n = Number(v);
+  return Number.isFinite(n) ? (n * 100).toFixed(d) + '%' : '-';
+}
+function queryParams() {
+  const p = new URLSearchParams();
+  const date = document.getElementById('tradeDate').value;
+  if (date) p.set('date', date);
+  p.set('historyDays', document.getElementById('historyDays').value || '1800');
+  p.set('bigThreshold', document.getElementById('bigThreshold').value || '7');
+  p.set('minSamples', document.getElementById('minSamples').value || '80');
+  p.set('minSignalPct', document.getElementById('minSignalPct').value || '3');
+  p.set('maxSignalPct', document.getElementById('maxSignalPct').value || '8.8');
+  p.set('minAmountYi', document.getElementById('minAmountYi').value || '5');
+  p.set('minNextHighRate', document.getElementById('minNextHighRate').value || '30');
+  p.set('minTouchLimitRate', document.getElementById('minTouchLimitRate').value || '20');
+  p.set('top', '10');
+  p.set('continuationOnly', document.getElementById('continuationOnly').checked ? '1' : '0');
+  p.set('excludeSignalLimit', document.getElementById('excludeSignalLimit').checked ? '1' : '0');
+  p.set('only10cm', document.getElementById('only10cm').checked ? '1' : '0');
+  return p;
+}
+function xueqiu(row) {
+  const code = String(row.code || '').padStart(6, '0');
+  const sec = String(row.secucode || '').toUpperCase();
+  let prefix = sec.endsWith('.SH') ? 'SH' : 'SZ';
+  if (sec.endsWith('.BJ')) prefix = 'BJ';
+  return `https://xueqiu.com/S/${prefix}${code}`;
+}
+function renderStats(batch) {
+  const items = [
+    ['批次', batch?.id || '-'],
+    ['交易日', batch?.trade_date || '-'],
+    ['状态', batch?.status || '-'],
+    ['候选', batch?.row_count ?? '-'],
+    ['过滤前', batch?.pre_trade_filter_count ?? '-'],
+    ['原始信号', batch?.raw_signal_count ?? '-'],
+    ['股票数', batch?.stock_count ?? '-'],
+    ['历史日', batch?.history_days ?? '-'],
+    ['大涨阈值', `${num(batch?.big_threshold, 1)}%`],
+    ['最小样本', batch?.min_samples ?? '-'],
+    ['排除封板', batch?.exclude_signal_limit ? '是' : '否'],
+    ['耗时', batch?.elapsed_s ? `${num(batch.elapsed_s, 1)}s` : '-'],
+    ['创建', batch?.created_at || '-'],
+    ['更新', batch?.updated_at || '-'],
+  ];
+  document.getElementById('stats').innerHTML = items.map(([k,v]) => `
+    <div class="stat"><div class="stat-label">${esc(k)}</div><div class="stat-value">${esc(v)}</div></div>
+  `).join('');
+}
+function renderProgress(progress) {
+  const p = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+  document.getElementById('resultTitle').textContent = `扫描批次 ${progress.batch_id || '-'}`;
+  document.getElementById('resultMeta').textContent = progress.status || '-';
+  document.getElementById('result').innerHTML = `
+    <div class="progress">
+      <div class="progress-title">${esc(progress.phase || progress.status || 'running')} ${p.toFixed(0)}%</div>
+      <div class="progress-msg">${esc(progress.message || '扫描中…')}</div>
+      <div class="track"><div class="bar" style="width:${p}%"></div></div>
+    </div>`;
+}
+function renderRows(rows) {
+  if (!rows.length) return '<div class="empty">该批次没有候选</div>';
+  return `<div class="scroll"><table>
+    <thead><tr>
+      <th>股票</th><th>形态</th><th>耦合</th><th class="num">样本</th>
+      <th class="num">次日触板</th><th class="num">次日封板</th><th class="num">高点>=阈值</th>
+      <th class="num">均高%</th><th class="num">信号日涨跌%</th><th>信号状态</th><th class="num">评分</th>
+    </tr></thead>
+    <tbody>${rows.map(r => {
+      const cls = Number(r.pct_change) >= 0 ? 'up' : 'down';
+      return `<tr>
+        <td><a class="stock" href="${esc(xueqiu(r))}" target="_blank" rel="noopener noreferrer">${esc(r.name)}<span>${esc(r.code)}</span></a></td>
+        <td>${esc(r.pattern)}</td>
+        <td>${esc(r.coupling)}</td>
+        <td class="num">${esc(r.surge_samples)}</td>
+        <td class="num up">${pct(r.next_touch_limit_rate)}</td>
+        <td class="num up">${pct(r.next_close_limit_rate)}</td>
+        <td class="num up">${pct(r.next_high_ge_big_rate)}</td>
+        <td class="num">${num(r.avg_next_high_gain_pct, 2)}</td>
+        <td class="num ${cls}">${num(r.pct_change, 2)}</td>
+        <td>${r.signal_close_limit ? '<span class="up">封板</span>' : (r.signal_touch_limit ? '<span class="up">触板</span>' : '')}</td>
+        <td class="num">${num(r.surge_score, 2)}</td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table></div>`;
+}
+function renderBatch(data) {
+  const batch = data.batch || {};
+  renderStats(batch);
+  document.getElementById('resultTitle').textContent = `批次 ${batch.id || '-'}`;
+  document.getElementById('resultMeta').textContent = `${batch.trade_date || '-'} · ${batch.row_count || 0}只`;
+  document.getElementById('result').innerHTML = renderRows(data.rows || []);
+}
+function renderHistory(data) {
+  const rows = data.batches || [];
+  document.getElementById('history').innerHTML = rows.length ? rows.map(b => `
+    <button class="batch" onclick="loadBatch(${Number(b.id)})">
+      <strong>#${esc(b.id)} ${esc(b.trade_date || '-')} · ${esc(b.row_count || 0)}只</strong>
+      <small>${esc(b.status)} · 大涨阈值 ${num(b.big_threshold,1)}% · 样本 ${esc(b.min_samples)} · ${esc(b.created_at)}</small>
+    </button>
+  `).join('') : '<div class="empty">暂无历史批次</div>';
+}
+async function loadHistory() {
+  const res = await fetch('/api/surge/history');
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || '历史加载失败');
+  renderHistory(data);
+}
+async function loadBatch(id) {
+  const res = await fetch('/api/surge/batch/' + encodeURIComponent(id));
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || '批次加载失败');
+  renderBatch(data);
+}
+async function loadLatest() {
+  const res = await fetch('/api/surge/latest');
+  const data = await res.json();
+  if (!res.ok) {
+    document.getElementById('result').innerHTML = `<div class="empty">${esc(data.error || '暂无结果')}</div>`;
+    return;
+  }
+  renderBatch(data);
+}
+async function poll(batchId) {
+  for (;;) {
+    const res = await fetch('/api/surge/progress');
+    const progress = await res.json();
+    renderProgress(progress);
+    if (progress.status === 'done') {
+      await loadBatch(batchId || progress.batch_id);
+      await loadHistory();
+      document.getElementById('scanBtn').disabled = false;
+      return;
+    }
+    if (progress.status === 'error') {
+      document.getElementById('scanBtn').disabled = false;
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
+}
+async function startScan() {
+  const btn = document.getElementById('scanBtn');
+  btn.disabled = true;
+  renderProgress({status:'queued', phase:'queued', percent:1, message:'正在启动扫描'});
+  try {
+    const res = await fetch('/api/surge/scan?' + queryParams().toString(), {method:'POST'});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '启动失败');
+    renderProgress(data.progress || {status:'running', percent:1, message:'扫描任务已启动'});
+    poll(data.batch_id);
+  } catch (err) {
+    document.getElementById('result').innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    btn.disabled = false;
+  }
+}
+loadHistory().catch(err => { document.getElementById('history').innerHTML = `<div class="empty">${esc(err.message)}</div>`; });
+loadLatest().catch(() => {});
+</script>
+</body>
+</html>
+"""
+
+
 CSI1000_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -7700,6 +8530,7 @@ CSI1000_HTML = """<!doctype html>
       <a href="/pattern">收盘形态</a>
       <a href="/momentum">14:30 选股</a>
       <a href="/high-confidence">高置信小集合</a>
+      <a href="/surge">涨停概率</a>
     </nav>
   </header>
 
@@ -7885,6 +8716,11 @@ def high_confidence_page():
     return render_template_string(HIGH_CONFIDENCE_HTML)
 
 
+@app.route("/surge")
+def surge_page():
+    return render_template_string(SURGE_HTML)
+
+
 @app.route("/csi1000")
 def csi1000_page():
     return render_template_string(CSI1000_HTML)
@@ -7940,6 +8776,55 @@ def api_high_confidence_sync():
     params = build_hc_params(request.args)
     payload, status = start_high_confidence_sync(params)
     return jsonify(payload), status
+
+
+@app.route("/api/surge/scan", methods=["POST"])
+def api_surge_scan():
+    params = build_surge_params(request.args)
+    payload, status = start_surge_scan(params)
+    return jsonify(payload), status
+
+
+@app.route("/api/surge/progress")
+def api_surge_progress():
+    return jsonify(get_surge_progress())
+
+
+@app.route("/api/surge/history")
+def api_surge_history():
+    limit = to_int_arg("limit", 20, 1, 100)
+    conn = get_db()
+    try:
+        batches = load_surge_history(conn, limit=limit)
+    finally:
+        conn.close()
+    return jsonify({"batches": batches})
+
+
+@app.route("/api/surge/latest")
+def api_surge_latest():
+    limit = to_int_arg("limit", 10, 1, 1000)
+    conn = get_db()
+    try:
+        payload = load_surge_batch(conn, limit=limit)
+    finally:
+        conn.close()
+    if not payload:
+        return jsonify({"error": "暂无涨停/大涨扫描批次"}), 404
+    return jsonify(payload)
+
+
+@app.route("/api/surge/batch/<int:batch_id>")
+def api_surge_batch(batch_id):
+    limit = to_int_arg("limit", 10, 1, 1000)
+    conn = get_db()
+    try:
+        payload = load_surge_batch(conn, batch_id=batch_id, limit=limit)
+    finally:
+        conn.close()
+    if not payload:
+        return jsonify({"error": "批次不存在"}), 404
+    return jsonify(payload)
 
 
 @app.route("/api/indices")
