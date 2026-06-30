@@ -1,3 +1,4 @@
+# 归档：本文件为低PB周期股回测 v1，已被 backtest2.py（v2，现 trader.strategies.low_pb.backtest）取代，仅作归档保留，不再维护。
 """
 低PB周期股策略历史回测 — backtest.py
 =======================================
