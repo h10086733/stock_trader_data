@@ -15,7 +15,13 @@ from pathlib import Path
 
 import pandas as pd
 
-import app
+from trader.core.config import BASE_DIR
+from trader.core.db import connect_existing as get_db
+from trader.strategies.high_confidence.core import (
+    ensure_high_confidence_tables,
+    build_high_confidence_payload_realtime,
+)
+from trader.strategies.high_confidence.config import HC_DEFAULT_MAX_PER_DATE, HC_DEFAULT_PATTERNS
 
 
 def parse_args():
@@ -28,7 +34,7 @@ def parse_args():
     parser.add_argument("--refresh", action="store_true", help="强制重算每日选股")
     parser.add_argument("--use-cache", action="store_true", help="允许使用页面/面板/质量缓存；默认不使用")
     parser.add_argument("--dry-run", action="store_true", help="只打印交易日，不执行验证")
-    parser.add_argument("--output-dir", default=str(Path(app.BASE_DIR) / "outputs"))
+    parser.add_argument("--output-dir", default=str(Path(BASE_DIR) / "outputs"))
     return parser.parse_args()
 
 
@@ -169,9 +175,9 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    conn = app.get_db()
+    conn = get_db()
     try:
-        app.ensure_high_confidence_tables(conn)
+        ensure_high_confidence_tables(conn)
         dates = trade_dates(conn, args)
     finally:
         conn.close()
@@ -195,12 +201,12 @@ def main():
         trade_date = item["date"]
         t0 = time.time()
         print(f"[{index}/{len(dates)}] {trade_date} 扫描", flush=True)
-        payload = app.build_high_confidence_payload_realtime({
+        payload = build_high_confidence_payload_realtime({
             "date": trade_date,
             "no_cache": not args.use_cache,
             "no_quality_fallback": not args.use_cache,
-            "max_per_date": app.HC_DEFAULT_MAX_PER_DATE,
-            "patterns": list(app.HC_DEFAULT_PATTERNS),
+            "max_per_date": HC_DEFAULT_MAX_PER_DATE,
+            "patterns": list(HC_DEFAULT_PATTERNS),
         })
         if isinstance(payload, tuple):
             payload, status_code = payload
@@ -209,7 +215,7 @@ def main():
         assert_payload_trade_date(payload, trade_date)
         meta = payload.get("meta") or {}
         picks = flatten_picks(payload)
-        conn = app.get_db()
+        conn = get_db()
         try:
             enriched = [
                 enrich_pick_outcome(conn, pick, args.forward_days)
