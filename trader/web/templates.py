@@ -2731,4 +2731,3 @@ loadData().catch(err => { $('tableWrap').innerHTML = `<div class="empty">${esc(e
 </body>
 </html>
 """
-

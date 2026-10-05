@@ -48,7 +48,7 @@ def _load_timing_payload(days: int = 180, run_key: str = _RUN_KEY) -> dict:
         latest_row = conn.execute("""
             SELECT trade_date, signal, trade_state, action, reason, csi_close,
                    csi_score, hs300_score, csi_score_ma3, hs300_score_ma3,
-                   vol_ratio_5_20, price_from_low10, drawdown_from_high10,
+                   vol_ratio_5_20, vol_ratio_5_60, price_from_low10, drawdown_from_high10,
                    pct_2d, payload_json, updated_at
             FROM csi1000_timing_signals
             ORDER BY trade_date DESC LIMIT 1

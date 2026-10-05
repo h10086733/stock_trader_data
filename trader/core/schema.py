@@ -439,6 +439,7 @@ def ensure_csi1000_tables(conn: sqlite3.Connection) -> None:
             csi_score_ma3   REAL,
             hs300_score_ma3 REAL,
             vol_ratio_5_20  REAL,
+            vol_ratio_5_60  REAL,
             price_from_low10 REAL,
             drawdown_from_high10 REAL,
             pct_2d          REAL,
@@ -450,6 +451,8 @@ def ensure_csi1000_tables(conn: sqlite3.Connection) -> None:
     signal_cols = {r[1] for r in conn.execute("PRAGMA table_info(csi1000_timing_signals)").fetchall()}
     if "trade_state" not in signal_cols:
         conn.execute("ALTER TABLE csi1000_timing_signals ADD COLUMN trade_state TEXT")
+    if "vol_ratio_5_60" not in signal_cols:
+        conn.execute("ALTER TABLE csi1000_timing_signals ADD COLUMN vol_ratio_5_60 REAL")
     conn.execute("""
         UPDATE csi1000_timing_signals
         SET trade_state = CASE

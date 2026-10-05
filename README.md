@@ -190,6 +190,26 @@ python app.py
 20 18 * * 0 cd ~/project/stock_trader_data && python3 index.py --update-all >> index_constituents_cron.log 2>&1
 ```
 
+生产行情中断后的补数（先确认没有其他 `fetch.py` 进程写同一份数据库）：
+
+```bash
+# 复用数据库已有股票列表，避免再次卡在全市场股票列表接口
+nohup python3 fetch.py \
+  --backfill-start 2026-09-29 \
+  --backfill-end 2026-10-05 \
+  --reuse-stocks \
+  > backfill_20260929_20261005.log 2>&1 &
+
+# 补完后重算最近 20 个交易日的行业宽度
+python3 index_stats.py --recent-days 20 --force
+
+# 核验
+python3 fetch.py --status
+python3 index_stats.py --show-all
+```
+
+定时任务建议用 `flock -n /tmp/stock-trader-data.lock` 加锁，避免上一次同步未结束时重复启动。
+
 14:30 动量选股任务会先结算最近一个已保存买入日的次日 10:00 前卖出收益，再扫描并保存当天 14:30 入选股票。常用命令：
 
 ```bash
@@ -223,11 +243,37 @@ python3 app.py --momentum-backfill --backfill-days 30 --daily-fallback-only
 
 ### 9. 中证1000择时策略
 
-文档 `1000判断 (1).docx` 对应的择时策略已整理到 `csi1000_timing.py`。第一版规则：
+文档 `1000判断 (1).docx` 对应的择时策略已整理到 `csi1000_timing.py`。生产/默认回测继续保留原收益口径（`low_dd`）：
 
-- 做多：中证1000宽度强、沪深300不弱，5日成交额均值大于20日均值的 1.1 倍，且价格较10日低点涨出 4% 以上。
-- 做空：中证1000和沪深300的3日宽度均值偏弱，5日成交额不高于20日均值的 1.05 倍，且价格距10日高点回撤不超过 5%。
+- 做多：中证1000宽度强、沪深300不弱，5/20日成交额量比超过阈值，且价格较10日低点涨出阈值以上。
+- 做空：中证1000和沪深300的3日宽度均值偏弱，5/20日成交额量比不高于 1.05，且价格距10日高点回撤不超过 5%。
 - 风控：空单遇中证1000两日涨幅超过 2% 时止损；跌深后默认不追空。
+
+新规则保留为研究预设 `research_5_60`，不覆盖默认策略：5/60日成交额量比，做多阈值 1.05，做空严格小于 1.00，跌深反抽阈值 6%。运行研究回测时增加 `--preset research_5_60 --run-key research_5_60`。
+
+该框架也可以延伸到行业指数。当前数据库已有中证军工（399967）、中证医疗（399989）、申万证券（399707）等指数的成分股和宽度数据，但这些指数的历史宽度目前主要从 2026-02-03 开始；要做多年收益比较，还需先补齐历史成分快照/宽度及指数日线。支持任意指数日线抓取：`--fetch-index-prices --index-codes 399967,399989`；回测时用 `--target-index 399967` 指定目标指数。研究时应为每个指数单独保存 `run_key`，并与中证1000基准分别比较总收益、最大回撤、胜率、交易次数和多空贡献。
+
+个股趋势聚合研究脚本：`trader/strategies/stock_trend_index.py`。它按每只成分股的 5/20/60 日收益和均线方向生成趋势分数，再按日汇总为指数 LONG/SHORT/FLAT，并用下一交易日成分股平均收益回测。例如：
+
+```bash
+python trader/strategies/stock_trend_index.py --index-code 000852 --start 2016-06-20 --end 2026-06-22
+```
+
+20日线四点法事件统计脚本：`research/csi1000/stock_ma20_swing_study.py`。它识别低点、上穿确认、高点、下穿确认，统计各涨跌幅区间之后的反向波段幅度。例如：
+
+```bash
+python research/csi1000/stock_ma20_swing_study.py --index-code 000852 --start 2015-01-01 --end 2026-06-22
+```
+
+可交易确认点聚合回测：`research/csi1000/stock_ma20_confirmation_strategy.py`。默认要求单日确认事件占有事件股票的 10%，上涨/下跌波段阈值 10%，只使用确认点后的下一交易日收益：
+
+```bash
+python research/csi1000/stock_ma20_confirmation_strategy.py --index-code 000852 --start 2016-06-20 --end 2026-06-22
+```
+
+按你最新定义的 9 日局部高低点版本：`research/csi1000/ma20_wave_strategy_v2.py`。高点/低点使用前后各 4 日最高/最低价并要求位于 MA20 上/下；连续同类点合并，确认点只保留相邻极值之间第一个上穿/下穿。该版本输出确认点前后涨跌幅和持续天数，极值因需要未来4日确认，不能直接当成当天交易信号。
+
+在可交易回测中已加入未来4日确认延迟：中证1000（2016-06-20～2026-06-22、波段阈值10%、成分股确认比例约2%）结果为总收益约 **1368.0%**、最大回撤 **-26.1%**、方向准确率 **52.3%**。这只是当前成分股回看，且聚合仍需继续做样本外验证；较小波段阈值会显著增加切换和噪声。
 
 常用命令：
 
@@ -246,6 +292,9 @@ python csi1000_timing.py --backtest --start 2026-02-03 --run-key first_width_202
 
 # 回测最近10年
 python csi1000_timing.py --backtest --start 2016-06-20 --end 2026-06-18 --run-key current_constituents_10y
+
+# 研究新规则（不覆盖默认旧策略收益）
+python csi1000_timing.py --backtest --preset research_5_60 --start 2016-06-20 --end 2026-06-22 --run-key research_5_60
 
 # 直接使用历史 Excel 里的 300/1000 宽度做回测
 python csi1000_timing.py --backtest --data-source excel --start 2016-06-20 --end 2025-09-24 --run-key excel_width_10y

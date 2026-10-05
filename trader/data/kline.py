@@ -904,7 +904,13 @@ def run_init(conn, resume=True):
     run_batch(conn, rows, mode="init", sync_type="init")
 
 
-def run_daily_sync(conn):
+def _load_existing_stock_rows(conn):
+    """读取库内股票列表，供行情接口故障时继续增量同步。"""
+    rows = conn.execute("SELECT code, market FROM stocks ORDER BY code").fetchall()
+    return [(row[0], row[1]) for row in rows]
+
+
+def run_daily_sync(conn, refresh_stock_list=True):
     log.info("=" * 55)
     log.info(f"每日同步  {datetime.today().strftime('%Y-%m-%d %H:%M')}")
 
@@ -914,35 +920,57 @@ def run_daily_sync(conn):
         return
 
     # 刷新股票列表，自动捕获新上市
-    new_list = fetch_stock_list()
+    try:
+        new_list = fetch_stock_list() if refresh_stock_list else []
+    except Exception as exc:
+        # 股票列表接口故障不应阻断已有股票的行情补齐。
+        log.warning(f"股票列表刷新失败，将复用数据库现有列表继续同步: {exc}")
+        new_list = []
     cur = conn.cursor()
     cur.execute("SELECT code FROM stocks")
     existing  = {r[0] for r in cur.fetchall()}
-    upsert_stocks(conn, new_list)
+    if new_list:
+        upsert_stocks(conn, new_list)
     new_codes = {s["code"] for s in new_list} - existing
     if new_codes:
         log.info(f"新上市股票 {len(new_codes)} 只: {sorted(new_codes)[:10]}")
 
-    cur.execute("SELECT code, market FROM stocks ORDER BY code")
-    rows = cur.fetchall()
+    rows = _load_existing_stock_rows(conn)
     run_batch(conn, rows, mode="daily", sync_type="daily", new_stocks=len(new_codes), use_sina_today=True)
     sync_market_caps_for_trade_date(conn, datetime.today().strftime("%Y-%m-%d"), rows)
 
 
-def run_recent_backfill(conn, days):
-    if days <= 0:
-        raise ValueError("--backfill-days 必须大于 0")
+def run_recent_backfill(conn, days=None, start_date=None, end_date=None,
+                        refresh_stock_list=True, sync_caps=False):
+    if start_date:
+        start_dash = start_date.replace("/", "-")
+        if len(start_dash) == 8 and start_dash.isdigit():
+            start_dash = f"{start_dash[:4]}-{start_dash[4:6]}-{start_dash[6:8]}"
+        start_date = start_dash.replace("-", "")
+    elif days and days > 0:
+        start_date = (datetime.today() - timedelta(days=days)).strftime("%Y%m%d")
+        start_dash = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+    else:
+        raise ValueError("请提供 --backfill-days 或 --backfill-start")
 
-    start_date = (datetime.today() - timedelta(days=days)).strftime("%Y%m%d")
-    start_dash = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+    if end_date:
+        end_dash = end_date.replace("/", "-")
+        if len(end_dash) == 8 and end_dash.isdigit():
+            end_dash = f"{end_dash[:4]}-{end_dash[4:6]}-{end_dash[6:8]}"
+        end_date = end_dash.replace("-", "")
+    else:
+        end_date = datetime.today().strftime("%Y%m%d")
+        end_dash = datetime.today().strftime("%Y-%m-%d")
+
     log.info("=" * 55)
-    log.info(f"回补最近 {days} 天日K  start={start_dash}")
+    log.info(f"回补日K  start={start_dash} end={end_dash} refresh_stock_list={refresh_stock_list}")
 
-    new_list = fetch_stock_list()
+    new_list = fetch_stock_list() if refresh_stock_list else []
     cur = conn.cursor()
     cur.execute("SELECT code FROM stocks")
     existing = {r[0] for r in cur.fetchall()}
-    upsert_stocks(conn, new_list)
+    if new_list:
+        upsert_stocks(conn, new_list)
     new_codes = {s["code"] for s in new_list} - existing
     if new_codes:
         log.info(f"新上市股票 {len(new_codes)} 只: {sorted(new_codes)[:10]}")
@@ -956,7 +984,7 @@ def run_recent_backfill(conn, days):
 
     for i, (code, market) in enumerate(stock_rows, start=1):
         try:
-            rows = fetch_kline(code, market, start_date)
+            rows = fetch_kline(code, market, start_date, end_date=end_date)
             insert_daily_prices(conn, code, rows)
             update_stock_price_range(conn, code, rows)
             ok += 1
@@ -988,7 +1016,8 @@ def run_recent_backfill(conn, days):
           total, ok, fail, len(new_codes), round(duration, 1),
           f"days={days} start={start_dash} failures={fail_codes[:20]}" if fail_codes else f"days={days} start={start_dash}"))
     conn.commit()
-    sync_market_caps_for_trade_date(conn, datetime.today().strftime("%Y-%m-%d"), stock_rows)
+    if sync_caps:
+        sync_market_caps_for_trade_date(conn, end_dash, stock_rows)
     log.info(f"回补完成  耗时:{duration/60:.1f}min  成功:{ok}  失败:{fail}")
 
 
@@ -1052,6 +1081,12 @@ def main():
     parser.add_argument("--init",      action="store_true", help="全量初始化（支持断点续传）")
     parser.add_argument("--sync",      action="store_true", help="每日增量同步")
     parser.add_argument("--backfill-days", type=int, help="强制回补最近 N 天日K，适合修复近期缺行")
+    parser.add_argument("--backfill-start", help="回补起始日期 YYYY-MM-DD（可与 --backfill-end 配合）")
+    parser.add_argument("--backfill-end", help="回补结束日期 YYYY-MM-DD，默认今天")
+    parser.add_argument("--reuse-stocks", action="store_true",
+                        help="同步/回补时复用数据库现有股票列表，不请求全市场股票列表接口")
+    parser.add_argument("--sync-market-caps", action="store_true",
+                        help="回补完成后补指定结束日的市值快照")
     parser.add_argument("--sync-caps", metavar="YYYY-MM-DD", help="为指定交易日的高置信候选票补市值快照")
     parser.add_argument("--status",    action="store_true", help="查看数据库状态")
     parser.add_argument("--no-resume", action="store_true", help="init 时不断点续传，重新全量")
@@ -1069,9 +1104,16 @@ def main():
     elif args.init:
         run_init(conn, resume=not args.no_resume)
     elif args.sync:
-        run_daily_sync(conn)
-    elif args.backfill_days:
-        run_recent_backfill(conn, args.backfill_days)
+        run_daily_sync(conn, refresh_stock_list=not args.reuse_stocks)
+    elif args.backfill_days or args.backfill_start:
+        run_recent_backfill(
+            conn,
+            days=args.backfill_days,
+            start_date=args.backfill_start,
+            end_date=args.backfill_end,
+            refresh_stock_list=not args.reuse_stocks,
+            sync_caps=args.sync_market_caps,
+        )
     elif args.sync_caps:
         sync_market_caps_for_high_confidence_candidates(conn, args.sync_caps)
     else:

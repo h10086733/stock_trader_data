@@ -64,6 +64,7 @@ BAOSTOCK_INDEX_CODES = {
 class StrategyConfig:
     long_csi_score_min: float = 10.0
     long_hs300_score_min: float = -10.0
+    # 旧策略默认使用 5/20 日成交额量比。
     long_vol_ratio_min: float = 1.10
     long_price_from_low_min: float = 0.04
 
@@ -76,6 +77,8 @@ class StrategyConfig:
 
     reverse_deep_short: bool = False
     fee_bps: float = 2.0
+    # 可切换量能口径；旧策略为 5/20，研究策略可指定 5/60。
+    volume_ratio_field: str = "vol_ratio_5_20"
 
 
 STRATEGY_PRESETS: dict[str, StrategyConfig] = {
@@ -122,6 +125,19 @@ STRATEGY_PRESETS: dict[str, StrategyConfig] = {
         short_vol_ratio_max=1.00,
         short_drawdown_from_high_max=0.05,
         reverse_deep_short=True,
+    ),
+    # 新规则仅作为研究预设，不改变默认 low_dd 的生产/历史收益口径。
+    "research_5_60": StrategyConfig(
+        long_csi_score_min=20.0,
+        long_hs300_score_min=-20.0,
+        long_vol_ratio_min=1.05,
+        long_price_from_low_min=0.06,
+        short_csi_score_max=-10.0,
+        short_hs300_score_max=10.0,
+        short_vol_ratio_max=1.00,
+        short_drawdown_from_high_max=0.06,
+        reverse_deep_short=True,
+        volume_ratio_field="vol_ratio_5_60",
     ),
 }
 
@@ -201,6 +217,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             csi_score_ma3   REAL,
             hs300_score_ma3 REAL,
             vol_ratio_5_20  REAL,
+            vol_ratio_5_60  REAL,
             price_from_low10 REAL,
             drawdown_from_high10 REAL,
             pct_2d          REAL,
@@ -214,6 +231,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     }
     if "trade_state" not in signal_cols:
         conn.execute("ALTER TABLE csi1000_timing_signals ADD COLUMN trade_state TEXT")
+    if "vol_ratio_5_60" not in signal_cols:
+        conn.execute("ALTER TABLE csi1000_timing_signals ADD COLUMN vol_ratio_5_60 REAL")
     conn.execute("""
         UPDATE csi1000_timing_signals
         SET trade_state = CASE
@@ -292,9 +311,23 @@ def normalize_baostock_date(value: str | None) -> str | None:
 
 def fetch_index_kline(index_code: str, start: str, end: str | None = None) -> list[dict[str, Any]]:
     source = INDEX_PRICE_SOURCES[index_code]
+    return fetch_index_kline_generic(index_code, start, end, market=source["market"])
+
+
+def index_market(index_code: str) -> str:
+    """根据常见指数代码推断东方财富 secid 市场标识。"""
+    code = str(index_code).split(".", 1)[0]
+    return "0" if code.startswith(("399", "980")) else "1"
+
+
+def fetch_index_kline_generic(index_code: str, start: str,
+                              end: str | None = None, market: str | None = None) -> list[dict[str, Any]]:
+    """抓取任意沪深指数日线，供行业指数研究使用。"""
+    index_code = str(index_code).split(".", 1)[0]
+    market = market or index_market(index_code)
     end = end or datetime.today().strftime("%Y%m%d")
     params = {
-        "secid": f"{source['market']}.{index_code}",
+        "secid": f"{market}.{index_code}",
         "ut": "8dec03ba335b81bf4ebdf7b29ec27d15",
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
@@ -344,6 +377,16 @@ def fetch_index_kline(index_code: str, start: str, end: str | None = None) -> li
             "turnover": safe_float(parts[10]),
         })
     return rows
+
+
+def fetch_and_save_index_prices(conn: sqlite3.Connection, index_codes: list[str],
+                                start: str, end: str | None = None) -> dict[str, int]:
+    """批量抓取并保存目标/基准指数行情，便于行业研究脚本调用。"""
+    counts = {}
+    for code in index_codes:
+        rows = fetch_index_kline_generic(code, start=start, end=end)
+        counts[code] = save_index_prices(conn, rows)
+    return counts
 
 
 def fetch_index_kline_baostock(index_code: str, start: str, end: str | None = None) -> list[dict[str, Any]]:
@@ -543,14 +586,22 @@ def save_index_prices(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> i
     return len(rows)
 
 
-def cmd_fetch_index_prices(conn: sqlite3.Connection, start: str, end: str | None) -> None:
+def cmd_fetch_index_prices(conn: sqlite3.Connection, start: str, end: str | None,
+                           index_codes: list[str] | None = None) -> None:
     init_db(conn)
-    for index_code, source in INDEX_PRICE_SOURCES.items():
+    selected_codes = index_codes or list(INDEX_PRICE_SOURCES)
+    for index_code in selected_codes:
+        source = INDEX_PRICE_SOURCES.get(index_code, {
+            "name": index_code, "market": index_market(index_code),
+        })
         provider = "eastmoney"
         try:
-            rows = fetch_index_kline(index_code, start=start, end=end)
+            rows = fetch_index_kline(index_code, start=start, end=end) if index_code in INDEX_PRICE_SOURCES else fetch_index_kline_generic(index_code, start=start, end=end)
         except (requests.RequestException, RuntimeError) as exc:
             print(f"[{index_code}] {source['name']} 东方财富失败，改用 baostock: {exc}")
+            if index_code not in BAOSTOCK_INDEX_CODES:
+                print(f"[{index_code}] 无 baostock 兜底，跳过")
+                continue
             rows = fetch_index_kline_baostock(index_code, start=start, end=end)
             provider = "baostock"
         saved = save_index_prices(conn, rows)
@@ -666,30 +717,30 @@ def cmd_backfill_width(conn: sqlite3.Connection, start: str, end: str | None,
 
 
 def load_feature_frame(conn: sqlite3.Connection, start: str | None = None,
-                       end: str | None = None) -> pd.DataFrame:
+                       end: str | None = None, index_code: str = "000852",
+                       benchmark_code: str = "000300") -> pd.DataFrame:
+    """读取目标指数行情和宽度；默认仍为中证1000/沪深300。"""
+    index_code = str(index_code).split(".", 1)[0]
+    benchmark_code = str(benchmark_code).split(".", 1)[0]
     price = pd.read_sql_query("""
         SELECT trade_date, open, close, high, low, volume, amount, pct_change
         FROM index_prices
-        WHERE index_code = '000852'
-          AND trade_date >= COALESCE(?, '1900-01-01')
-          AND trade_date <= COALESCE(?, '2999-12-31')
+        WHERE index_code = ?
         ORDER BY trade_date
-    """, conn, params=(start, end))
+    """, conn, params=(index_code,))
     if price.empty:
         return price
     price["trade_date"] = pd.to_datetime(price["trade_date"])
 
     width = pd.read_sql_query("""
         SELECT trade_date,
-               MAX(CASE WHEN index_code='000852' THEN score_sum END) AS csi_score,
-               MAX(CASE WHEN index_code='000300' THEN score_sum END) AS hs300_score
+               MAX(CASE WHEN index_code=? THEN score_sum END) AS csi_score,
+               MAX(CASE WHEN index_code=? THEN score_sum END) AS hs300_score
         FROM index_daily_stats
-        WHERE index_code IN ('000852','000300')
-          AND trade_date >= COALESCE(?, '1900-01-01')
-          AND trade_date <= COALESCE(?, '2999-12-31')
+        WHERE index_code IN (?, ?)
         GROUP BY trade_date
         ORDER BY trade_date
-    """, conn, params=(start, end))
+    """, conn, params=(index_code, benchmark_code, index_code, benchmark_code))
     if not width.empty:
         width["trade_date"] = pd.to_datetime(width["trade_date"])
         width = width.sort_values("trade_date").reset_index(drop=True)
@@ -701,13 +752,19 @@ def load_feature_frame(conn: sqlite3.Connection, start: str | None = None,
 
     df["amount_ma5"] = df["amount"].rolling(5, min_periods=5).mean()
     df["amount_ma20"] = df["amount"].rolling(20, min_periods=20).mean()
+    df["amount_ma60"] = df["amount"].rolling(60, min_periods=60).mean()
     df["vol_ratio_5_20"] = df["amount_ma5"] / df["amount_ma20"]
+    df["vol_ratio_5_60"] = df["amount_ma5"] / df["amount_ma60"]
     df["low10"] = df["close"].rolling(10, min_periods=10).min()
     df["high10"] = df["close"].rolling(10, min_periods=10).max()
     df["price_from_low10"] = df["close"] / df["low10"] - 1.0
     df["drawdown_from_high10"] = 1.0 - df["close"] / df["high10"]
     df["pct_1d"] = df["close"] / df["close"].shift(1) - 1.0
     df["pct_2d"] = df["close"] / df["close"].shift(2) - 1.0
+    if start:
+        df = df[df["trade_date"] >= pd.to_datetime(start)]
+    if end:
+        df = df[df["trade_date"] <= pd.to_datetime(end)]
     return df
 
 
@@ -717,7 +774,8 @@ def load_excel_feature_frame(path: str | Path, start: str | None = None,
     直接使用历史 Excel 中的宽度和中证1000行情。
 
     Excel 结构：
-      - 测算：A-E 为中证1000 OHLC，I-K 为成交额/5日均额/20日均额。
+      - 测算：A-E 为中证1000 OHLC，I-K 为成交额/5日均额/20日均额；
+        60 日均额由原始成交额重新计算，两个量比字段同时保留。
       - 以前300和1000统计：C 为1000宽度3日均值，G 为300宽度3日均值。
         D/E/H/I 分别为当日新高/新低数，可用于还原当日 score。
     """
@@ -759,7 +817,10 @@ def load_excel_feature_frame(path: str | Path, start: str | None = None,
     )
     df = df.sort_values("trade_date").reset_index(drop=True)
 
+    # Excel 中的 20 日均额用于旧策略；新策略的 60 日均额按原始成交额重算。
     df["vol_ratio_5_20"] = df["amount_ma5"] / df["amount_ma20"]
+    df["amount_ma60"] = df["amount"].rolling(60, min_periods=60).mean()
+    df["vol_ratio_5_60"] = df["amount_ma5"] / df["amount_ma60"]
     df["low10"] = df["close"].rolling(10, min_periods=10).min()
     df["high10"] = df["close"].rolling(10, min_periods=10).max()
     df["price_from_low10"] = df["close"] / df["low10"] - 1.0
@@ -799,7 +860,9 @@ def load_excel_width_frame(path: str | Path) -> pd.DataFrame:
 
 def load_db_price_excel_width_frame(conn: sqlite3.Connection, excel_path: str | Path,
                                     start: str | None = None,
-                                    end: str | None = None) -> pd.DataFrame:
+                                    end: str | None = None,
+                                    index_code: str = "000852",
+                                    benchmark_code: str = "000300") -> pd.DataFrame:
     """本地指数行情/量能 + Excel 日期范围/宽度。"""
     width = load_excel_width_frame(excel_path)
     if width.empty:
@@ -809,7 +872,8 @@ def load_db_price_excel_width_frame(conn: sqlite3.Connection, excel_path: str | 
     start = start or excel_start
     end = end or excel_end
 
-    df = load_feature_frame(conn, start=start, end=end)
+    df = load_feature_frame(conn, start=start, end=end,
+                            index_code=index_code, benchmark_code=benchmark_code)
     if df.empty:
         return df
     df = df.drop(columns=[
@@ -825,17 +889,32 @@ def finite(value: Any) -> bool:
     return value is not None and not pd.isna(value) and math.isfinite(float(value))
 
 
+def volume_ratio_for_config(row: pd.Series, config: StrategyConfig) -> float | None:
+    """按策略选择量能口径，并兼容只提供另一字段的旧研究 DataFrame。"""
+    preferred = row.get(config.volume_ratio_field)
+    if finite(preferred):
+        return float(preferred)
+    alternate_field = "vol_ratio_5_60" if config.volume_ratio_field == "vol_ratio_5_20" else "vol_ratio_5_20"
+    alternate = row.get(alternate_field)
+    return float(alternate) if finite(alternate) else None
+
+
+def volume_ratio_label(config: StrategyConfig) -> str:
+    return "5/60" if config.volume_ratio_field == "vol_ratio_5_60" else "5/20"
+
+
 def classify_signal(row: pd.Series, config: StrategyConfig,
                     current_position: str = "FLAT",
                     state: SignalContextState | None = None,
                     row_index: int | None = None) -> tuple[str, str, str]:
+    volume_ratio = volume_ratio_for_config(row, config)
     needed = [
         row.get("csi_score_ma3"), row.get("hs300_score_ma3"),
-        row.get("vol_ratio_5_20"), row.get("price_from_low10"),
+        volume_ratio, row.get("price_from_low10"),
         row.get("drawdown_from_high10"),
     ]
     if not all(finite(v) for v in needed):
-        return "NO_DATA", "数据不足", "缺少指数行情、20日量能或宽度指标"
+        return "NO_DATA", "数据不足", "缺少指数行情、量能或宽度指标"
 
     if current_position == "SHORT":
         short_stop_gain = short_stop_gain_since_entry(row, state, row_index)
@@ -847,12 +926,12 @@ def classify_signal(row: pd.Series, config: StrategyConfig,
     long_context = (
         row["csi_score_ma3"] > config.long_csi_score_min
         and row["hs300_score_ma3"] > config.long_hs300_score_min
-        and row["vol_ratio_5_20"] > config.long_vol_ratio_min
+        and volume_ratio > config.long_vol_ratio_min
     )
     short_context = (
         row["csi_score_ma3"] < config.short_csi_score_max
         and row["hs300_score_ma3"] < config.short_hs300_score_max
-        and row["vol_ratio_5_20"] <= config.short_vol_ratio_max
+        and volume_ratio < config.short_vol_ratio_max
     )
     short_width_context = (
         row["csi_score_ma3"] < config.short_csi_score_max
@@ -874,7 +953,7 @@ def classify_signal(row: pd.Series, config: StrategyConfig,
         state.reset_short()
         if state.long_wave_blocked:
             return "FLAT", "做多波段作废", "多头环境成立，但波段开始时价格未脱离10日低点"
-        return "LONG", "做多", "1000宽度MA3转强，300宽度MA3不弱，5/20日成交额放大，价格脱离10日低点"
+        return "LONG", "做多", f"1000宽度MA3转强，300宽度MA3不弱，{volume_ratio_label(config)}日成交额放大，价格脱离10日低点"
 
     if short_context:
         if not state.short_wave_active:
@@ -887,7 +966,7 @@ def classify_signal(row: pd.Series, config: StrategyConfig,
                 state.short_wave_target = "FLAT"
         state.reset_long()
         if state.short_wave_target == "SHORT":
-            return "SHORT", "做空", "大小盘3日宽度偏弱，1000缩量，且未从10日高点跌太深"
+            return "SHORT", "做空", f"大小盘3日宽度偏弱，{volume_ratio_label(config)}日成交额缩量，且未从10日高点跌太深"
         if state.short_wave_target == "LONG":
             return "LONG", "跌深反做多", "空头环境已从10日高点跌超阈值，按文档反向做多假设处理"
         return "FLAT", "跌深不追空", "空头环境成立但已从10日高点跌超阈值，等待反弹或新机会"
@@ -928,10 +1007,10 @@ def classify_signal_stateless(row: pd.Series, config: StrategyConfig,
     if long_context:
         if row["price_from_low10"] < config.long_price_from_low_min:
             return "FLAT", "做多波段作废", "多头环境成立，但价格未脱离10日低点"
-        return "LONG", "做多", "1000宽度MA3转强，300宽度MA3不弱，5/20日成交额放大，价格脱离10日低点"
+        return "LONG", "做多", f"1000宽度MA3转强，300宽度MA3不弱，{volume_ratio_label(config)}日成交额放大，价格脱离10日低点"
     if short_context:
         if row["drawdown_from_high10"] <= config.short_drawdown_from_high_max:
-            return "SHORT", "做空", "大小盘3日宽度偏弱，1000缩量，且未从10日高点跌太深"
+            return "SHORT", "做空", f"大小盘3日宽度偏弱，{volume_ratio_label(config)}日成交额缩量，且未从10日高点跌太深"
         if config.reverse_deep_short:
             return "LONG", "跌深反做多", "空头环境已从10日高点跌超阈值，按文档反向做多假设处理"
         return "FLAT", "跌深不追空", "空头环境成立但已从10日高点跌超阈值，等待反弹或新机会"
@@ -949,7 +1028,7 @@ def trade_state_from_signal(signal: str) -> str:
 def row_payload(row: pd.Series) -> dict[str, Any]:
     keys = [
         "trade_date", "open", "close", "amount", "csi_score", "hs300_score",
-        "csi_score_ma3", "hs300_score_ma3", "vol_ratio_5_20",
+        "csi_score_ma3", "hs300_score_ma3", "vol_ratio_5_60", "vol_ratio_5_20",
         "price_from_low10", "drawdown_from_high10", "pct_1d", "pct_2d",
     ]
     payload = {}
@@ -974,10 +1053,10 @@ def save_signal(conn: sqlite3.Connection, row: pd.Series, signal: str,
         INSERT INTO csi1000_timing_signals (
             trade_date, signal, trade_state, action, reason, csi_close,
             csi_score, hs300_score, csi_score_ma3, hs300_score_ma3,
-            vol_ratio_5_20, price_from_low10, drawdown_from_high10,
+            vol_ratio_5_20, vol_ratio_5_60, price_from_low10, drawdown_from_high10,
             pct_2d, payload_json, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))
         ON CONFLICT(trade_date) DO UPDATE SET
             signal = excluded.signal,
             trade_state = excluded.trade_state,
@@ -989,6 +1068,7 @@ def save_signal(conn: sqlite3.Connection, row: pd.Series, signal: str,
             csi_score_ma3 = excluded.csi_score_ma3,
             hs300_score_ma3 = excluded.hs300_score_ma3,
             vol_ratio_5_20 = excluded.vol_ratio_5_20,
+            vol_ratio_5_60 = excluded.vol_ratio_5_60,
             price_from_low10 = excluded.price_from_low10,
             drawdown_from_high10 = excluded.drawdown_from_high10,
             pct_2d = excluded.pct_2d,
@@ -998,7 +1078,8 @@ def save_signal(conn: sqlite3.Connection, row: pd.Series, signal: str,
         payload["trade_date"], signal, trade_state, action, reason, payload.get("close"),
         payload.get("csi_score"), payload.get("hs300_score"),
         payload.get("csi_score_ma3"), payload.get("hs300_score_ma3"),
-        payload.get("vol_ratio_5_20"), payload.get("price_from_low10"),
+        payload.get("vol_ratio_5_20"), payload.get("vol_ratio_5_60", payload.get("vol_ratio_5_20")),
+        payload.get("price_from_low10"),
         payload.get("drawdown_from_high10"), payload.get("pct_2d"),
         json.dumps(payload, ensure_ascii=False),
     ))
@@ -1006,7 +1087,7 @@ def save_signal(conn: sqlite3.Connection, row: pd.Series, signal: str,
 
 
 def generate_and_save_signals(conn: sqlite3.Connection, df: pd.DataFrame,
-                              config: StrategyConfig) -> pd.DataFrame:
+                              config: StrategyConfig, persist: bool = True) -> pd.DataFrame:
     rows = []
     position = "FLAT"
     state = SignalContextState()
@@ -1019,7 +1100,8 @@ def generate_and_save_signals(conn: sqlite3.Connection, df: pd.DataFrame,
                 else:
                     state.clear_trade_position()
             position = signal
-        save_signal(conn, row, signal, action, reason)
+        if persist:
+            save_signal(conn, row, signal, action, reason)
         item = row_payload(row)
         item.update({
             "signal": signal,
@@ -1188,7 +1270,7 @@ def format_num(value: Any, digits: int = 3) -> str:
     return f"{float(value):.{digits}f}"
 
 
-def print_signal(row: pd.Series | sqlite3.Row) -> None:
+def print_signal(row: pd.Series | sqlite3.Row, config: StrategyConfig | None = None) -> None:
     if isinstance(row, pd.Series):
         data = row.to_dict()
     elif isinstance(row, sqlite3.Row):
@@ -1201,6 +1283,12 @@ def print_signal(row: pd.Series | sqlite3.Row) -> None:
         close = data.get("close")
 
     trade_state = data.get("trade_state") or trade_state_from_signal(data.get("signal"))
+    volume_field = config.volume_ratio_field if config is not None else "vol_ratio_5_20"
+    volume_value = data.get(volume_field)
+    if not finite(volume_value):
+        fallback_20 = data.get("vol_ratio_5_20")
+        fallback_60 = data.get("vol_ratio_5_60")
+        volume_value = fallback_20 if finite(fallback_20) else fallback_60
     print(
         f"{data.get('trade_date')}  {data.get('action')}  "
         f"做单状态={trade_state}  signal={data.get('signal')}"
@@ -1210,54 +1298,69 @@ def print_signal(row: pd.Series | sqlite3.Row) -> None:
         "指标: "
         f"收盘={format_num(close, 2)}  "
         f"1000宽度={data.get('csi_score')}  300宽度={data.get('hs300_score')}  "
-        f"量比5/20={format_num(data.get('vol_ratio_5_20'), 3)}  "
+        f"量比{volume_ratio_label(config or StrategyConfig())}={format_num(volume_value, 3)}  "
         f"离10日低点={format_pct(data.get('price_from_low10'))}  "
         f"离10日高点回撤={format_pct(data.get('drawdown_from_high10'))}"
     )
 
 
 def load_frame_by_source(conn: sqlite3.Connection, source: str, excel_path: str | Path,
-                         start: str | None = None, end: str | None = None) -> pd.DataFrame:
+                         start: str | None = None, end: str | None = None,
+                         index_code: str = "000852", benchmark_code: str = "000300") -> pd.DataFrame:
     if source == "excel":
+        if index_code != "000852":
+            raise ValueError("data-source=excel 目前只支持中证1000历史表；行业指数请使用 db")
         return load_excel_feature_frame(excel_path, start=start, end=end)
     if source == "excel_width":
-        return load_db_price_excel_width_frame(conn, excel_path, start=start, end=end)
-    return load_feature_frame(conn, start=start, end=end)
+        if index_code != "000852":
+            raise ValueError("data-source=excel_width 目前只支持中证1000历史宽度；行业指数请使用 db")
+        return load_db_price_excel_width_frame(conn, excel_path, start=start, end=end,
+                                               index_code=index_code, benchmark_code=benchmark_code)
+    return load_feature_frame(conn, start=start, end=end,
+                              index_code=index_code, benchmark_code=benchmark_code)
 
 
 def cmd_signal(conn: sqlite3.Connection, config: StrategyConfig, date: str | None,
-               source: str, excel_path: str | Path) -> None:
+               source: str, excel_path: str | Path,
+               index_code: str = "000852", benchmark_code: str = "000300") -> None:
     init_db(conn)
-    df = load_frame_by_source(conn, source, excel_path)
+    df = load_frame_by_source(conn, source, excel_path,
+                              index_code=index_code, benchmark_code=benchmark_code)
     if df.empty:
         raise RuntimeError("没有可用行情/宽度数据")
-    signals = generate_and_save_signals(conn, df, config)
+    signals = generate_and_save_signals(conn, df, config, persist=(index_code == "000852"))
     if date:
         selected = signals[signals["trade_date"] == date]
     else:
         selected = signals.tail(1)
     if selected.empty:
         raise RuntimeError(f"没有找到信号日期: {date}")
-    print_signal(selected.iloc[-1])
+    print_signal(selected.iloc[-1], config)
 
 
 def cmd_backtest(conn: sqlite3.Connection, config: StrategyConfig,
                  start: str | None, end: str | None, run_key: str,
-                 source: str, excel_path: str | Path) -> None:
+                 source: str, excel_path: str | Path,
+                 index_code: str = "000852", benchmark_code: str = "000300") -> None:
     init_db(conn)
-    df = load_frame_by_source(conn, source, excel_path, start=start, end=end)
+    df = load_frame_by_source(conn, source, excel_path, start=start, end=end,
+                              index_code=index_code, benchmark_code=benchmark_code)
     if df.empty:
         raise RuntimeError("没有可用行情/宽度数据")
-    generate_and_save_signals(conn, df, config)
+    # 行业指数研究暂不写入按日期唯一的 csi1000_timing_signals，避免覆盖生产信号。
+    generate_and_save_signals(conn, df, config, persist=(index_code == "000852"))
     result = backtest(conn, df, config, run_key)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def cmd_list_signals(conn: sqlite3.Connection, limit: int, include_unchanged: bool = False) -> None:
+def cmd_list_signals(conn: sqlite3.Connection, limit: int, include_unchanged: bool = False,
+                     config: StrategyConfig | None = None) -> None:
     query_limit = limit + 1 if include_unchanged else 10000
+    volume_field = (config or StrategyConfig()).volume_ratio_field
+    volume_label = volume_ratio_label(config or StrategyConfig())
     rows = conn.execute("""
         SELECT trade_date, signal, trade_state, action, reason, csi_close, csi_score,
-               hs300_score, csi_score_ma3, hs300_score_ma3, vol_ratio_5_20,
+               hs300_score, csi_score_ma3, hs300_score_ma3, vol_ratio_5_20, vol_ratio_5_60,
                price_from_low10, drawdown_from_high10, pct_2d
         FROM csi1000_timing_signals
         ORDER BY trade_date DESC
@@ -1301,7 +1404,7 @@ def cmd_list_signals(conn: sqlite3.Connection, limit: int, include_unchanged: bo
                 f"close={format_num(row['csi_close'], 2)} "
                 f"ma3_1000={format_num(row['csi_score_ma3'], 1)} "
                 f"ma3_300={format_num(row['hs300_score_ma3'], 1)} "
-                f"vol={format_num(row['vol_ratio_5_20'], 3)} "
+                f"vol{volume_label}={format_num(row[volume_field], 3)} "
                 f"low10={format_pct(row['price_from_low10'])} "
                 f"dd10={format_pct(row['drawdown_from_high10'])}"
             )
@@ -1319,7 +1422,7 @@ def cmd_list_signals(conn: sqlite3.Connection, limit: int, include_unchanged: bo
             f"w1000={row['csi_score']} w300={row['hs300_score']} "
             f"ma3_1000={format_num(row['csi_score_ma3'], 1)} "
             f"ma3_300={format_num(row['hs300_score_ma3'], 1)} "
-            f"vol={format_num(row['vol_ratio_5_20'], 3)} "
+            f"vol{volume_label}={format_num(row[volume_field], 3)} "
             f"low10={format_pct(row['price_from_low10'])} "
             f"dd10={format_pct(row['drawdown_from_high10'])} "
             f"pct2d={format_pct(row['pct_2d'])}"
@@ -1408,6 +1511,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db", default=str(DB_PATH), help="SQLite 数据库路径")
     parser.add_argument("--init-db", action="store_true", help="初始化策略表")
     parser.add_argument("--fetch-index-prices", action="store_true", help="从东方财富同步沪深300/中证1000指数日线")
+    parser.add_argument("--index-codes", default=None,
+                        help="要抓取的指数代码，逗号分隔；例如 399967,399989。配合 --fetch-index-prices 使用")
+    parser.add_argument("--target-index", default="000852",
+                        help="回测/信号目标指数代码，默认 000852；需先将其行情写入 index_prices")
     parser.add_argument("--backfill-width", action="store_true", help="用当前成分股快速补算沪深300/中证1000宽度指标")
     parser.add_argument("--start", default=None, help="开始日期；抓行情用 YYYYMMDD，回测用 YYYY-MM-DD 或 YYYYMMDD")
     parser.add_argument("--end", default=None, help="结束日期；抓行情用 YYYYMMDD，回测用 YYYY-MM-DD 或 YYYYMMDD")
@@ -1472,6 +1579,8 @@ def main() -> int:
                 conn,
                 start=normalize_plain_date(args.start) or "20100101",
                 end=normalize_plain_date(args.end),
+                index_codes=[x.strip() for x in args.index_codes.split(",") if x.strip()]
+                if args.index_codes else None,
             )
         elif args.backfill_width:
             cmd_backfill_width(
@@ -1489,12 +1598,16 @@ def main() -> int:
                 run_key=args.run_key,
                 source=args.data_source,
                 excel_path=args.excel_path,
+                index_code=args.target_index,
+                benchmark_code="000300",
             )
         elif args.signal:
-            cmd_signal(conn, config, normalize_dash_date(args.date), args.data_source, args.excel_path)
+            cmd_signal(conn, config, normalize_dash_date(args.date), args.data_source, args.excel_path,
+                       index_code=args.target_index,
+                       benchmark_code="000300")
         elif args.signals:
             init_db(conn)
-            cmd_list_signals(conn, args.limit, include_unchanged=args.include_unchanged)
+            cmd_list_signals(conn, args.limit, include_unchanged=args.include_unchanged, config=config)
         elif args.trades:
             init_db(conn)
             cmd_list_trades(conn, args.limit)
