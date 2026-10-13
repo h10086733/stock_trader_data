@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from trader.data.kline import upsert_stocks, fetch_kline, insert_daily_prices, update_stock_price_range
+import fetch
 
 try:
     import baostock as bs
@@ -125,7 +125,7 @@ def ensure_stock_rows(conn: sqlite3.Connection, selected: pd.DataFrame) -> None:
             "market": infer_market(row["资产代码"], code),
             "price_latest": None,
         })
-    upsert_stocks(conn, rows)
+    fetch.upsert_stocks(conn, rows)
 
 
 def has_signal_day_rows(conn: sqlite3.Connection, code: str, dates: list[str]) -> tuple[bool, list[str]]:
@@ -249,14 +249,14 @@ def run(args) -> int:
                         item.end_fetch,
                     )
                 else:
-                    rows = fetch_kline(
+                    rows = fetch.fetch_kline(
                         item.code,
                         item.market,
                         item.start_fetch,
                         item.end_fetch,
                     )
-                inserted = insert_daily_prices(conn, item.code, rows)
-                update_stock_price_range(conn, item.code, rows)
+                inserted = fetch.insert_daily_prices(conn, item.code, rows)
+                fetch.update_stock_price_range(conn, item.code, rows)
                 inserted_total += inserted
                 ok += 1
                 print(

@@ -12,17 +12,7 @@ import argparse
 import sys
 import time
 
-from trader.core.db import connect_existing as get_db
-from trader.strategies.high_confidence.core import (
-    ensure_high_confidence_tables,
-    get_hc_available_dates,
-    high_confidence_payload,
-)
-from trader.strategies.high_confidence.config import (
-    HC_DEFAULT_MAX_PER_DATE,
-    HC_DEFAULT_PATTERNS,
-    HC_MIN_FULL_MARKET_ROWS,
-)
+import app
 
 
 def parse_args():
@@ -49,10 +39,10 @@ def parse_args():
 
 
 def load_trade_dates(args):
-    conn = get_db()
+    conn = app.get_db()
     try:
-        ensure_high_confidence_tables(conn)
-        rows = get_hc_available_dates(conn, limit=max(args.days * 5, 180))
+        app.ensure_high_confidence_tables(conn)
+        rows = app.get_hc_available_dates(conn, limit=max(args.days * 5, 180))
     finally:
         conn.close()
 
@@ -64,7 +54,7 @@ def load_trade_dates(args):
             continue
         if args.end and trade_date > args.end:
             continue
-        if not args.include_incomplete and daily_rows < HC_MIN_FULL_MARKET_ROWS:
+        if not args.include_incomplete and daily_rows < app.HC_MIN_FULL_MARKET_ROWS:
             continue
         dates.append({"date": trade_date, "daily_rows": daily_rows})
 
@@ -97,11 +87,11 @@ def main():
         t0 = time.time()
         print(f"[{index}/{total}] {trade_date} 开始", flush=True)
         try:
-            payload = high_confidence_payload({
+            payload = app.high_confidence_payload({
                 "date": trade_date,
                 "refresh": args.refresh,
-                "max_per_date": HC_DEFAULT_MAX_PER_DATE,
-                "patterns": list(HC_DEFAULT_PATTERNS),
+                "max_per_date": app.HC_DEFAULT_MAX_PER_DATE,
+                "patterns": list(app.HC_DEFAULT_PATTERNS),
             })
             meta = payload.get("meta") or {}
             print(
