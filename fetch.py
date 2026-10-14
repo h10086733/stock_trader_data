@@ -57,12 +57,12 @@ USER_AGENTS = [
 
 def get_headers():
     return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Referer": "https://www.eastmoney.com/",
+        # 固定一个浏览器 UA。每次请求换 UA 对东财没有帮助，还会让连接复用更像爬虫。
+        "User-Agent": USER_AGENTS[0],
+        "Referer": "https://quote.eastmoney.com/",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
+        "Connection": "close",
     }
 
 
@@ -94,13 +94,16 @@ logging.getLogger("urllib3.util.retry").setLevel(logging.ERROR)
 # ─────────────────────────────────────────────────────────────────
 def make_session():
     session = requests.Session()
+    # 连接错误交给下面的 safe_get。urllib3 再套一层 Retry 时，
+    # 一次 RemoteDisconnected 会先静默退避约 60 秒，日志里才出现 attempt=1。
     retry = Retry(
-        total=MAX_RETRIES,
-        backoff_factor=2,                         # 重试等待：2s, 4s, 8s
-        status_forcelist=[429, 500, 502, 503, 504],
+        total=0,
+        connect=0,
+        read=0,
+        status=0,
         allowed_methods=["GET"],
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=2, pool_maxsize=2)
     session.mount("http://",  adapter)
     session.mount("https://", adapter)
     return session
@@ -108,28 +111,51 @@ def make_session():
 SESSION = make_session()
 
 
+def reset_session():
+    """丢掉连接池。东财经常把空闲 keep-alive 直接掐掉，复用旧 socket 就会 RemoteDisconnected。"""
+    global SESSION
+    try:
+        SESSION.close()
+    except Exception:
+        pass
+    SESSION = make_session()
+
+
+def _retry_delay(attempt):
+    """第一次很快重试（多半是废连接），之后再指数退避。"""
+    return min(16.0, 0.6 * (2 ** attempt)) + random.uniform(0.1, 0.8)
+
+
 def safe_get(url, params, timeout=15):
     """带限流检测的 GET，遇到429或空响应自动等待重试"""
     for attempt in range(MAX_RETRIES):
         try:
-            # 每次请求使用随机User-Agent
             headers = get_headers()
             resp = SESSION.get(url, params=params, headers=headers, timeout=timeout)
             if resp.status_code == 429:
                 log.warning(f"  限流(429)，等待 {RETRY_INTERVAL}s  attempt={attempt+1}")
                 time.sleep(RETRY_INTERVAL)
                 continue
+            if resp.status_code in (500, 502, 503, 504):
+                log.warning(f"  HTTP {resp.status_code}，等待重试  attempt={attempt+1}")
+                time.sleep(_retry_delay(attempt))
+                continue
             if not resp.text or len(resp.text) < 10:
                 log.warning(f"  空响应，等待重试  attempt={attempt+1}")
-                time.sleep(RETRY_INTERVAL)
+                time.sleep(_retry_delay(attempt))
                 continue
             return resp
         except requests.exceptions.Timeout:
             log.warning(f"  超时，重试  attempt={attempt+1}")
-            time.sleep(RETRY_INTERVAL)
+            reset_session()
+            time.sleep(_retry_delay(attempt))
         except requests.exceptions.ConnectionError as e:
-            log.warning(f"  连接错误: {e}，重试  attempt={attempt+1}")
-            time.sleep(RETRY_INTERVAL)
+            cause = e.__cause__ or e
+            log.warning(
+                f"  连接被对端断开({type(cause).__name__})，重建连接后重试  attempt={attempt+1}"
+            )
+            reset_session()
+            time.sleep(_retry_delay(attempt))
     raise RuntimeError(f"请求失败，已重试 {MAX_RETRIES} 次: {url}")
 
 
@@ -151,13 +177,19 @@ def safe_get_sina(symbols, timeout=10):
             return resp
         except requests.exceptions.Timeout:
             log.warning(f"  新浪超时，重试  attempt={attempt+1}")
-            time.sleep(RETRY_INTERVAL)
+            reset_session()
+            time.sleep(_retry_delay(attempt))
         except requests.exceptions.ConnectionError as e:
-            log.warning(f"  新浪连接错误: {e}，重试  attempt={attempt+1}")
-            time.sleep(RETRY_INTERVAL)
+            cause = e.__cause__ or e
+            log.warning(
+                f"  新浪连接被对端断开({type(cause).__name__})，重建连接后重试  attempt={attempt+1}"
+            )
+            reset_session()
+            time.sleep(_retry_delay(attempt))
         except requests.exceptions.RequestException as e:
             log.warning(f"  新浪请求异常: {e}，重试  attempt={attempt+1}")
-            time.sleep(RETRY_INTERVAL)
+            reset_session()
+            time.sleep(_retry_delay(attempt))
     raise RuntimeError(f"新浪请求失败，已重试 {MAX_RETRIES} 次: {url}")
 
 
