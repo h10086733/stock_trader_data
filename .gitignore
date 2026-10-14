@@ -1,6 +1,7 @@
 *.db
 *.db-wal
 *.db-shm
+*.db.backup-*
 *.log
 __pycache__/
 *.pyc
