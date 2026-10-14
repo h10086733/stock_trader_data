@@ -10729,33 +10729,33 @@ def parse_cli_args():
                         choices=["four_pin", "bottom_reversal"],
                         help="收盘形态类型：four_pin=四根十字针，bottom_reversal=底部反转")
     parser.add_argument("--pattern-max-body-pct", type=float, default=1.05,
-                        help="四根十字针最大实体幅度，单位%")
+                        help="四根十字针最大实体幅度，单位%%")
     parser.add_argument("--pattern-max-body-range-pct", type=float, default=35.0,
-                        help="十字针实体占振幅上限，单位%")
+                        help="十字针实体占振幅上限，单位%%")
     parser.add_argument("--pattern-max-amp-pct", type=float, default=6.0,
-                        help="四根K线单日最大振幅，单位%")
+                        help="四根K线单日最大振幅，单位%%")
     parser.add_argument("--pattern-doji-body-pct", type=float, default=1.05,
-                        help="四根十字针最大实体幅度，单位%")
+                        help="四根十字针最大实体幅度，单位%%")
     parser.add_argument("--pattern-max-ma40-distance", type=float, default=0.0,
                         help="收盘价距离MA40的最大幅度，0表示不限制")
     parser.add_argument("--pattern-max-pair-distance", type=float, default=0.5,
-                        help="第1/3、第2/4同位允许偏差，单位%")
+                        help="第1/3、第2/4同位允许偏差，单位%%")
     parser.add_argument("--pattern-max-close-pair-distance", type=float, default=1.0,
-                        help="第1/3、第2/4收盘价允许偏差，单位%")
+                        help="第1/3、第2/4收盘价允许偏差，单位%%")
     parser.add_argument("--pattern-min-level-gap", type=float, default=0.8,
-                        help="第1/3高位中枢相对第2/4低位中枢的最小差，单位%")
+                        help="第1/3高位中枢相对第2/4低位中枢的最小差，单位%%")
     parser.add_argument("--pattern-min-shadow-pct", type=float, default=1.0,
-                        help="上下影线占单根振幅的最小比例，单位%")
+                        help="上下影线占单根振幅的最小比例，单位%%")
     parser.add_argument("--pattern-max-shadowless-count", type=int, default=0,
                         help="四根K线中允许缺上影或下影的最大根数")
     parser.add_argument("--pattern-bottom-lookback-days", type=int, default=60,
                         help="底部反转低位判定回看天数")
     parser.add_argument("--pattern-max-bottom-position", type=float, default=25.0,
-                        help="底部反转收盘价在回看区间中的最高位置，单位%")
+                        help="底部反转收盘价在回看区间中的最高位置，单位%%")
     parser.add_argument("--pattern-min-prior-drop-pct", type=float, default=10.0,
-                        help="底部反转前期最小回撤幅度，单位%")
+                        help="底部反转前期最小回撤幅度，单位%%")
     parser.add_argument("--pattern-bottom-max-body-pct", type=float, default=3.0,
-                        help="底部反转单根/星线最大实体幅度，单位%")
+                        help="底部反转单根/星线最大实体幅度，单位%%")
     parser.add_argument("--pattern-bottom-only-bullish-engulfing", type=int, default=1,
                         help="底部反转是否只保留看涨吞没，1=只保留，0=保留全部反转形态")
     parser.add_argument("--pattern-bottom-group", default="engulfing",
@@ -10766,21 +10766,21 @@ def parse_cli_args():
     parser.add_argument("--pattern-max-bottom-volume-ratio", type=float, default=3.0,
                         help="底部反转最高反转当日量比，0表示不限制；单针形态仍使用单针专属过热过滤")
     parser.add_argument("--pattern-min-bottom-rebound-pct", type=float, default=3.0,
-                        help="底部反转低点反弹下限，单位%")
+                        help="底部反转低点反弹下限，单位%%")
     parser.add_argument("--pattern-min-bottom-pct-change", type=float, default=2.5,
-                        help="底部反转当日涨幅下限，单位%")
+                        help="底部反转当日涨幅下限，单位%%")
     parser.add_argument("--pattern-min-bottom-strong-gain-pct", type=float, default=4.0,
-                        help="组合反转形态最低当日涨幅，单位%")
+                        help="组合反转形态最低当日涨幅，单位%%")
     parser.add_argument("--pattern-require-bottom-confirm", type=int, default=1,
                         help="底部反转是否要求MA20/组合形态/高位收盘确认，1=要求，0=不要求")
     parser.add_argument("--pattern-min-bottom-close-position", type=float, default=75.0,
-                        help="底部反转当日收盘价在日内振幅中的最低位置，单位%")
+                        help="底部反转当日收盘价在日内振幅中的最低位置，单位%%")
     parser.add_argument("--pattern-require-bottom-close-above-prev", type=int, default=1,
                         help="底部反转是否要求收盘价高于前一日，1=要求，0=不要求")
     parser.add_argument("--pattern-require-bottom-above-ma5", type=int, default=1,
                         help="底部反转是否要求收盘价收回MA5，1=要求，0=不要求")
     parser.add_argument("--pattern-min-bottom-ma5-slope-pct", type=float, default=-1.0,
-                        help="底部反转MA5斜率下限，单位%")
+                        help="底部反转MA5斜率下限，单位%%")
     parser.add_argument("--pattern-require-bottom-not-close-new-low", type=int, default=1,
                         help="底部反转是否要求收盘价不是近期收盘新低，1=要求，0=不要求")
     parser.add_argument("--pattern-bottom-new-low-lookback-days", type=int, default=20,
@@ -10790,9 +10790,9 @@ def parse_cli_args():
     parser.add_argument("--pattern-win-hold-days", type=int, default=1,
                         help="同股同形态胜率统计持有交易日数")
     parser.add_argument("--pattern-win-target-pct", type=float, default=3.0,
-                        help="同股同形态达标率目标涨幅，单位%")
+                        help="同股同形态达标率目标涨幅，单位%%")
     parser.add_argument("--pattern-min-turnover", type=float, default=0.0,
-                        help="最低换手率，单位%")
+                        help="最低换手率，单位%%")
     parser.add_argument("--pattern-min-market-cap-yi", type=float, default=0.0,
                         help="最低总市值，单位亿元；0表示不限制")
     parser.add_argument("--pattern-min-amount", type=float, default=None,
