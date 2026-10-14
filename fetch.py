@@ -126,9 +126,10 @@ def _retry_delay(attempt):
     return min(16.0, 0.6 * (2 ** attempt)) + random.uniform(0.1, 0.8)
 
 
-def safe_get(url, params, timeout=15):
+def safe_get(url, params, timeout=15, attempts=None):
     """带限流检测的 GET，遇到429或空响应自动等待重试"""
-    for attempt in range(MAX_RETRIES):
+    attempts = MAX_RETRIES if attempts is None else attempts
+    for attempt in range(attempts):
         try:
             headers = get_headers()
             resp = SESSION.get(url, params=params, headers=headers, timeout=timeout)
@@ -156,7 +157,7 @@ def safe_get(url, params, timeout=15):
             )
             reset_session()
             time.sleep(_retry_delay(attempt))
-    raise RuntimeError(f"请求失败，已重试 {MAX_RETRIES} 次: {url}")
+    raise RuntimeError(f"请求失败，已重试 {attempts} 次: {url}")
 
 
 def safe_get_sina(symbols, timeout=10):
@@ -598,10 +599,73 @@ def fetch_stock_list():
     return all_stocks
 
 
-def fetch_kline(code, market, start_date, end_date=None):
-    """日K线（前复权），返回列表"""
-    if end_date is None:
-        end_date = datetime.today().strftime("%Y%m%d")
+# 日K没有批量接口。东财连续被断开后，整次进程改走 baostock，避免每只都空等。
+_kline_source = "eastmoney"
+_eastmoney_kline_failures = 0
+_bs_module = None
+KLINE_EASTMONEY_ATTEMPTS = 2
+
+
+def _optional_float(value):
+    if value in (None, "", "-"):
+        return None
+    return float(value)
+
+
+def to_baostock_code(code, market):
+    return ("sh." if str(market) == "1" else "sz.") + code
+
+
+def _login_baostock():
+    global _bs_module
+    if _bs_module is not None:
+        return _bs_module
+    try:
+        import baostock as bs
+    except ImportError as exc:
+        raise RuntimeError("未安装 baostock，无法在东财断连时改用备用源") from exc
+    login = bs.login()
+    if login.error_code != "0":
+        raise RuntimeError(f"baostock 登录失败: {login.error_code} {login.error_msg}")
+    log.info("日K备用源：baostock 前复权")
+    _bs_module = bs
+    return bs
+
+
+def fetch_kline_baostock(code, market, start_date, end_date):
+    """前复权日K。成交量从股换算成手，和东财日K口径一致。"""
+    bs = _login_baostock()
+    start = datetime.strptime(start_date, "%Y%m%d").strftime("%Y-%m-%d")
+    end = datetime.strptime(end_date, "%Y%m%d").strftime("%Y-%m-%d")
+    rs = bs.query_history_k_data_plus(
+        to_baostock_code(code, market),
+        "date,code,open,high,low,close,volume,amount,pctChg,turn",
+        start_date=start,
+        end_date=end,
+        frequency="d",
+        adjustflag="2",
+    )
+    if rs.error_code != "0":
+        raise RuntimeError(f"baostock 查询失败 {code}: {rs.error_code} {rs.error_msg}")
+    rows = []
+    while rs.next():
+        date, _, open_, high, low, close, volume, amount, pct_chg, turn = rs.get_row_data()
+        volume_shares = _optional_float(volume)
+        rows.append({
+            "trade_date": date,
+            "open": _optional_float(open_),
+            "close": _optional_float(close),
+            "high": _optional_float(high),
+            "low": _optional_float(low),
+            "volume": volume_shares / 100.0 if volume_shares is not None else None,
+            "amount": _optional_float(amount),
+            "pct_change": _optional_float(pct_chg),
+            "turnover": _optional_float(turn),
+        })
+    return rows
+
+
+def _fetch_kline_eastmoney(code, market, start_date, end_date):
     params = {
         "secid":   f"{market}.{code}",
         "ut":      "8dec03ba335b81bf4ebdf7b29ec27d15",
@@ -611,7 +675,7 @@ def fetch_kline(code, market, start_date, end_date=None):
         "klt": 101, "fqt": 1,
         "beg": start_date, "end": end_date, "lmt": 10000,
     }
-    resp   = safe_get(KLINE_URL, params)
+    resp = safe_get(KLINE_URL, params, attempts=KLINE_EASTMONEY_ATTEMPTS)
     klines = resp.json().get("data", {}).get("klines", [])
 
     rows = []
@@ -619,19 +683,39 @@ def fetch_kline(code, market, start_date, end_date=None):
         p = k.split(",")
         if len(p) < 11:
             continue
-        def v(x): return float(x) if x not in ("-", "") else None
         rows.append({
             "trade_date": p[0],
-            "open":       v(p[1]),
-            "close":      v(p[2]),
-            "high":       v(p[3]),
-            "low":        v(p[4]),
-            "volume":     v(p[5]),
-            "amount":     v(p[6]),
-            "pct_change": v(p[8]),
-            "turnover":   v(p[10]),
+            "open":       _optional_float(p[1]),
+            "close":      _optional_float(p[2]),
+            "high":       _optional_float(p[3]),
+            "low":        _optional_float(p[4]),
+            "volume":     _optional_float(p[5]),
+            "amount":     _optional_float(p[6]),
+            "pct_change": _optional_float(p[8]),
+            "turnover":   _optional_float(p[10]),
         })
     return rows
+
+
+def fetch_kline(code, market, start_date, end_date=None):
+    """日K线（前复权）。东财 push2his 被断开时改用 baostock。"""
+    global _kline_source, _eastmoney_kline_failures
+    if end_date is None:
+        end_date = datetime.today().strftime("%Y%m%d")
+    if _kline_source == "baostock":
+        return fetch_kline_baostock(code, market, start_date, end_date)
+    try:
+        rows = _fetch_kline_eastmoney(code, market, start_date, end_date)
+        _eastmoney_kline_failures = 0
+        return rows
+    except (requests.exceptions.RequestException, RuntimeError) as exc:
+        _eastmoney_kline_failures += 1
+        if _eastmoney_kline_failures >= 2:
+            _kline_source = "baostock"
+            log.warning("东财日K连续被断开，后续股票改走 baostock")
+        else:
+            log.warning(f"东财日K失败，{code} 改用 baostock: {exc}")
+        return fetch_kline_baostock(code, market, start_date, end_date)
 
 
 # ─────────────────────────────────────────────────────────────────
